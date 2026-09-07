@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TCG Inventory Middleware | SortSwift & eBay Bridge</title>
+    <meta name="description" content="Containerized TCG card inventory middleware for SortSwift and eBay Seller Hub synchronization.">
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        dark: {
+                            900: '#0B0F19',
+                            800: '#111827',
+                            700: '#1E293B',
+                            600: '#334155',
+                        },
+                        brand: {
+                            500: '#6366F1',
+                            600: '#4F46E5',
+                        },
+                        accent: {
+                            cyan: '#06B6D4',
+                            emerald: '#10B981',
+                            amber: '#F59E0B',
+                            rose: '#F43F5E',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        heading: ['Outfit', 'sans-serif'],
+                        mono: ['"JetBrains Mono"', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Custom Styles -->
+    <link rel="stylesheet" href="/static/style.css">
+    
+    <!-- Google Sign-In SDK (Optional if Client ID configured) -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body class="bg-dark-900 text-slate-100 min-h-screen font-sans antialiased selection:bg-brand-500 selection:text-white">
+
+    <!-- Top Navigation Bar -->
+    <header class="sticky top-0 z-40 bg-dark-800/80 backdrop-blur-md border-b border-slate-800/80 px-4 lg:px-8 py-3.5 transition-all">
+        <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4">
+            
+            <!-- App Branding -->
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-brand-600 via-indigo-500 to-accent-cyan flex items-center justify-center shadow-lg shadow-brand-500/20">
+                    <svg class="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="text-lg font-bold font-heading text-white tracking-tight flex items-center gap-2">
+                        TCG Inventory Middleware
+                        <span class="text-xs font-mono font-normal px-2 py-0.5 rounded-full bg-slate-800 text-accent-cyan border border-slate-700">v1.0</span>
+                    </h1>
+                    <p class="text-xs text-slate-400">SortSwift &harr; eBay Seller Hub Bridge</p>
+                </div>
+            </div>
+
+            <!-- Stats Ribbon -->
+            <div id="statsRibbon" class="hidden md:flex items-center gap-6 bg-dark-900/60 border border-slate-800 rounded-xl px-4 py-1.5 shadow-inner">
+                <div class="text-left">
+                    <div class="text-[10px] uppercase font-semibold tracking-wider text-slate-400">Catalog Cards</div>
+                    <div id="statTotalCards" class="text-base font-bold font-heading text-white">0</div>
+                </div>
+                <div class="h-6 w-px bg-slate-800"></div>
+                <div class="text-left">
+                    <div class="text-[10px] uppercase font-semibold tracking-wider text-slate-400">eBay Active</div>
+                    <div id="statActiveListings" class="text-base font-bold font-heading text-accent-cyan">0</div>
+                </div>
+                <div class="h-6 w-px bg-slate-800"></div>
+                <div class="text-left">
+                    <div class="text-[10px] uppercase font-semibold tracking-wider text-slate-400">Total Live Stock</div>
+                    <div id="statTotalStock" class="text-base font-bold font-heading text-accent-emerald">0</div>
+                </div>
+            </div>
+
+            <!-- User Status & Actions -->
+            <div class="flex items-center gap-2 sm:gap-3">
+                <button id="btnListingRules" class="text-xs font-medium px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5" title="Configure Variation Grouping & Single Rules">
+                    <svg class="w-4 h-4 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                    Listing Rules
+                </button>
+
+                <button id="btnPricingRules" class="text-xs font-medium px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5" title="Configure Tiered Pricing Rules">
+                    <svg class="w-4 h-4 text-accent-emerald" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    Pricing Rules
+                </button>
+
+                <button id="btnAdminPanel" class="hidden text-xs font-medium px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5">
+                    <svg class="w-4 h-4 text-accent-amber" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                    </svg>
+                    Users & Approvals
+                </button>
+                
+                <div id="userProfileBadge" class="hidden items-center gap-2 bg-dark-900 border border-slate-800 rounded-lg px-2.5 py-1">
+                    <div class="w-6 h-6 rounded-full bg-brand-600/30 text-brand-400 border border-brand-500/40 flex items-center justify-center text-xs font-bold font-mono" id="userAvatarText">U</div>
+                    <span id="userNameText" class="text-xs font-medium text-slate-300">User</span>
+                    <span id="userRoleBadge" class="text-[10px] uppercase px-1.5 py-0.2 rounded bg-indigo-950 text-indigo-300 border border-indigo-800">Admin</span>
+                </div>
+
+                <button id="btnLogout" class="hidden text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800 p-2 rounded-lg transition-colors" title="Log Out">
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                    </svg>
+                </button>
+
+                <button id="btnOpenLoginModal" class="text-xs font-medium px-4 py-2 rounded-lg bg-brand-600 hover:bg-brand-500 text-white shadow-md shadow-brand-500/20 transition-all flex items-center gap-2">
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1" />
+                    </svg>
+                    Sign In
+                </button>
+            </div>
+
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="max-w-7xl mx-auto px-4 lg:px-8 py-8 space-y-8">
+
+        <!-- Pending Approval Banner (Hidden by default) -->
+        <div id="pendingApprovalBanner" class="hidden p-5 rounded-2xl bg-amber-950/40 border border-amber-800/60 text-amber-200 flex items-start gap-4 shadow-xl">
+            <div class="p-2 rounded-xl bg-amber-900/60 text-amber-300">
+                <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+            </div>
+            <div class="flex-1">
+                <h2 class="text-sm font-bold font-heading text-amber-100">Account Pending Administrator Approval</h2>
+                <p class="text-xs text-amber-300/80 mt-1">Your account has been registered successfully. An administrator must approve your access before you can process inventory or sync listings.</p>
+            </div>
+            <button onclick="checkAuthStatus()" class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-800 hover:bg-amber-700 text-amber-100 transition-colors">
+                Check Status
+            </button>
+        </div>
+
+        <!-- Operational Grid (3 File Dropzones) -->
+        <section class="space-y-4">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h2 class="text-lg font-bold font-heading text-white tracking-tight">Data Conversion Pipeline</h2>
+                    <p class="text-xs text-slate-400">Drag & drop your CSV files to process sales, inventory batches, and store state syncs.</p>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+
+                <!-- Card 1: Process eBay Orders (Downstream) -->
+                <div class="glass-card p-5 rounded-2xl border border-slate-800/80 bg-dark-800/60 hover:border-slate-700/80 transition-all flex flex-col justify-between group">
+                    <div>
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-indigo-950 text-indigo-400 border border-indigo-800/50">Module A</span>
+                            <span class="text-xs text-slate-400">eBay &rarr; SortSwift</span>
+                        </div>
+                        <h3 class="text-base font-bold font-heading text-white group-hover:text-brand-400 transition-colors">1. Process eBay Orders</h3>
+                        <p class="text-xs text-slate-400 mt-1">Parses raw eBay Orders CSV, extracts manifest IDs & sold quantities, and outputs SortSwift Import CSV.</p>
+
+                        <!-- Dropzone 1 -->
+                        <div id="dropzoneOrders" class="dropzone mt-4 p-6 rounded-xl border-2 border-dashed border-slate-700 bg-dark-900/40 hover:bg-dark-900/80 hover:border-brand-500/70 text-center cursor-pointer transition-all">
+                            <input type="file" id="fileInputOrders" class="hidden" accept=".csv">
+                            <div class="space-y-2">
+                                <div class="w-10 h-10 mx-auto rounded-full bg-indigo-900/40 text-brand-400 flex items-center justify-center">
+                                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                                    </svg>
+                                </div>
+                                <div class="text-xs font-medium text-slate-200" id="labelOrders">Drop `ebay_orders.csv` or <span class="text-brand-400 underline">browse</span></div>
+                                <div class="text-[10px] text-slate-500">Official eBay Orders report download</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Action / Download Buttons for Card 1 -->
+                    <div id="resultBoxOrders" class="hidden mt-4 pt-3 border-t border-slate-800/80 space-y-2">
+                        <button id="btnDownloadOrders" class="w-full text-xs font-semibold py-2.5 px-3 rounded-xl bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white shadow-md shadow-brand-500/20 flex items-center justify-center gap-2 transition-all">
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            <span>Download SortSwift Orders CSV</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Card 2: Process SortSwift Batch (Upstream) -->
+                <div class="glass-card p-5 rounded-2xl border border-slate-800/80 bg-dark-800/60 hover:border-slate-700/80 transition-all flex flex-col justify-between group">
+                    <div>
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-cyan-950 text-accent-cyan border border-cyan-800/50">Module B</span>
+                            <span class="text-xs text-slate-400">SortSwift &rarr; eBay</span>
+                        </div>
+                        <h3 class="text-base font-bold font-heading text-white group-hover:text-accent-cyan transition-colors">2. Process SortSwift Batch</h3>
+                        <p class="text-xs text-slate-400 mt-1">Catalogs new card states, auto-assigns IDs, and routes to eBay Revise vs. Add CSVs.</p>
+
+                        <!-- Dropzone 2 -->
+                        <div id="dropzoneBatch" class="dropzone mt-4 p-6 rounded-xl border-2 border-dashed border-slate-700 bg-dark-900/40 hover:bg-dark-900/80 hover:border-accent-cyan/70 text-center cursor-pointer transition-all">
+                            <input type="file" id="fileInputBatch" class="hidden" accept=".csv">
+                            <div class="space-y-2">
+                                <div class="w-10 h-10 mx-auto rounded-full bg-cyan-950/60 text-accent-cyan flex items-center justify-center">
+                                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                                    </svg>
+                                </div>
+                                <div class="text-xs font-medium text-slate-200" id="labelBatch">Drop `sortswift_batch.csv` or <span class="text-accent-cyan underline">browse</span></div>
+                                <div class="text-[10px] text-slate-500">Fresh SortSwift scan export</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Action / Download Buttons for Card 2 -->
+                    <div id="resultBoxBatch" class="hidden mt-4 pt-3 border-t border-slate-800/80 space-y-2">
+                        <button id="btnDownloadRevise" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition-all">
+                            <svg class="w-4 h-4 text-accent-amber" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            <span>Download ebay_inventory_updates.csv (Revise)</span>
+                        </button>
+                        <button id="btnDownloadAdd" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition-all">
+                            <svg class="w-4 h-4 text-accent-emerald" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            <span>Download ebay_new_additions.csv (Add)</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Card 3: Sync Active eBay Inventory -->
+                <div class="glass-card p-5 rounded-2xl border border-slate-800/80 bg-dark-800/60 hover:border-slate-700/80 transition-all flex flex-col justify-between group">
+                    <div>
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-emerald-950 text-accent-emerald border border-emerald-800/50">Module C</span>
+                            <span class="text-xs text-slate-400">eBay &rarr; Store Mirror</span>
+                        </div>
+                        <h3 class="text-base font-bold font-heading text-white group-hover:text-accent-emerald transition-colors">3. Sync Active eBay Inventory</h3>
+                        <p class="text-xs text-slate-400 mt-1">Ingests eBay Active Listings report to synchronize live Item IDs and on-hand quantities.</p>
+
+                        <!-- Dropzone 3 -->
+                        <div id="dropzoneSync" class="dropzone mt-4 p-6 rounded-xl border-2 border-dashed border-slate-700 bg-dark-900/40 hover:bg-dark-900/80 hover:border-accent-emerald/70 text-center cursor-pointer transition-all">
+                            <input type="file" id="fileInputSync" class="hidden" accept=".csv">
+                            <div class="space-y-2">
+                                <div class="w-10 h-10 mx-auto rounded-full bg-emerald-950/60 text-accent-emerald flex items-center justify-center">
+                                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                </div>
+                                <div class="text-xs font-medium text-slate-200" id="labelSync">Drop `active_listings.csv` or <span class="text-accent-emerald underline">browse</span></div>
+                                <div class="text-[10px] text-slate-500">Official eBay Active Listings report</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sync Status Info -->
+                    <div id="resultBoxSync" class="hidden mt-4 pt-3 border-t border-slate-800/80 text-center">
+                        <div class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-950/60 text-accent-emerald text-xs font-semibold border border-emerald-800/50">
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                            </svg>
+                            <span id="syncSummaryText">Store Mirror Synced</span>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- Live Inventory Table Section -->
+        <section class="space-y-4">
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                    <h2 class="text-lg font-bold font-heading text-white tracking-tight">Live Store Inventory</h2>
+                    <p class="text-xs text-slate-400">Master catalog joined with live eBay variation IDs and quantities.</p>
+                </div>
+                
+                <div class="flex items-center gap-3">
+                    <!-- Search Input -->
+                    <div class="relative w-64">
+                        <span class="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none text-slate-400">
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                            </svg>
+                        </span>
+                        <input type="text" id="inventorySearch" placeholder="Search cards, sets, IDs..." class="w-full pl-9 pr-3 py-1.5 text-xs rounded-xl bg-dark-800 border border-slate-700 text-slate-100 placeholder-slate-500 focus:outline-none focus:border-brand-500 transition-all">
+                    </div>
+
+                    <!-- Add Card Button -->
+                    <button id="btnOpenAddCardModal" class="text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5" title="Add Card Manually">
+                        <svg class="w-4 h-4 text-accent-emerald" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                        </svg>
+                        <span>Add Card</span>
+                    </button>
+
+                    <!-- Export Catalog Button -->
+                    <a href="/api/export/manifest" download="master_catalog.csv" class="text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5" title="Export CSV">
+                        <svg class="w-4 h-4 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                        <span>Export</span>
+                    </a>
+
+                    <!-- Refresh Button -->
+                    <button onclick="fetchInventory()" class="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-slate-200 transition-all" title="Refresh Table">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Table Container -->
+            <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden bg-dark-800/40">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse text-xs">
+                        <thead>
+                            <tr class="border-b border-slate-800 bg-dark-800/80 text-slate-400 uppercase font-semibold text-[10px] tracking-wider">
+                                <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('manifest_id')">Manifest ID</th>
+                                <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('product_name')">Card Title</th>
+                                <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('set_name')">Expansion Set</th>
+                                <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('condition')">Condition</th>
+                                <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('printing')">Printing</th>
+                                <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('remarks')">Bin / Remark</th>
+                                <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('ebay_parent_id')">eBay Item #</th>
+                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')">Live Stock</th>
+                                <th class="py-3 px-4 text-right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="inventoryTableBody" class="divide-y divide-slate-800/60 text-slate-300">
+                            <!-- Populated dynamically via JS -->
+                            <tr>
+                                <td colspan="8" class="py-8 text-center text-slate-500">Loading catalog inventory...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Table Footer / Pagination -->
+                <div class="p-3.5 border-t border-slate-800/80 bg-dark-800/50 flex flex-wrap items-center justify-between text-xs text-slate-400 gap-3">
+                    <div id="paginationInfo">Showing 0 of 0 records</div>
+                    <div class="flex items-center gap-2">
+                        <button id="btnPrevPage" onclick="changePage(-1)" class="px-3 py-1 rounded-lg bg-dark-800 border border-slate-700 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all">Previous</button>
+                        <span id="pageIndicator" class="px-2 font-mono">Page 1</span>
+                        <button id="btnNextPage" onclick="changePage(1)" class="px-3 py-1 rounded-lg bg-dark-800 border border-slate-700 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all">Next</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Operational Terminal Log Console -->
+        <section class="space-y-3">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <span class="w-2.5 h-2.5 rounded-full bg-accent-emerald animate-pulse"></span>
+                    <h2 class="text-sm font-bold font-heading text-slate-200">Terminal Operational Log Console</h2>
+                </div>
+                <div class="flex items-center gap-2">
+                    <button onclick="clearConsoleLogs()" class="text-[11px] text-slate-400 hover:text-slate-200 transition-colors">Clear Console</button>
+                </div>
+            </div>
+
+            <!-- Terminal Window -->
+            <div class="rounded-2xl border border-slate-800 bg-dark-900 overflow-hidden shadow-2xl">
+                <!-- Mac-style top bar -->
+                <div class="bg-dark-800 px-4 py-2 border-b border-slate-800/80 flex items-center justify-between text-xs text-slate-400 font-mono">
+                    <div class="flex items-center gap-2">
+                        <div class="flex items-center gap-1.5">
+                            <span class="w-3 h-3 rounded-full bg-rose-500/80 inline-block"></span>
+                            <span class="w-3 h-3 rounded-full bg-amber-500/80 inline-block"></span>
+                            <span class="w-3 h-3 rounded-full bg-emerald-500/80 inline-block"></span>
+                        </div>
+                        <span class="text-slate-400 ml-2 font-mono text-[11px]">tcg-middleware-console://stdout</span>
+                    </div>
+                    <span class="text-[11px] text-slate-500">Live Execution Logs</span>
+                </div>
+
+                <!-- Terminal Output Div -->
+                <div id="terminalLogBox" class="p-4 font-mono text-[11px] leading-relaxed max-h-56 overflow-y-auto space-y-1 bg-[#070A10]">
+                    <div class="text-slate-500">[SYSTEM] Ready for operations. Waiting for CSV upload or database queries...</div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- AUTHENTICATION MODAL -->
+    <div id="authModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
+        <div class="w-full max-w-md bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative">
+            <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+
+            <div class="text-center mb-6">
+                <h3 id="authModalTitle" class="text-lg font-bold font-heading text-white">Sign In to TCG Middleware</h3>
+                <p class="text-xs text-slate-400 mt-1" id="authModalSubtitle">Enter your credentials to access inventory and conversion tools.</p>
+            </div>
+
+            <!-- Tab Switcher -->
+            <div class="flex rounded-xl bg-dark-900 p-1 mb-5 border border-slate-700/80">
+                <button id="tabLogin" onclick="switchAuthTab('login')" class="flex-1 py-1.5 text-xs font-semibold rounded-lg bg-brand-600 text-white transition-all">Sign In</button>
+                <button id="tabRegister" onclick="switchAuthTab('register')" class="flex-1 py-1.5 text-xs font-semibold rounded-lg text-slate-400 hover:text-slate-200 transition-all">Register</button>
+            </div>
+
+            <!-- Auth Error Message -->
+            <div id="authErrorMsg" class="hidden mb-4 p-3 rounded-xl bg-rose-950/60 border border-rose-800 text-rose-300 text-xs"></div>
+
+            <!-- Login Form -->
+            <form id="loginForm" onsubmit="handleLogin(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-medium text-slate-300 mb-1">Username</label>
+                    <input type="text" id="loginUsername" required class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300 mb-1">Password</label>
+                    <input type="password" id="loginPassword" required class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <button type="submit" class="w-full py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20 transition-all">
+                    Sign In
+                </button>
+            </form>
+
+            <!-- Register Form (Hidden by default) -->
+            <form id="registerForm" onsubmit="handleRegister(event)" class="hidden space-y-4">
+                <div>
+                    <label class="block text-xs font-medium text-slate-300 mb-1">Username</label>
+                    <input type="text" id="regUsername" required minlength="3" class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300 mb-1">Email (Optional)</label>
+                    <input type="email" id="regEmail" class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300 mb-1">Password</label>
+                    <input type="password" id="regPassword" required minlength="6" class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <button type="submit" class="w-full py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20 transition-all">
+                    Create Account
+                </button>
+            </form>
+
+            <!-- Google Sign-In Container (Shown if Google Client ID is configured) -->
+            <div id="googleAuthContainer" class="hidden mt-5 pt-5 border-t border-slate-700 text-center">
+                <div class="text-[11px] text-slate-400 mb-3">Or continue with</div>
+                <div id="g_id_onload"
+                     data-client_id=""
+                     data-callback="handleGoogleCallback"
+                     data-auto_prompt="false">
+                </div>
+                <div class="g_id_signin flex justify-center" data-type="standard" data-size="large" data-theme="filled_black" data-text="sign_in_with" data-shape="pill" data-logo_alignment="left"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ADMIN USER MANAGEMENT MODAL -->
+    <div id="adminModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
+        <div class="w-full max-w-4xl bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] flex flex-col">
+            <button onclick="closeAdminModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+
+            <div class="mb-5">
+                <h3 class="text-lg font-bold font-heading text-white flex items-center gap-2">
+                    <svg class="w-5 h-5 text-accent-amber" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                    </svg>
+                    User Management & Approvals
+                </h3>
+                <p class="text-xs text-slate-400 mt-1">Approve pending user sign-ups or manage admin privileges.</p>
+            </div>
+
+            <div class="overflow-x-auto flex-1">
+                <table class="w-full text-left text-xs">
+                    <thead>
+                        <tr class="border-b border-slate-700 bg-dark-900 text-slate-400 uppercase text-[10px]">
+                            <th class="py-2.5 px-3">Username</th>
+                            <th class="py-2.5 px-3">Email</th>
+                            <th class="py-2.5 px-3">Provider</th>
+                            <th class="py-2.5 px-3">Role</th>
+                            <th class="py-2.5 px-3">Status</th>
+                            <th class="py-2.5 px-3">Registered</th>
+                            <th class="py-2.5 px-3 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adminUserTableBody" class="divide-y divide-slate-700/60 text-slate-300">
+                        <tr>
+                            <td colspan="7" class="py-4 text-center text-slate-500">Loading registered users...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- MANUAL ADD CARD MODAL -->
+    <div id="addCardModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
+        <div class="w-full max-w-lg bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative">
+            <button onclick="closeAddCardModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+
+            <div class="mb-4">
+                <h3 class="text-lg font-bold font-heading text-white">Add Card to Master Catalog</h3>
+                <p class="text-xs text-slate-400 mt-1">Manually catalog a card state or link an eBay listing.</p>
+            </div>
+
+            <form id="addCardForm" onsubmit="handleAddCard(event)" class="space-y-3 text-xs">
+                <div>
+                    <label class="block text-slate-300 mb-1">Card Product Name *</label>
+                    <input type="text" id="addCardName" required placeholder="e.g. Charizard" class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div>
+                    <label class="block text-slate-300 mb-1">Expansion Set Name *</label>
+                    <input type="text" id="addSetName" required placeholder="e.g. Base Set" class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-slate-300 mb-1">Condition</label>
+                        <select id="addCondition" class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                            <option value="Near Mint">Near Mint</option>
+                            <option value="Lightly Played">Lightly Played</option>
+                            <option value="Moderately Played">Moderately Played</option>
+                            <option value="Heavily Played">Heavily Played</option>
+                            <option value="Damaged">Damaged</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-slate-300 mb-1">Printing / Finish</label>
+                        <select id="addPrinting" class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                            <option value="Normal">Normal</option>
+                            <option value="Holofoil">Holofoil</option>
+                            <option value="Reverse Holofoil">Reverse Holofoil</option>
+                            <option value="1st Edition">1st Edition</option>
+                            <option value="Foil">Foil</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-slate-300 mb-1">eBay 12-Digit Item ID (Optional)</label>
+                        <input type="text" id="addEbayId" placeholder="e.g. 123456789012" class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                    </div>
+                    <div>
+                        <label class="block text-slate-300 mb-1">Live Stock Quantity</label>
+                        <input type="number" id="addQuantity" value="1" min="0" class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+                    </div>
+                </div>
+                <div class="pt-2">
+                    <button type="submit" class="w-full py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20 transition-all">
+                        Save to Catalog
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- PRICING RULES CONFIGURATION MODAL -->
+    <div id="pricingModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
+        <div class="w-full max-w-3xl bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] flex flex-col">
+            <button onclick="closePricingModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+
+            <div class="mb-4">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="text-lg font-bold font-heading text-white flex items-center gap-2">
+                            <svg class="w-5 h-5 text-accent-emerald" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                            Tiered Pricing Rules
+                        </h3>
+                        <p class="text-xs text-slate-400 mt-1">Configure automated eBay listing prices based on TCGplayer Market Price ranges.</p>
+                    </div>
+                    <button onclick="resetDefaultPricingRules()" class="text-xs text-slate-400 hover:text-slate-200 underline">Reset Defaults</button>
+                </div>
+            </div>
+
+            <!-- Interactive Live Price Calculator Preview Box -->
+            <div class="mb-5 p-3.5 rounded-xl bg-dark-900/90 border border-slate-700 flex flex-col sm:flex-row items-center justify-between gap-3">
+                <div class="flex items-center gap-2 w-full sm:w-auto">
+                    <span class="text-xs font-semibold text-slate-300 whitespace-nowrap">Test Price Calculator:</span>
+                    <div class="relative flex-1 sm:w-28">
+                        <span class="absolute inset-y-0 left-0 pl-2.5 flex items-center text-xs text-slate-400">$</span>
+                        <input type="number" id="testPriceInput" value="0.17" step="0.01" min="0" class="w-full pl-6 pr-2 py-1 text-xs rounded-lg bg-dark-800 border border-slate-600 text-white font-mono focus:outline-none focus:border-brand-500" placeholder="0.17">
+                    </div>
+                </div>
+                <div class="flex items-center gap-3 text-xs w-full sm:w-auto justify-between sm:justify-end">
+                    <span class="text-slate-400">&rarr; Calculated eBay Price:</span>
+                    <span id="testPriceResult" class="font-mono font-bold text-accent-emerald text-sm px-2.5 py-0.5 rounded-lg bg-emerald-950 border border-emerald-800">$1.99</span>
+                </div>
+            </div>
+
+            <!-- Rules Table Editor -->
+            <div class="overflow-x-auto flex-1 mb-4">
+                <table class="w-full text-left text-xs border-collapse">
+                    <thead>
+                        <tr class="border-b border-slate-700 bg-dark-900 text-slate-400 uppercase text-[10px]">
+                            <th class="py-2.5 px-3">Min Market Price</th>
+                            <th class="py-2.5 px-3">Max Market Price</th>
+                            <th class="py-2.5 px-3">Rule Type</th>
+                            <th class="py-2.5 px-3">Value / Markup</th>
+                            <th class="py-2.5 px-3 text-right">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pricingRulesTableBody" class="divide-y divide-slate-700/60 text-slate-300 font-mono">
+                        <!-- Populated dynamically via JS -->
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Modal Action Buttons -->
+            <div class="flex items-center justify-between pt-3 border-t border-slate-700">
+                <button onclick="addEmptyPricingRuleRow()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-all">
+                    <svg class="w-4 h-4 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                    <span>Add Tier Rule</span>
+                </button>
+                <div class="flex items-center gap-2">
+                    <button onclick="closePricingModal()" class="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs">Cancel</button>
+                    <button onclick="savePricingRules()" class="px-4 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20">Save Pricing Rules</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- LISTING & VARIATION RULES CONFIGURATION MODAL -->
+    <div id="listingModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
+        <div class="w-full max-w-2xl bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] flex flex-col">
+            <button onclick="closeListingModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+
+            <div class="mb-5">
+                <h3 class="text-lg font-bold font-heading text-white flex items-center gap-2">
+                    <svg class="w-5 h-5 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                    Listing & Multi-Variation Grouping Rules
+                </h3>
+                <p class="text-xs text-slate-400 mt-1">Configure how cards are grouped into set-level variation drop-down listings vs standalone singles.</p>
+            </div>
+
+            <form id="listingRulesForm" onsubmit="saveListingSettings(event)" class="space-y-4 text-xs">
+                
+                <!-- Single Listing Threshold -->
+                <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-2">
+                    <label class="block font-semibold text-slate-200">Single Card Listing Threshold ($)</label>
+                    <p class="text-[11px] text-slate-400">Cards with calculated price equal to or above this value will be listed as <strong>individual Singles</strong>. Cards below this value are automatically grouped into their <strong>Set Variation listing</strong>.</p>
+                    <div class="flex items-center gap-2 pt-1">
+                        <span class="text-slate-400 font-mono text-sm">$</span>
+                        <input type="number" id="settingSingleThreshold" step="0.50" min="0" value="5.00" class="w-28 px-3 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                    </div>
+                </div>
+
+                <!-- Variation Title Template -->
+                <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-2">
+                    <label class="block font-semibold text-slate-200">Variation Listing Title Template</label>
+                    <p class="text-[11px] text-slate-400">Template used for eBay set-level parent listings. (Use <code class="text-accent-cyan font-mono">{set_name}</code> as the placeholder).</p>
+                    <input type="text" id="settingTitleTemplate" value="{set_name}: Pick Your Card - Near Mint - Complete Your Set" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                    
+                    <!-- Title Character Preview & Fallback Demo -->
+                    <div class="mt-3 p-3 rounded-lg bg-dark-800 border border-slate-700 space-y-2">
+                        <div class="flex items-center justify-between text-[11px] text-slate-400">
+                            <span>Live Title Preview & Length Checker:</span>
+                            <span id="titleCharCount" class="font-mono text-accent-cyan font-semibold">0 / 80 Chars</span>
+                        </div>
+                        <input type="text" id="testSetTitleInput" value="SV05: Temporal Forces" placeholder="Test with a Set Name..." class="w-full px-2.5 py-1 text-xs rounded bg-dark-900 border border-slate-600 text-slate-300 font-mono">
+                        <div id="generatedTitleDisplay" class="p-2 rounded bg-dark-900 text-xs font-mono text-slate-200 border border-slate-800 break-words">
+                            SV05: Temporal Forces: Pick Your Card - Near Mint - Complete Your Set
+                        </div>
+                        <p class="text-[10px] text-slate-500 italic">* If the title exceeds 80 characters, 'Near Mint' is automatically converted to 'NM' to ensure eBay accepts the file.</p>
+                    </div>
+                </div>
+
+                <div class="flex items-center justify-between pt-3 border-t border-slate-700">
+                    <button type="button" onclick="resetListingSettings()" class="text-xs text-slate-400 hover:text-slate-200 underline">Reset Defaults</button>
+                    <div class="flex items-center gap-2">
+                        <button type="button" onclick="closeListingModal()" class="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">Cancel</button>
+                        <button type="submit" class="px-4 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20">Save Listing Rules</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Application JavaScript -->
+    <script src="/static/app.js"></script>
+</body>
+</html>

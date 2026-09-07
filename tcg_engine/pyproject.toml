@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcg-engine"
+version = "0.1.0"
+description = "Lightweight, standalone core engine for TCG inventory and eBay/SortSwift CSV processing"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Mark", email = "mark@example.com" }
+]
+dependencies = []
+
+[project.scripts]
+tcg-engine = "tcg_engine.cli:main"
