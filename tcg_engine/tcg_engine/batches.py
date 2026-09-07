@@ -157,20 +157,36 @@ def process_batch_csv(
     })
 
     for row_idx, row in enumerate(reader, start=1):
-        product_name = _find_column(row, ["Name", "Product Name", "Card Name", "Card", "Title", "Product"])
-        set_name = _find_column(row, ["Set", "Set Name", "Expansion", "Edition"])
-        raw_condition = _find_column(row, ["Condition", "Card Condition", "Grade"]) or "NM"
-        printing = _find_column(row, ["Printing", "Finish", "Variant", "Foil"]) or "Normal"
-        qty_str = _find_column(row, ["Quantity", "Qty", "Count", "Amount", "Add Quantity"])
+        product_name = _find_column(row, [
+            "*C:Card Name", "Name", "Product Name", "Product Name (No Card Number)",
+            "Card Name", "Card", "Product",
+        ])
+        set_name = _find_column(row, ["*C:Set", "Set", "Set Name", "Expansion", "Edition"])
+        raw_condition = _find_column(row, [
+            "Condition", "Condition Code", "Condition (Full Name)", "C:Card Condition",
+            "Card Condition", "Grade",
+        ]) or "NM"
+        printing = _find_column(row, [
+            "Printing", "*C:Finish", "Finish", "Variant", "Foil", "Foil (normal/foil)",
+        ]) or "Normal"
+        qty_str = _find_column(row, ["*Quantity", "Quantity", "Qty", "Count", "Amount"])
 
-        # Extra SortSwift fields
-        sku_id = _find_column(row, ["SKU Id", "SKU", "SkuId", "skuId"])
-        tcgplayer_id = _find_column(row, ["TCGplayer Id", "ProductId", "productId", "ID Product"])
-        card_number = _find_column(row, ["Card Number", "Number"])
+        # Extra SortSwift / eBay-export fields
+        sku_id = _find_column(row, ["SKU ID", "SKU Id", "SKU", "SkuId", "skuId"])
+        tcgplayer_id = _find_column(row, [
+            "TCGPlayer ID", "TCGplayer Id", "Product ID", "ProductId", "productId", "ID Product",
+        ])
+        card_number = _find_column(row, ["*C:Card Number", "Card Number", "Number"])
         set_code = _find_column(row, ["Set Code", "SetCode"])
-        language = _find_column(row, ["Language", "Lang"]) or "EN"
-        cdn_image = _find_column(row, ["CDN Image", "cdn_link", "PicURL", "Image URL", "CDN Link"])
-        remarks = _find_column(row, ["Remarks", "Remark", "Bin", "binIndex", "Comment"])
+        language = _find_column(row, ["Language", "*C:Language", "Lang", "Language (Full Name)"]) or "EN"
+        cdn_image = _find_column(row, ["PicURL", "CDN Image", "CDN Link", "cdn_link", "Image URL"])
+        cdn_back_image = _find_column(row, ["CDN Back Link", "Card Back CDN Image", "Back Image"])
+        stock_image = _find_column(row, ["Stock Image", "Stock Photo"])
+        remarks = _find_column(row, [
+            "Remark + Bin Index", "Remarks", "Remark", "Bin Index", "Bin", "binIndex", "Comment",
+        ])
+        # Raw ConditionID from CSV (e.g. 4000) — prefer over string mapping
+        raw_condition_id = _find_column(row, ["*ConditionID", "ConditionID", "Condition ID"])
 
         # Clean remark / bin string for eBay SKU encoding
         clean_remark = ""
@@ -179,9 +195,9 @@ def process_batch_csv(
             clean_remark = clean_remark[:20]
 
         # Dynamic Pricing Calculation
-        ebay_price_val = _parse_price(_find_column(row, ["eBay Price", "Ebay Price", "ebay_price"]))
-        standard_price_val = _parse_price(_find_column(row, ["Price", "Selling Price"]))
-        market_price_val = _parse_price(_find_column(row, ["Market Price", "TCGPlayer Price", "Market"]))
+        ebay_price_val = _parse_price(_find_column(row, ["Platform Price (Ebay)", "eBay Price", "Ebay Price", "ebay_price"]))
+        standard_price_val = _parse_price(_find_column(row, ["Your Price", "Price", "Selling Price", "Platform Price (Internal)"]))
+        market_price_val = _parse_price(_find_column(row, ["Market Price", "Platform Price (Tcgplayer)", "TCGPlayer Price", "Market"]))
 
         raw_base_price = market_price_val if market_price_val > 0 else standard_price_val
 
@@ -199,8 +215,13 @@ def process_batch_csv(
             continue
 
         # Standardize Condition and ConditionID
+        # Prefer raw integer ConditionID from CSV column; fall back to string mapping
         cond_clean = raw_condition.strip().lower()
-        condition_name, condition_id = CONDITION_MAP.get(cond_clean, (raw_condition.strip(), "3000"))
+        condition_name, condition_id_mapped = CONDITION_MAP.get(cond_clean, (raw_condition.strip(), "3000"))
+        if raw_condition_id and str(raw_condition_id).strip().isdigit():
+            condition_id = str(raw_condition_id).strip()
+        else:
+            condition_id = condition_id_mapped
 
         try:
             quantity = int(qty_str.strip()) if qty_str else 1
@@ -273,6 +294,8 @@ def process_batch_csv(
                 "quantity": quantity,
                 "price": effective_price,
                 "cdn_image": cdn_image or "",
+                "cdn_back_image": cdn_back_image or "",
+                "stock_image": stock_image or "",
                 "card_number": card_number or "",
             }
 
@@ -355,6 +378,14 @@ def process_batch_csv(
         if len(single_title) > 80:
             single_title = single_title[:80]
 
+        # Single listings: include front, back, and stock images (pipe-delimited)
+        single_pic_parts = [url for url in [
+            s["cdn_image"],
+            s.get("cdn_back_image", ""),
+            s.get("stock_image", ""),
+        ] if url]
+        single_pic_url = "|".join(single_pic_parts)
+
         final_add_rows.append({
             "Action": "Add",
             "Category": category_id,
@@ -366,7 +397,7 @@ def process_batch_csv(
             "StartPrice": f"{s['price']:.2f}",
             "Quantity": s["quantity"],
             "CustomLabel": s["custom_label"],
-            "PicURL": s["cdn_image"],
+            "PicURL": single_pic_url,
             "Format": "FixedPrice",
             "Duration": "GTC",
             "Price": f"{s['price']:.2f}",
