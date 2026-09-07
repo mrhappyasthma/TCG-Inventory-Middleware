@@ -9,7 +9,10 @@ import urllib.request
 import urllib.error
 from typing import Optional, Dict, Any, Tuple
 from fastapi import Request, HTTPException, status, Depends
-from .user_db import UserDatabase
+try:
+    from app.user_db import UserDatabase
+except ImportError:
+    from .user_db import UserDatabase
 
 # Environment configurations
 AUTH_METHOD = os.environ.get("AUTH_METHOD", "local").lower()  # "local", "google", "none"

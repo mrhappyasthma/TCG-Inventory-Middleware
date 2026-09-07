@@ -1,7 +1,14 @@
 import os
+import sys
 import io
 import csv
 from typing import Optional, Dict, Any, List
+
+# Ensure project root is in sys.path when running as direct script
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -22,16 +29,28 @@ from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import process_batch_csv
 from tcg_engine.sync import sync_active_listings_csv
 
-from .user_db import UserDatabase
-from .auth import (
-    AuthManager,
-    hash_password,
-    verify_password,
-    create_jwt_token,
-    verify_google_id_token,
-    AUTH_METHOD,
-    GOOGLE_CLIENT_ID,
-)
+try:
+    from app.user_db import UserDatabase
+    from app.auth import (
+        AuthManager,
+        hash_password,
+        verify_password,
+        create_jwt_token,
+        verify_google_id_token,
+        AUTH_METHOD,
+        GOOGLE_CLIENT_ID,
+    )
+except ImportError:
+    from .user_db import UserDatabase
+    from .auth import (
+        AuthManager,
+        hash_password,
+        verify_password,
+        create_jwt_token,
+        verify_google_id_token,
+        AUTH_METHOD,
+        GOOGLE_CLIENT_ID,
+    )
 
 # App Configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
