@@ -9,6 +9,21 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# Load .env file into os.environ BEFORE any other imports that read env vars at import time
+# (auth.py reads AUTH_METHOD at module level, so this must run first)
+_env_path = os.path.join(project_root, ".env")
+if os.path.isfile(_env_path):
+    with open(_env_path, encoding="utf-8") as _ef:
+        for _line in _ef:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _, _val = _line.partition("=")
+            _key = _key.strip()
+            _val = _val.strip().strip('"').strip("'")
+            if _key and _key not in os.environ:  # don't override real env vars (e.g. Docker)
+                os.environ[_key] = _val
+
 from fastapi import (
     FastAPI,
     UploadFile,
