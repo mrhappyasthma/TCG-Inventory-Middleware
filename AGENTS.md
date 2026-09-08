@@ -18,6 +18,7 @@
   * `docs: <summary>` for documentation or guideline changes
   * `chore: <summary>` for configuration, Docker, or dependency adjustments
 * **Push Immediately After Committing**: Run `git push origin main` as soon as each commit is created. Do not batch commits up locally and do not wait to be asked — the NAS deploys via `git pull origin main`, so an unpushed commit cannot be deployed.
+* **Sole Attribution**: Commits are attributed to the repository owner only. Do **not** append a `Co-Authored-By:` trailer (for Claude or any other tool) to commit messages. Message quality is unchanged — conventional prefix, subject line, and a body explaining *why* — only the trailer is omitted.
 * **Atomic & Reversible**: Keep commits logical and granular so that changes can be easily tracked, reviewed, or rolled back if needed.
 * **History is Append-Only Once Pushed**: The standing push permission covers ordinary commits to `main` only. Force-pushing, rewriting or rebasing pushed commits, creating tags or releases, and deleting branches all require asking first.
 * **Never Commit Secrets**: `.env`, `data/*.db` and `data/.session_secret` are gitignored and must stay that way. `.env.example` carries empty placeholders only — never a real `GOOGLE_CLIENT_ID` or `JWT_SECRET`.

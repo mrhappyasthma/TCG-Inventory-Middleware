@@ -6,6 +6,7 @@
   ```bash
   git push origin main
   ```
+* **No co-author trailers**: Commit messages must not contain a `Co-Authored-By:` line. Commits are attributed to the repository owner alone.
 * **Never force-push or rewrite pushed history**: `--force`, `--force-with-lease`, rebases of pushed commits, tag/release creation and branch deletion are NOT covered by the standing push permission. Ask first.
 * **Use conventional commit prefixes**:
   - `feat:` for new capabilities
