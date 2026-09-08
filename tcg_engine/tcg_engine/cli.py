@@ -36,7 +36,8 @@ def handle_batch(args):
 
     print(f"Processing SortSwift Batch from: {args.input_file}")
     result = process_batch_file(
-        args.input_file, db, revise_path, add_path, force=args.force
+        args.input_file, db, revise_path, add_path,
+        force=args.force, dry_run=args.dry_run,
     )
     for log in result["logs"]:
         print(f"[{log['level']}] {log['message']}")
@@ -130,6 +131,11 @@ def main():
     )
     p_batch.add_argument("input_file", help="Path to SortSwift batch CSV")
     p_batch.add_argument("--out-dir", default=".", help="Directory to save generated CSVs")
+    p_batch.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Regenerate the CSVs without writing anything to the catalogue or store mirror",
+    )
     p_batch.add_argument(
         "--force",
         action="store_true",

@@ -644,11 +644,18 @@ function setupDropzones() {
         }
     });
 
+    document.getElementById("btnDownloadOnlyBatch").addEventListener("click", () => {
+        if (!pendingBatchFile) return;
+        document.getElementById("batchDuplicateWarning").classList.add("hidden");
+        logToTerminal("INFO", `[MODULE B] Rebuilding files for ${pendingBatchFile.name} - inventory will not change.`);
+        handleBatchUpload(pendingBatchFile, "dry-run");
+    });
+
     document.getElementById("btnForceProcessBatch").addEventListener("click", () => {
         if (!pendingBatchFile) return;
         document.getElementById("batchDuplicateWarning").classList.add("hidden");
         logToTerminal("WARN", `[MODULE B] Force processing ${pendingBatchFile.name} - quantities will be added again.`);
-        handleBatchUpload(pendingBatchFile, true);
+        handleBatchUpload(pendingBatchFile, "force");
     });
 
     document.getElementById("btnDownloadAdd").addEventListener("click", () => {
@@ -724,16 +731,21 @@ async function handleOrdersUpload(file) {
     }
 }
 
-async function handleBatchUpload(file, force = false) {
-    if (!force) {
+// mode: "normal" | "force" | "dry-run"
+async function handleBatchUpload(file, mode = "normal") {
+    if (mode === "normal") {
         document.getElementById("batchDuplicateWarning").classList.add("hidden");
         document.getElementById("resultBoxBatch").classList.add("hidden");
     }
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("force", force ? "true" : "false");
+    formData.append("force", mode === "force" ? "true" : "false");
+    formData.append("dry_run", mode === "dry-run" ? "true" : "false");
 
-    logToTerminal("INFO", `[MODULE B] Uploading ${file.name} for SortSwift Batch routing...`);
+    const intent = mode === "dry-run"
+        ? "rebuilding files only"
+        : mode === "force" ? "force processing" : "routing";
+    logToTerminal("INFO", `[MODULE B] Uploading ${file.name} (${intent})...`);
 
     try {
         const res = await fetch("/api/process/batch", {
@@ -754,9 +766,12 @@ async function handleBatchUpload(file, force = false) {
         if (data.duplicate) {
             pendingBatchFile = file;
             const detail = (data.logs || []).find(l => l.level === "WARN");
-            document.getElementById("batchDuplicateText").innerText = detail
+            const base = detail
                 ? detail.message
                 : `"${file.name}" has already been processed. Nothing was added to your live inventory.`;
+            document.getElementById("batchDuplicateText").innerText = base
+                + " Choose Download only to rebuild the CSVs with your current settings,"
+                + " or Force process to apply the batch a second time.";
             document.getElementById("batchDuplicateWarning").classList.remove("hidden");
             document.getElementById("resultBoxBatch").classList.add("hidden");
             return;
@@ -782,18 +797,21 @@ async function handleBatchUpload(file, force = false) {
         if (data.add_count > 0) parts.push(`${data.add_count} to add`);
         if (data.revise_count > 0) parts.push(`${data.revise_count} to revise`);
         if (data.skipped_count > 0) parts.push(`${data.skipped_count} skipped`);
+        const suffix = data.dry_run ? " (inventory unchanged)" : "";
         document.getElementById("batchReadyText").innerText = parts.length
-            ? `Files ready \u2014 ${parts.join(", ")}`
-            : "Processed, but nothing to upload";
+            ? `Files ready \u2014 ${parts.join(", ")}${suffix}`
+            : `Nothing to upload${suffix}`;
 
         logToTerminal(
             "SUCCESS",
-            `[MODULE B] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}. Click to download.`
+            `[MODULE B] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}${suffix}. Click to download.`
         );
 
-        // Refresh live table and stats
-        fetchStats();
-        fetchInventory();
+        // A download-only rebuild wrote nothing, so there is nothing to refresh.
+        if (!data.dry_run) {
+            fetchStats();
+            fetchInventory();
+        }
     } catch (err) {
         logToTerminal("ERROR", `[MODULE B] ${err.message}`);
     }

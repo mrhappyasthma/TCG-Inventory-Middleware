@@ -295,6 +295,7 @@ def _empty_batch_result(
         "new_catalog_count": 0,
         "skipped_count": 0,
         "duplicate": False,
+        "dry_run": False,
         "logs": logs,
     }
     result.update(overrides)
@@ -306,6 +307,7 @@ def process_batch_csv(
     db: Database,
     source_name: str = "batch.csv",
     force: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
     Process fresh SortSwift inventory batch CSV.
@@ -322,6 +324,14 @@ def process_batch_csv(
     Revise quantities are additive, so processing the same export twice would
     double the live stock. Uploads are therefore fingerprinted and a repeat is
     refused unless ``force`` is set.
+
+    ``dry_run`` regenerates the output files **without writing anything**: no
+    catalogue entries, no quantity accumulation, no store-mirror updates and no
+    batch fingerprint. It exists for the common case of re-downloading a batch
+    that has already been applied because a setting changed and the CSV needs
+    rebuilding -- so it renders with current settings rather than replaying a
+    stored file. Cards it cannot already find in the catalogue are skipped,
+    since minting a manifest ID would itself be a write.
     """
     logs: List[Dict[str, str]] = []
     revise_rows: List[Dict[str, Any]] = []
@@ -415,7 +425,7 @@ def process_batch_csv(
     # Refuse a replay of an already-processed file unless explicitly forced.
     batch_hash = hashlib.sha256(csv_text.encode("utf-8", errors="replace")).hexdigest()
     previous = db.find_processed_batch(batch_hash)
-    if previous and not force:
+    if previous and not force and not dry_run:
         return _empty_batch_result(
             [{
                 "level": "WARN",
@@ -458,7 +468,15 @@ def process_batch_csv(
                 "policy names under Listing Rules if the upload is rejected."
             ),
         })
-    if previous and force:
+    if dry_run:
+        logs.append({
+            "level": "INFO",
+            "message": (
+                "Download-only run: regenerating the CSV files with current "
+                "settings. Nothing will be written to your inventory."
+            ),
+        })
+    if previous and force and not dry_run:
         logs.append({
             "level": "WARN",
             "message": (
@@ -601,21 +619,39 @@ def process_batch_csv(
             quantity = 1
 
         # Check or create manifest ID
-        manifest_id, is_new, card_data = db.get_or_create_manifest(
-            product_name=product_name,
-            set_name=set_name,
-            condition=condition_name,
-            printing=printing,
-            sku_id=sku_id,
-            tcgplayer_id=tcgplayer_id,
-            card_number=card_number,
-            set_code=set_code,
-            language=language,
-            price=effective_price,
-            market_price=market_price_val,
-            cdn_image=cdn_image,
-            remarks=remarks,
-        )
+        if dry_run:
+            # Read-only: find the existing catalogue entry, never mint one.
+            existing = db.find_manifest(
+                product_name, set_name, condition_name, printing
+            )
+            if not existing:
+                skipped_count += 1
+                logs.append({
+                    "level": "WARN",
+                    "message": (
+                        f"Row {row_idx}: '{product_name}' is not in the catalogue yet, "
+                        f"so it has no manifest ID to put in the file. Process the "
+                        f"batch for real to catalogue it."
+                    ),
+                })
+                continue
+            manifest_id, is_new, card_data = existing["manifest_id"], False, existing
+        else:
+            manifest_id, is_new, card_data = db.get_or_create_manifest(
+                product_name=product_name,
+                set_name=set_name,
+                condition=condition_name,
+                printing=printing,
+                sku_id=sku_id,
+                tcgplayer_id=tcgplayer_id,
+                card_number=card_number,
+                set_code=set_code,
+                language=language,
+                price=effective_price,
+                market_price=market_price_val,
+                cdn_image=cdn_image,
+                remarks=remarks,
+            )
 
         # Forward this row's item specifics verbatim, defaulting Game because
         # eBay requires it for the card categories.
@@ -643,7 +679,8 @@ def process_batch_csv(
             row_specifics[GAME_ITEM_SPECIFIC] = game
 
         # Accumulate our own catalogued stock count for this card.
-        db.increment_manifest_quantity(manifest_id, quantity)
+        if not dry_run:
+            db.increment_manifest_quantity(manifest_id, quantity)
 
         ebay_custom_label = f"{manifest_id}-{clean_remark}" if clean_remark else manifest_id
 
@@ -662,10 +699,15 @@ def process_batch_csv(
             # REVISE Scenario: Item is already live on eBay
             ebay_item_id = str(variation["ebay_parent_id"]).strip()
             prev_qty = variation.get("last_known_qty", 0)
-            new_consolidated_qty = prev_qty + quantity
 
-            # Update live store mirror in DB
-            db.upsert_variation(manifest_id, ebay_item_id, new_consolidated_qty)
+            if dry_run:
+                # The batch has already been applied, so the mirror already
+                # includes it; adding again would overstate the file.
+                new_consolidated_qty = prev_qty
+            else:
+                new_consolidated_qty = prev_qty + quantity
+                # Update live store mirror in DB
+                db.upsert_variation(manifest_id, ebay_item_id, new_consolidated_qty)
 
             revise_rows.append({
                 "Action": "Revise",
@@ -853,11 +895,12 @@ def process_batch_csv(
 
     # Fingerprint only after the batch has actually been applied, so a failure
     # part-way through does not mark the file as done.
-    db.record_processed_batch(
-        sha256=batch_hash,
-        source_name=source_name,
-        row_count=len(lines) - 1,
-    )
+    if not dry_run:
+        db.record_processed_batch(
+            sha256=batch_hash,
+            source_name=source_name,
+            row_count=len(lines) - 1,
+        )
 
     return {
         "revise_csv": revise_csv,
@@ -867,6 +910,7 @@ def process_batch_csv(
         "new_catalog_count": new_catalog_count,
         "skipped_count": skipped_count,
         "duplicate": False,
+        "dry_run": dry_run,
         "logs": logs,
     }
 
@@ -877,6 +921,7 @@ def process_batch_file(
     revise_output_path: Optional[str] = None,
     add_output_path: Optional[str] = None,
     force: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Process a SortSwift batch CSV file from disk."""
     with open(input_path, "r", encoding="utf-8", errors="replace") as f:
@@ -886,6 +931,7 @@ def process_batch_file(
         db,
         source_name=os.path.basename(input_path),
         force=force,
+        dry_run=dry_run,
     )
     if revise_output_path and result["revise_count"] > 0:
         with open(revise_output_path, "w", encoding="utf-8", newline="") as f:

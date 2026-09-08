@@ -306,6 +306,7 @@ async def process_orders_endpoint(
 async def process_batch_endpoint(
     file: UploadFile = File(...),
     force: bool = Form(False),
+    dry_run: bool = Form(False),
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
@@ -314,6 +315,9 @@ async def process_batch_endpoint(
     Quantities are additive, so re-processing the same export would inflate live
     eBay stock. Uploads are fingerprinted and a repeat of an already-processed
     file is refused unless the caller explicitly passes force=true.
+
+    Pass dry_run=true to rebuild the CSVs from current settings without writing
+    anything to the catalogue or store mirror.
     """
     content_bytes = await file.read()
     csv_text = content_bytes.decode("utf-8", errors="replace")
@@ -322,6 +326,7 @@ async def process_batch_endpoint(
         db,
         source_name=file.filename or "upload.csv",
         force=force,
+        dry_run=dry_run,
     )
     return result
 

@@ -925,6 +925,83 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         parent = next(r for r in rows if r["Title"])
         self.assertEqual(parent["C:Set"], "eBay Set Name")
 
+    # ------------------------------------------------------------------
+    # Download-only (dry run) regeneration
+    # ------------------------------------------------------------------
+
+    def _full_state(self):
+        return (
+            [tuple(sorted(r.items())) for r in self.db.export_all_manifest()],
+            self.db.get_stats(),
+            self.db.get_inventory(limit=1000),
+        )
+
+    def test_dry_run_writes_nothing_but_still_produces_files(self):
+        process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
+        before = self._full_state()
+
+        res = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
+        )
+        self.assertTrue(res["dry_run"])
+        # Not reported as a duplicate: a read-only rebuild is always safe.
+        self.assertFalse(res["duplicate"])
+        self.assertEqual(res["add_count"], 2, "the files must still be generated")
+        self.assertEqual(self._full_state(), before, "dry run mutated state")
+
+    def test_dry_run_does_not_fingerprint_the_batch(self):
+        res = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
+        )
+        # Nothing was catalogued, so nothing could be emitted...
+        self.assertEqual(res["add_count"], 0)
+        # ...and the batch must remain un-fingerprinted so a real run still works.
+        real = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
+        self.assertFalse(real["duplicate"])
+        self.assertEqual(real["add_count"], 2)
+
+    def test_dry_run_uses_current_settings_not_the_previous_output(self):
+        process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
+        self.db.set_listing_settings({
+            "seller_postal_code": "10001",
+            "default_game": "Changed Game",
+        })
+        res = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
+        )
+        parent = next(
+            r for r in csv.DictReader(io.StringIO(res["add_csv"])) if r["Title"]
+        )
+        # The whole point of rebuilding is to pick up changed settings.
+        self.assertEqual(parent["PostalCode"], "10001")
+        self.assertEqual(parent["C:Game"], "Changed Game")
+
+    def test_dry_run_skips_cards_not_yet_catalogued(self):
+        res = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
+        )
+        self.assertEqual(res["add_count"], 0)
+        self.assertEqual(res["skipped_count"], 2)
+        self.assertTrue(
+            any("not in the catalogue yet" in lg["message"] for lg in res["logs"]),
+            "the skip reason should explain why an ID cannot be minted",
+        )
+
+    def test_dry_run_does_not_double_the_revise_quantity(self):
+        process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
+        # Put a card live on eBay so the revise path is exercised.
+        self.db.upsert_variation("ID1001", "998877665544", 3)
+
+        res = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
+        )
+        revise = list(csv.DictReader(io.StringIO(res["revise_csv"])))
+        self.assertTrue(revise)
+        # The mirror already includes this batch, so the file reports it as-is
+        # rather than adding the batch quantity a second time.
+        self.assertEqual(revise[0]["Quantity"], "3")
+        self.assertEqual(self.db.get_variation("ID1001")["last_known_qty"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

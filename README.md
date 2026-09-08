@@ -323,9 +323,24 @@ been applied is **refused before any database write happens** — the run return
 early, so a conflicting batch is a true no-op rather than a partial apply.
 
 The dashboard then shows an inline warning naming when the file was last
-processed, alongside an explicit **"Force process anyway"** button. Nothing is
-auto-processed while a conflict is outstanding; you have to click through.
-The CLI equivalent is `--force`.
+processed, alongside two explicit choices. Nothing is auto-processed while a
+conflict is outstanding.
+
+| Button | Effect | CLI |
+|---|---|---|
+| **Download only — no inventory change** | Rebuilds both CSVs from your **current settings** and writes nothing at all: no catalogue entries, no quantity accumulation, no store-mirror update, no fingerprint. | `--dry-run` |
+| **Force process (adds quantities)** | Applies the batch a second time. Quantities are added again. | `--force` |
+
+"Download only" is the common case: you already processed the batch, then
+changed a setting (a policy name, the postal code, the `C:Game` value) and need
+the CSV rebuilt. It re-renders from scratch rather than replaying a stored file,
+so the corrections are picked up.
+
+Because it never writes, it cannot mint a manifest ID — a card not yet in the
+catalogue is skipped with a warning rather than being catalogued silently. For
+a card already live on eBay it reports the mirror's current quantity rather than
+adding the batch quantity again, so the rebuilt file matches what was uploaded
+the first time.
 
 ### Generated files are never auto-downloaded
 
