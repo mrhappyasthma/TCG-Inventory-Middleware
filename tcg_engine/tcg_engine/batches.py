@@ -42,6 +42,21 @@ ITEM_SPECIFIC_PATTERN = re.compile(r"^\*?C:(.+)$", re.IGNORECASE)
 # export omits it, using a configurable default.
 GAME_ITEM_SPECIFIC = "C:Game"
 
+# Item specifics we can build from the plain SortSwift columns already parsed
+# for other purposes. This maps an eBay specific to the input columns it can be
+# read from -- it does not invent or translate values, so a plain (non-eBay)
+# export still produces a listing with the specifics eBay expects. An explicit
+# "C:"-prefixed column in the upload always wins over these.
+DERIVED_ITEM_SPECIFICS = (
+    ("C:Game", ["Game"]),
+    ("C:Set", ["Set", "Set Name", "Expansion", "Edition"]),
+    ("C:Card Name", ["Name", "Product Name", "Card Name", "Card", "Product"]),
+    ("C:Card Number", ["Card Number", "Number"]),
+    ("C:Language", ["Language", "Lang", "Language (Full Name)"]),
+    ("C:Rarity", ["Rarity"]),
+    ("C:Finish", ["Printing", "Finish", "Variant", "Foil"]),
+)
+
 
 def _detect_item_specific_columns(fieldnames) -> Dict[str, str]:
     """
@@ -372,10 +387,30 @@ def process_batch_csv(
     # Item specifics are discovered from the uploaded file's own headers, so
     # whatever your export provides is forwarded without needing a mapping.
     item_specific_columns = _detect_item_specific_columns(reader.fieldnames)
+
+    # Derived specifics only apply where the upload has no explicit C: column
+    # for them and does have a plain column to read from.
+    present = {str(f).strip().lower() for f in (reader.fieldnames or []) if f}
+    derived_specifics = tuple(
+        (out_col, candidates)
+        for out_col, candidates in DERIVED_ITEM_SPECIFICS
+        if out_col not in set(item_specific_columns.values())
+        and any(c.strip().lower() in present for c in candidates)
+    )
+
     item_specific_outputs = sorted(
-        set(item_specific_columns.values()) | {GAME_ITEM_SPECIFIC}
+        set(item_specific_columns.values())
+        | {out for out, _ in derived_specifics}
+        | {GAME_ITEM_SPECIFIC}
     )
     add_headers = ADD_HEADERS + list(active_policies) + item_specific_outputs
+
+    if item_specific_outputs:
+        forwarded = ", ".join(item_specific_outputs)
+        logs.append({
+            "level": "INFO",
+            "message": f"eBay item specifics included: {forwarded}",
+        })
 
     # Refuse a replay of an already-processed file unless explicitly forced.
     batch_hash = hashlib.sha256(csv_text.encode("utf-8", errors="replace")).hexdigest()
@@ -589,9 +624,23 @@ def process_batch_csv(
             value = str(row.get(source_col) or "").strip()
             if value:
                 row_specifics[out_col] = value
-        if not row_specifics.get(GAME_ITEM_SPECIFIC):
+        for out_col, candidates in derived_specifics:
+            if row_specifics.get(out_col):
+                continue
+            value = str(_find_column(row, candidates) or "").strip()
+            if value:
+                row_specifics[out_col] = value
+        # Game is the one specific where the configured value OVERRIDES the
+        # export rather than merely filling a gap. eBay only accepts values from
+        # its own list for the category (e.g. "Pokemon TCG" with an accented e),
+        # and SortSwift exports a looser label such as "Pokemon", which eBay
+        # rejects as invalid. The export's value is used only when no setting is
+        # configured.
+        if default_game:
+            row_specifics[GAME_ITEM_SPECIFIC] = default_game
+        elif not row_specifics.get(GAME_ITEM_SPECIFIC):
             game = str(_find_column(row, ["Game", "*C:Game", "C:Game"]) or "").strip()
-            row_specifics[GAME_ITEM_SPECIFIC] = game or default_game
+            row_specifics[GAME_ITEM_SPECIFIC] = game
 
         # Accumulate our own catalogued stock count for this card.
         db.increment_manifest_quantity(manifest_id, quantity)

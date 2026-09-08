@@ -822,6 +822,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertNotIn("*C:Game", header)
 
     def test_parent_keeps_only_specifics_shared_by_the_whole_group(self):
+        # Clear the overriding setting so the export-supplied value is used.
+        self.db.set_listing_settings({"default_game": ""})
         res = process_batch_csv(self.EBAY_EXPORT_BATCH, self.db)
         rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
         parent = next(r for r in rows if r["Title"])
@@ -846,6 +848,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
                 self.assertEqual(r["C:Game"], "Fallback Game")
 
     def test_bare_game_column_is_normalised(self):
+        # Clear the overriding setting so the export-supplied value is used.
+        self.db.set_listing_settings({"default_game": ""})
         hdr = (
             '"Game","Set","Name","Market Price","Condition","Printing",'
             '"Quantity","Remarks","SKU Id","*ConditionID"'
@@ -857,6 +861,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(parent["C:Game"], "Some Game")
 
     def test_single_listing_keeps_all_of_its_own_specifics(self):
+        # Clear the overriding setting so the export-supplied value is used.
+        self.db.set_listing_settings({"default_game": ""})
         batch = self.EBAY_EXPORT_BATCH.replace('"0.17"', '"40.00"')
         res = process_batch_csv(batch, self.db)
         rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
@@ -865,6 +871,59 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         for r in rows:
             self.assertEqual(r["C:Game"], "Test TCG")
             self.assertTrue(r["C:Card Name"], "a single keeps its own card name")
+
+    PLAIN_EXPORT_BATCH = """"Game","Set","Set Code","Card Number","Name","Rarity","Market Price","Condition","Language","Printing","Quantity","Remarks","SKU Id","*ConditionID"
+"Pokemon","SWSH06: Chilling Reign","CRE","121/198","Crushing Gloves","Uncommon","0.17","NM","English","Normal",1,"C-1",111,"4000"
+"Pokemon","SWSH06: Chilling Reign","CRE","004/198","Heracross","Common","0.17","NM","English","Normal",2,"C-1",112,"4000"
+"""
+
+    def test_specifics_are_derived_from_plain_sortswift_columns(self):
+        """A plain export with no C: columns still gets eBay specifics."""
+        res = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db)
+        header = res["add_csv"].splitlines()[0].split(",")
+        for column in ("C:Game", "C:Set", "C:Card Name", "C:Card Number",
+                       "C:Language", "C:Rarity", "C:Finish"):
+            self.assertIn(column, header, f"{column} should be derived")
+
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        parent = next(r for r in rows if r["Title"])
+        # Uniform across the group.
+        self.assertEqual(parent["C:Set"], "SWSH06: Chilling Reign")
+        self.assertEqual(parent["C:Language"], "English")
+        self.assertEqual(parent["C:Finish"], "Normal")
+        # Varies per card, so not stated at listing level.
+        self.assertEqual(parent["C:Rarity"], "")
+        self.assertEqual(parent["C:Card Number"], "")
+
+    def test_configured_game_overrides_the_export_value(self):
+        """eBay only accepts its own Game values, so the setting wins."""
+        self.db.set_listing_settings({"default_game": "Pokemon TCG (exact)"})
+        res = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db)
+        for r in csv.DictReader(io.StringIO(res["add_csv"])):
+            if r["Title"]:
+                # Not "Pokemon", which is what the export says.
+                self.assertEqual(r["C:Game"], "Pokemon TCG (exact)")
+
+    def test_blank_game_setting_falls_back_to_the_export(self):
+        self.db.set_listing_settings({"default_game": ""})
+        res = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db)
+        for r in csv.DictReader(io.StringIO(res["add_csv"])):
+            if r["Title"]:
+                self.assertEqual(r["C:Game"], "Pokemon")
+
+    def test_explicit_c_column_beats_a_derived_one(self):
+        hdr = (
+            '"*C:Set","Set","Name","Market Price","Condition","Printing",'
+            '"Quantity","Remarks","SKU Id","*ConditionID"'
+        )
+        row = (
+            '"eBay Set Name","Internal Set Name","Deerling","0.17","NM","Normal",'
+            '1,"C-1",111,"4000"'
+        )
+        res = process_batch_csv(chr(10).join([hdr, row]) + chr(10), self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        parent = next(r for r in rows if r["Title"])
+        self.assertEqual(parent["C:Set"], "eBay Set Name")
 
 
 if __name__ == "__main__":

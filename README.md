@@ -446,11 +446,40 @@ Two rules govern where they land:
 * **Single listings carry all of their own specifics**, since there is no group
   to reconcile.
 
-`Game` is special-cased because eBay always requires it: a bare `Game` column is
-normalised to `C:Game`, and if the export has no game information at all the
-**Default `C:Game` item specific** setting under Listing Rules is used (shipped
-as `Pokémon TCG`). The value must be one eBay accepts for the category — if it is
-rejected, check the exact spelling and accent against an existing listing.
+**Specifics are also derived from plain columns.** If your export has no `C:`
+columns at all, the following are built from the ordinary SortSwift columns
+already parsed, so a plain export still produces a compliant listing:
+
+| eBay specific | Read from |
+|---|---|
+| `C:Game` | `Game` |
+| `C:Set` | `Set`, `Set Name`, `Expansion`, `Edition` |
+| `C:Card Name` | `Name`, `Product Name`, `Card Name` |
+| `C:Card Number` | `Card Number`, `Number` |
+| `C:Language` | `Language` |
+| `C:Rarity` | `Rarity` |
+| `C:Finish` | `Printing`, `Finish`, `Variant`, `Foil` |
+
+An explicit `C:`-prefixed column in the upload always wins over a derived one.
+Each run logs exactly which specifics it included, so you can see what eBay will
+receive:
+
+```
+[INFO] eBay item specifics included: C:Card Name, C:Card Number, C:Finish,
+       C:Game, C:Language, C:Rarity, C:Set
+```
+
+#### `Game` is an override, not a fallback
+
+`Game` is the one specific where the configured value **overrides** the export.
+eBay only accepts values from its own list for the category — `Pokémon TCG`,
+accent included — while SortSwift exports a looser label such as `Pokemon`,
+which eBay rejects as invalid. So the **`C:Game` item specific** setting under
+Listing Rules wins; clear it to fall back to the export's value.
+
+Copy the value verbatim from one of your own existing listings. The safest way
+to find any required specific and its exact spelling is to open a live listing
+of the same kind and read them off it.
 
 ### ⚠️ Possibly still incomplete
 
