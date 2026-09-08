@@ -1,6 +1,8 @@
 # Project Guidelines & Rules: TCG Card Inventory Middleware
 
-## 1. 🔄 Git Commit Workflow & History Tracking (Mandatory Rule)
+## 1. 🔄 Git Commit & Push Workflow (Mandatory Rule)
+
+* **Remote**: [`github.com/mrhappyasthma/TCG-Inventory-Middleware`](https://github.com/mrhappyasthma/TCG-Inventory-Middleware) (`origin`, branch `main`).
 
 * **Commit Every Change**: Always create a clean git commit after completing each feature implementation, bug fix, refactoring, or configuration update.
 * **Verify Before Committing**: Always run the automated test suites before committing to ensure no regressions:
@@ -15,7 +17,10 @@
   * `test: <summary>` for test additions or updates
   * `docs: <summary>` for documentation or guideline changes
   * `chore: <summary>` for configuration, Docker, or dependency adjustments
+* **Push Immediately After Committing**: Run `git push origin main` as soon as each commit is created. Do not batch commits up locally and do not wait to be asked — the NAS deploys via `git pull origin main`, so an unpushed commit cannot be deployed.
 * **Atomic & Reversible**: Keep commits logical and granular so that changes can be easily tracked, reviewed, or rolled back if needed.
+* **History is Append-Only Once Pushed**: The standing push permission covers ordinary commits to `main` only. Force-pushing, rewriting or rebasing pushed commits, creating tags or releases, and deleting branches all require asking first.
+* **Never Commit Secrets**: `.env`, `data/*.db` and `data/.session_secret` are gitignored and must stay that way. `.env.example` carries empty placeholders only — never a real `GOOGLE_CLIENT_ID` or `JWT_SECRET`.
 
 ---
 

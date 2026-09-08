@@ -161,11 +161,12 @@ any other reverse-proxied service on the NAS.
    mkdir -p /volume1/docker/tcg-middleware/data
    chmod -R 777 /volume1/docker/tcg-middleware/data
    ```
-2. On your local machine, push your changes to GitHub:
+2. Make sure your work is on GitHub. Commits are pushed to
+   [`mrhappyasthma/TCG-Inventory-Middleware`](https://github.com/mrhappyasthma/TCG-Inventory-Middleware)
+   as they are made, so this is normally just a check:
    ```bash
-   git add .
-   git commit -m "Deploy latest changes"
-   git push origin main
+   git status            # should be clean
+   git log origin/main..HEAD   # should be empty
    ```
 3. On your Synology NAS (via SSH or Container Manager Web UI):
    ```bash
