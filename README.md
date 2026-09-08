@@ -45,7 +45,7 @@ Google requires OAuth JavaScript origins to use **HTTPS** and **rejects raw IP a
 | `http://192.168.1.50:8080` | ❌ Never — raw IP and plain HTTP |
 | `http://tcg.local:8080` | ❌ Plain HTTP, non-localhost |
 | `http://localhost:8080` | ✅ The one plain-HTTP exception |
-| `https://yourname.synology.me` | ✅ Recommended for the NAS |
+| `https://cards.yourname.synology.me` | ✅ Recommended for the NAS (see Step 2) |
 
 So reaching the dashboard on your NAS requires an HTTPS hostname in front of the container. The setup is walked through below.
 
@@ -77,8 +77,8 @@ Google reorganized these screens into the **Google Auth Platform**; the old
    * **Application type**: `Web application`
    * **Name**: anything, e.g. "TCG Middleware Web"
 7. Under **Authorized JavaScript origins**, click **Add URI** for each of:
-   * `https://yourname.synology.me` - production (scheme + host, no path, no
-     trailing slash)
+   * `https://cards.yourname.synology.me` - production (scheme + host, no
+     path, no trailing slash, no `:443`)
    * `http://localhost:8080` - Windows development
    * `http://localhost` - optional, harmless, avoids port surprises
 8. Leave **Authorized redirect URIs empty.** The Google Identity Services
@@ -105,14 +105,46 @@ Google reorganized these screens into the **Google Auth Platform**; the old
 | `Access blocked: app has not completed verification` | The app is still in *Testing* and your account is not listed under **Audience > Test users**. |
 | One Tap prompt never appears on `http://localhost` | Expected: One Tap requires HTTPS. The standard sign-in button still works. |
 
-### Step 2 — Put HTTPS in front of the container (Synology)
+### Step 2 - Put HTTPS in front of the container (Synology)
 
-1. **Control Panel → External Access → DDNS** → add a Synology-provided hostname such as `yourname.synology.me`.
-2. **Control Panel → Security → Certificate → Add** → *Get a certificate from Let's Encrypt* for that hostname. Ports 80/443 must be reachable from the internet for issuance and automatic renewal.
-3. **Control Panel → Login Portal → Advanced → Reverse Proxy** → create a rule:
-   * Source: `https` / `yourname.synology.me` / port `443`
-   * Destination: `http` / `localhost` / port `8080`
-4. Keep `COOKIE_SECURE=true` in the NAS `.env`. DSM terminates TLS; the container continues to serve plain HTTP internally on `8080`.
+Give the app **its own subdomain** rather than serving it on the bare DDNS
+hostname. Synology resolves any subdomain of your DDNS name to the same NAS, so
+`cards.yourname.synology.me` works with no extra DNS configuration.
+
+This is not just cosmetic. All of this app's requests are rooted at `/`
+(`/static/app.js`, `/api/...`), so a path-based proxy rule such as
+`/cards/ -> localhost:8080` would break every asset and API call. Host-based
+routing on a subdomain needs no rewriting. It also keeps the app on its own
+browser origin, so its session cookie is not shared with DSM's own web UI or
+any other reverse-proxied service on the NAS.
+
+1. **Control Panel > External Access > DDNS** - add a Synology-provided
+   hostname, e.g. `yourname.synology.me`. You register only this one name; the
+   subdomain below needs no separate registration.
+2. **Control Panel > Security > Certificate > Add > Add a new certificate >
+   Get a certificate from Let's Encrypt**, then:
+   * **Domain name**: `yourname.synology.me`
+   * **Subject Alternative Name**: `*.yourname.synology.me`
+
+   The wildcard SAN covers the bare hostname *and* every subdomain, so one
+   certificate serves this app and anything else you host later, with a single
+   renewal. Wildcard issuance is supported for Synology DDNS domains
+   specifically; it is not available through the wizard for custom domains.
+3. **Control Panel > Login Portal > Advanced > Reverse Proxy > Create**:
+   * Source: `HTTPS` / `cards.yourname.synology.me` / port `443`
+   * Destination: `HTTP` / `localhost` / port `8080`
+   * On the **Custom Header** tab, use **Create > WebSocket** if you later add
+     any streaming endpoints. Not required today.
+4. Set the certificate for that subdomain under **Control Panel > Security >
+   Certificate > Settings**, pointing `cards.yourname.synology.me` at the
+   wildcard certificate.
+5. Keep `COOKIE_SECURE=true` in the NAS `.env`. DSM terminates TLS; the
+   container keeps serving plain HTTP internally on `8080`.
+6. Register the subdomain as the authorized JavaScript origin in Google Cloud
+   Console - **exactly** `https://cards.yourname.synology.me`, with no port and
+   no trailing slash. Origins are matched exactly, so the bare
+   `https://yourname.synology.me` is a *different* origin and would be
+   rejected. Register both only if you intend to browse to both.
 
 ---
 
@@ -141,7 +173,7 @@ Google reorganized these screens into the **Google Auth Platform**; the old
    git pull origin main
    docker-compose up -d --build
    ```
-4. Access the dashboard at `https://yourname.synology.me`.
+4. Access the dashboard at `https://cards.yourname.synology.me`.
 
 `docker-compose` will refuse to start if `GOOGLE_CLIENT_ID` is not set in the environment or `.env`.
 
