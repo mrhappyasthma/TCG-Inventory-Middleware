@@ -1094,6 +1094,53 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         built = build_variation_option_name("Weird=Card", "1/10")
         self.assertNotIn("=", built)
 
+    # ------------------------------------------------------------------
+    # Purging inventory for a clean test run
+    # ------------------------------------------------------------------
+
+    def test_purge_clears_inventory_but_keeps_configuration(self):
+        process_batch_csv(self.NUMBERED_BATCH, self.db, source_name="b.csv")
+        self.db.upsert_variation("ID1001", "998877665544", 5)
+        self.db.set_listing_settings({"seller_postal_code": "10001"})
+
+        self.assertGreater(self.db.get_stats()["total_cards"], 0)
+
+        counts = self.db.purge_inventory()
+        self.assertEqual(counts["manifest"], 3)
+        self.assertEqual(counts["processed_batches"], 1)
+
+        stats = self.db.get_stats()
+        self.assertEqual(stats["total_cards"], 0)
+        self.assertEqual(stats["active_listings"], 0)
+        self.assertEqual(self.db.get_inventory(limit=100), [])
+
+        # Configuration must survive: a reset for testing should not also
+        # discard the seller setup.
+        settings = self.db.get_listing_settings()
+        self.assertEqual(settings["seller_postal_code"], "10001")
+        self.assertEqual(settings["shipping_profile_name"], "Free Shipping Cards")
+        self.assertGreaterEqual(len(self.db.get_pricing_rules()), 4)
+
+    def test_purge_allows_the_same_batch_to_be_reprocessed(self):
+        process_batch_csv(self.NUMBERED_BATCH, self.db, source_name="b.csv")
+        # Refused as a duplicate before the purge.
+        self.assertTrue(
+            process_batch_csv(self.NUMBERED_BATCH, self.db, source_name="b.csv")["duplicate"]
+        )
+
+        self.db.purge_inventory()
+
+        again = process_batch_csv(self.NUMBERED_BATCH, self.db, source_name="b.csv")
+        self.assertFalse(again["duplicate"])
+        self.assertEqual(again["add_count"], 3)
+        # IDs restart, since the catalogue is empty.
+        self.assertEqual(self.db.get_next_manifest_id(), "ID1004")
+
+    def test_purge_on_an_empty_database_is_harmless(self):
+        counts = self.db.purge_inventory()
+        self.assertEqual(counts["manifest"], 0)
+        self.assertEqual(self.db.get_stats()["total_cards"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

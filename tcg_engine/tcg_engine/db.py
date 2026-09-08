@@ -832,6 +832,30 @@ class Database:
             row = cursor.fetchone()
             return row["value"] if row else default
 
+    def purge_inventory(self) -> Dict[str, int]:
+        """
+        Delete the catalogue, the live store mirror and the batch fingerprints.
+
+        Configuration is deliberately preserved: pricing rules and listing
+        settings (postal code, business policies, templates) survive, so a
+        testing reset does not also throw away setup. Deleting the database
+        file would take those with it.
+
+        Returns the number of rows removed from each table.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            counts = {}
+            for table in ("ebay_variations", "manifest", "processed_batches"):
+                cursor.execute(f"SELECT COUNT(*) AS n FROM {table}")
+                counts[table] = cursor.fetchone()["n"]
+            # ebay_variations first: it references manifest.
+            cursor.execute("DELETE FROM ebay_variations")
+            cursor.execute("DELETE FROM manifest")
+            cursor.execute("DELETE FROM processed_batches")
+            conn.commit()
+            return counts
+
     def find_processed_batch(self, sha256: str) -> Optional[Dict[str, Any]]:
         """Return the record of a previously processed batch upload, if any."""
         with self.get_connection() as conn:

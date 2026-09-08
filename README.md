@@ -248,7 +248,33 @@ python -m tcg_engine.cli sync active_listings.csv --db data/inventory.db
 
 # Export Master Catalog
 python -m tcg_engine.cli export-manifest -o master_manifest.csv --db data/inventory.db
+
+# Purge the catalog for a clean test run (see below)
+python -m tcg_engine.cli purge --db data/inventory.db
 ```
+
+### Purging inventory while testing
+
+```powershell
+# Shows what would be deleted and exits without touching anything
+python -m tcg_engine.cli purge --db data/inventory.db
+
+# Actually delete
+python -m tcg_engine.cli purge --yes --db data/inventory.db
+```
+
+This clears the **master catalog**, the **live store mirror** and the
+**processed-batch fingerprints**, so manifest IDs restart at `ID1001` and a
+previously uploaded batch can be processed again.
+
+Your **pricing rules and listing settings survive** — postal code, business
+policy names, `C:Game`, templates, the cover photo. That is the reason to prefer
+this over deleting `data/inventory.db`, which would take your whole setup with
+it. Use the file deletion only when you want to reset the configuration too.
+
+Without `--yes` the command is a dry run: it prints the row counts it would
+remove and exits.
+
 
 ---
 

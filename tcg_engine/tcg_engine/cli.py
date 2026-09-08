@@ -85,6 +85,33 @@ def handle_export_manifest(args):
     print(f"Exported {len(items)} catalog records to: {output_path}")
 
 
+def handle_purge(args):
+    db = _get_db(args.db)
+    stats = db.get_stats()
+
+    if not args.yes:
+        print("This will permanently delete:")
+        print(f"  - {stats['total_cards']} master catalog cards")
+        print(f"  - {stats['active_listings']} live eBay listing links")
+        print("  - all processed-batch fingerprints")
+        print()
+        print("Your pricing rules and listing settings (postal code, business")
+        print("policies, templates) are NOT touched.")
+        print()
+        print("Nothing was deleted. Re-run with --yes to confirm:")
+        print(f"  python -m tcg_engine.cli purge --yes --db {args.db}")
+        return
+
+    counts = db.purge_inventory()
+    print("Purged:")
+    print(f"  manifest           {counts['manifest']} rows")
+    print(f"  ebay_variations    {counts['ebay_variations']} rows")
+    print(f"  processed_batches  {counts['processed_batches']} rows")
+    print()
+    print("Pricing rules and listing settings were preserved.")
+    print("You can now re-upload your batches from a clean slate.")
+
+
 def handle_status(args):
     db = _get_db(args.db)
     stats = db.get_stats()
@@ -101,7 +128,13 @@ def main():
         description="TCG Card Inventory Middleware: SortSwift <-> eBay CSV Bridge",
     )
     default_db = os.environ.get("DATABASE_URL", "data/inventory.db")
-    parser.add_argument(
+
+    # --db is declared on a shared parent rather than the top-level parser so
+    # that it can be written AFTER the subcommand, which is how every documented
+    # example reads: "cli batch file.csv --db data/inventory.db". An argparse
+    # option on the top-level parser only accepts the prefix position.
+    db_parent = argparse.ArgumentParser(add_help=False)
+    db_parent.add_argument(
         "--db",
         default=default_db,
         help=f"Path to SQLite database (default: {default_db})",
@@ -110,16 +143,21 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # init-db
-    p_init = subparsers.add_parser("init-db", help="Initialize SQLite database schema")
+    p_init = subparsers.add_parser(
+        "init-db",
+        parents=[db_parent], help="Initialize SQLite database schema")
     p_init.set_defaults(func=handle_init_db)
 
     # status
-    p_status = subparsers.add_parser("status", help="Show inventory statistics")
+    p_status = subparsers.add_parser(
+        "status",
+        parents=[db_parent], help="Show inventory statistics")
     p_status.set_defaults(func=handle_status)
 
     # orders (Module A)
     p_orders = subparsers.add_parser(
-        "orders", help="Module A: Convert eBay Orders CSV to SortSwift Orders Import CSV"
+        "orders",
+        parents=[db_parent], help="Module A: Convert eBay Orders CSV to SortSwift Orders Import CSV"
     )
     p_orders.add_argument("input_file", help="Path to raw eBay orders CSV")
     p_orders.add_argument("-o", "--output", help="Output path for SortSwift import CSV")
@@ -127,7 +165,8 @@ def main():
 
     # batch (Module B)
     p_batch = subparsers.add_parser(
-        "batch", help="Module B: Route SortSwift Scan Batch to Add vs. Revise eBay CSVs"
+        "batch",
+        parents=[db_parent], help="Module B: Route SortSwift Scan Batch to Add vs. Revise eBay CSVs"
     )
     p_batch.add_argument("input_file", help="Path to SortSwift batch CSV")
     p_batch.add_argument("--out-dir", default=".", help="Directory to save generated CSVs")
@@ -145,13 +184,29 @@ def main():
 
     # sync (Module C)
     p_sync = subparsers.add_parser(
-        "sync", help="Module C: Sync active eBay listings report into store mirror database"
+        "sync",
+        parents=[db_parent], help="Module C: Sync active eBay listings report into store mirror database"
     )
     p_sync.add_argument("input_file", help="Path to eBay Active Listings report CSV")
     p_sync.set_defaults(func=handle_sync)
 
+    # purge
+    p_purge = subparsers.add_parser(
+        "purge",
+        parents=[db_parent],
+        help="Delete the catalog, store mirror and batch fingerprints (keeps settings)",
+    )
+    p_purge.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually perform the deletion. Without it, only a summary is shown.",
+    )
+    p_purge.set_defaults(func=handle_purge)
+
     # export-manifest
-    p_export = subparsers.add_parser("export-manifest", help="Export full master catalog to CSV")
+    p_export = subparsers.add_parser(
+        "export-manifest",
+        parents=[db_parent], help="Export full master catalog to CSV")
     p_export.add_argument("-o", "--output", help="Output path for exported CSV")
     p_export.set_defaults(func=handle_export_manifest)
 
