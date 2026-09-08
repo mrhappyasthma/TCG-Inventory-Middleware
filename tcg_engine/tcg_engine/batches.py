@@ -25,54 +25,65 @@ ADD_HEADERS = [
     "Price",
 ]
 
-# Standard eBay Condition IDs for Trading Card Singles
-CONDITION_MAP = {
-    "nm": ("Near Mint", "3000"),
-    "near mint": ("Near Mint", "3000"),
-    "mint": ("Near Mint", "3000"),
-    "lp": ("Lightly Played", "4000"),
-    "lightly played": ("Lightly Played", "4000"),
-    "excellent": ("Lightly Played", "4000"),
-    "mp": ("Moderately Played", "5000"),
-    "moderately played": ("Moderately Played", "5000"),
-    "good": ("Moderately Played", "5000"),
-    "hp": ("Heavily Played", "6000"),
-    "heavily played": ("Heavily Played", "6000"),
-    "played": ("Heavily Played", "6000"),
-    "dm": ("Damaged", "6000"),
-    "damaged": ("Damaged", "6000"),
-    "dmg": ("Damaged", "6000"),
-    "poor": ("Damaged", "6000"),
-}
+# eBay's variation syntax: within one attribute, values are separated by
+# semicolons; a pipe separates different attributes. Card names containing
+# either character would corrupt the RelationshipDetails field.
+VARIATION_VALUE_SEPARATOR = ";"
+VARIATION_ATTRIBUTE_SEPARATOR = "|"
+VARIATION_ATTRIBUTE_NAME = "Card"
+
+DEFAULT_VARIATION_TITLE_TEMPLATE = (
+    "{set_name}: Pick Your Card - {condition} - Complete Your Set"
+)
+
+
+def _sanitize_variation_value(value: str) -> str:
+    """
+    Make a card name safe to embed in RelationshipDetails.
+
+    A literal ';' or '|' inside a value would be read by eBay as a separator,
+    splitting one card into several bogus options.
+    """
+    cleaned = str(value or "").strip()
+    for sep in (VARIATION_VALUE_SEPARATOR, VARIATION_ATTRIBUTE_SEPARATOR):
+        cleaned = cleaned.replace(sep, "/")
+    return cleaned
 
 
 def generate_variation_title(
     set_name: str,
-    template: str = "{set_name}: Pick Your Card - Near Mint - Complete Your Set",
+    condition: str = "",
+    template: str = DEFAULT_VARIATION_TITLE_TEMPLATE,
 ) -> str:
     """
-    Generate an optimized eBay listing title for variation drop-down listings.
-    If longer than 80 chars, automatically replaces 'Near Mint' with 'NM'.
+    Build an eBay variation listing title within the 80-character limit.
+
+    The condition is substituted verbatim from the source data and is never
+    abbreviated or altered here: the title makes a factual claim about the
+    cards, so shortening it risks misdescribing them. When a title is too long
+    the set name is truncated instead.
     """
-    # 1. Try default template with full 'Near Mint'
-    title = template.replace("{set_name}", set_name.strip())
+    cond = str(condition or "").strip()
+
+    def render(tpl: str, s_name: str) -> str:
+        return tpl.replace("{set_name}", s_name).replace("{condition}", cond)
+
+    s_name = str(set_name or "").strip()
+
+    title = render(template, s_name)
     if len(title) <= 80:
         return title
 
-    # 2. Fallback: Replace 'Near Mint' with 'NM'
-    title_nm = template.replace("Near Mint", "NM").replace("{set_name}", set_name.strip())
-    if len(title_nm) <= 80:
-        return title_nm
+    # Legacy templates hardcode "Near Mint" instead of using {condition}.
+    # Shortening that literal is safe because it is template text, not data.
+    shortened = render(template.replace("Near Mint", "NM"), s_name)
+    if len(shortened) <= 80:
+        return shortened
 
-    # 3. Compact fallback
-    compact = f"{set_name.strip()}: Pick Your Card - NM - Complete Set"
-    if len(compact) <= 80:
-        return compact
-
-    # 4. Truncate set name to ensure <= 80 chars
-    suffix = ": Pick Your Card - NM"
-    avail = 80 - len(suffix)
-    return f"{set_name.strip()[:avail]}{suffix}"
+    # Last resort: trim the set name by exactly the overflow amount.
+    overflow = len(shortened) - 80
+    trimmed_set = s_name[: max(0, len(s_name) - overflow)].strip()
+    return render(template.replace("Near Mint", "NM"), trimmed_set)[:80]
 
 
 def _find_column(row: Dict[str, str], candidate_names: List[str]) -> Optional[str]:
@@ -141,7 +152,9 @@ def process_batch_csv(
 
     # Raw items to be added (categorized into singles vs variation sets)
     staged_singles: List[Dict[str, Any]] = []
-    staged_variations: Dict[str, List[Dict[str, Any]]] = {}  # set_name -> [cards]
+    # (set_name, condition) -> [cards]. Condition is part of the key because a
+    # variation listing carries a single ConditionID for all of its options.
+    staged_variations: Dict[tuple, List[Dict[str, Any]]] = {}
 
     new_catalog_count = 0
     skipped_count = 0
@@ -150,7 +163,7 @@ def process_batch_csv(
     single_threshold = float(db.get_listing_setting("single_threshold", "5.00"))
     title_template = db.get_listing_setting(
         "variation_title_template",
-        "{set_name}: Pick Your Card - Near Mint - Complete Your Set",
+        DEFAULT_VARIATION_TITLE_TEMPLATE,
     )
     category_id = db.get_listing_setting("category_id", "183454")
     group_by_set = str(db.get_listing_setting("group_by_set", "true")).strip().lower() not in (
@@ -219,7 +232,7 @@ def process_batch_csv(
         raw_condition = _find_column(row, [
             "Condition", "Condition Code", "Condition (Full Name)", "C:Card Condition",
             "Card Condition", "Grade",
-        ]) or "NM"
+        ])
         printing = _find_column(row, [
             "Printing", "*C:Finish", "Finish", "Variant", "Foil", "Foil (normal/foil)",
         ]) or "Normal"
@@ -268,14 +281,34 @@ def process_batch_csv(
             })
             continue
 
-        # Standardize Condition and ConditionID
-        # Prefer raw integer ConditionID from CSV column; fall back to string mapping
-        cond_clean = raw_condition.strip().lower()
-        condition_name, condition_id_mapped = CONDITION_MAP.get(cond_clean, (raw_condition.strip(), "3000"))
-        if raw_condition_id and str(raw_condition_id).strip().isdigit():
-            condition_id = str(raw_condition_id).strip()
-        else:
-            condition_id = condition_id_mapped
+        # Condition is passed through from the source export verbatim. We do not
+        # translate it: the value originates in SortSwift and is destined for
+        # eBay or back into SortSwift, so interposing our own vocabulary only
+        # creates a third one that can disagree with both.
+        condition_name = str(raw_condition or "").strip()
+        if not condition_name:
+            skipped_count += 1
+            logs.append({
+                "level": "WARN",
+                "message": f"Row {row_idx}: No Condition value. Skipped rather than guessing the card's condition.",
+            })
+            continue
+
+        # eBay requires a numeric ConditionID for category 183454. It must come
+        # from the input; we will not infer one.
+        condition_id = str(raw_condition_id or "").strip()
+        if not condition_id.isdigit():
+            skipped_count += 1
+            logs.append({
+                "level": "WARN",
+                "message": (
+                    f"Row {row_idx}: No numeric ConditionID column for "
+                    f"'{product_name}' (Condition: {condition_name}). Skipped rather "
+                    f"than guessing. Re-export from SortSwift including the "
+                    f"ConditionID column."
+                ),
+            })
+            continue
 
         try:
             quantity = int(qty_str.strip()) if qty_str else 1
@@ -366,12 +399,11 @@ def process_batch_csv(
                     "message": f"Row {row_idx}: [ADD SINGLE] [{ebay_custom_label}] {product_name} (Price: ${effective_price:.2f} >= ${single_threshold:.2f} threshold)",
                 })
             else:
-                if set_name not in staged_variations:
-                    staged_variations[set_name] = []
-                staged_variations[set_name].append(card_entry)
+                group_key = (set_name, condition_name)
+                staged_variations.setdefault(group_key, []).append(card_entry)
                 logs.append({
                     "level": "SUCCESS",
-                    "message": f"Row {row_idx}: [ADD VARIATION] [{ebay_custom_label}] {product_name} grouped into '{set_name}' (Price: ${effective_price:.2f})",
+                    "message": f"Row {row_idx}: [ADD VARIATION] [{ebay_custom_label}] {product_name} grouped into '{set_name}' / {condition_name} (Price: ${effective_price:.2f})",
                 })
 
     # -----------------------------------------------------------------
@@ -379,28 +411,39 @@ def process_batch_csv(
     # -----------------------------------------------------------------
     final_add_rows: List[Dict[str, Any]] = []
 
-    # 1. Multi-Item Variation Listings (grouped by Set)
-    for set_title, cards in staged_variations.items():
+    # 1. Multi-Item Variation Listings (one per set + condition)
+    for (set_title, group_condition), cards in staged_variations.items():
         if not cards:
             continue
 
         # Generate Parent Container Row
-        parent_title = generate_variation_title(set_title, template=title_template)
+        parent_title = generate_variation_title(
+            set_title, condition=group_condition, template=title_template
+        )
         cover_image = next((c["cdn_image"] for c in cards if c["cdn_image"]), "")
-        
-        # Build list of variation card options for parent container
-        # Format: Card=Name1|Name2|Name3...
-        option_names = [c["product_name"].replace("|", "/") for c in cards]
-        parent_rel_details = "Card=" + "|".join(option_names)
 
-        # Append Parent Container Row
+        # Declare the option list on the parent. eBay separates values within
+        # one attribute by semicolons; a pipe would be read as the start of a
+        # second attribute and rejected.
+        option_names = [_sanitize_variation_value(c["product_name"]) for c in cards]
+        parent_rel_details = (
+            f"{VARIATION_ATTRIBUTE_NAME}="
+            + VARIATION_VALUE_SEPARATOR.join(option_names)
+        )
+
+        # Append Parent Container Row. The parent leaves Relationship EMPTY;
+        # only the child rows are marked "Variation". Marking the parent too
+        # leaves eBay unable to tell which row is the container.
         final_add_rows.append({
             "Action": "Add",
             "Category": category_id,
             "Title": parent_title,
-            "Relationship": "Variation",
+            "Relationship": "",
             "RelationshipDetails": parent_rel_details,
-            "Description": f"Pick Your Card from {set_title}! Near Mint / Mint condition. Complete your collection.",
+            "Description": (
+                f"Pick Your Card from {set_title}! "
+                f"Condition: {group_condition}. Complete your collection."
+            ),
             "ConditionID": cards[0]["condition_id"],
             "StartPrice": "",
             "Quantity": "",
@@ -418,7 +461,10 @@ def process_batch_csv(
                 "Category": category_id,
                 "Title": "",
                 "Relationship": "Variation",
-                "RelationshipDetails": f"Card={c['product_name'].replace('|', '/')}",
+                "RelationshipDetails": (
+                    f"{VARIATION_ATTRIBUTE_NAME}="
+                    f"{_sanitize_variation_value(c['product_name'])}"
+                ),
                 "Description": "",
                 "ConditionID": c["condition_id"],
                 "StartPrice": f"{c['price']:.2f}",
@@ -481,7 +527,7 @@ def process_batch_csv(
 
     logs.append({
         "level": "INFO",
-        "message": f"Batch routing finished: {len(revise_rows)} items to REVISE, {len(staged_variations)} Set Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
+        "message": f"Batch routing finished: {len(revise_rows)} items to REVISE, {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
     })
 
     # Fingerprint only after the batch has actually been applied, so a failure

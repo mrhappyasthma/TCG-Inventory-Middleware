@@ -18,17 +18,9 @@ os.environ["COOKIE_SECURE"] = "false"
 from app.main import app, db, user_db  # noqa: E402
 
 # A SortSwift export row, reused so the duplicate-batch guard can be exercised.
-BATCH_CSV = (
-    '"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity",'
-    '"Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language",'
-    '"Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC",'
-    '"CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price",'
-    '"Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price"\n'
-    '"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162",'
-    '"Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,'
-    '"","Bin A-12",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg",'
-    '"https://cdn.example.com/back.jpg","0.00","0.15","","","","","","",""\n'
-)
+BATCH_CSV = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
+"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","Bin A-12",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","https://cdn.example.com/back.jpg","0.00","0.15","","","","","","","","4000"
+"""
 
 
 def google_claims(sub, email, name):
@@ -265,7 +257,7 @@ class TestWebApp(unittest.TestCase):
             "settings": {
                 "single_threshold": "6.00",
                 "group_by_set": "false",
-                "variation_title_template": "{set_name}: Pick Your Card - Near Mint - Complete Your Set",
+                "variation_title_template": "{set_name}: Pick Your Card - {condition} - Complete Your Set",
             }
         }
         res = self.client.post("/api/listing-settings", json=payload)
@@ -276,7 +268,7 @@ class TestWebApp(unittest.TestCase):
 
         preview = self.client.post(
             "/api/listing-settings/preview-title",
-            json={"set_name": "SV05: Temporal Forces"},
+            json={"set_name": "SV05: Temporal Forces", "condition": "Near Mint"},
         )
         self.assertEqual(preview.status_code, 200)
         self.assertEqual(

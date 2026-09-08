@@ -159,7 +159,7 @@ class Database:
                 default_settings = [
                     ("single_threshold", "5.00"),
                     ("group_by_set", "true"),
-                    ("variation_title_template", "{set_name}: Pick Your Card - Near Mint - Complete Your Set"),
+                    ("variation_title_template", "{set_name}: Pick Your Card - {condition} - Complete Your Set"),
                     ("category_id", "183454"),
                 ]
                 cursor.executemany(
@@ -169,6 +169,22 @@ class Database:
                     """,
                     default_settings,
                 )
+
+            # Migrate the title template off the hardcoded condition. A stored
+            # value equal to the old default was never customised, so it is safe
+            # to move it onto the {condition} placeholder; anything the user has
+            # edited is left untouched.
+            cursor.execute(
+                """
+                UPDATE listing_settings
+                SET value = ?
+                WHERE key = 'variation_title_template' AND value = ?
+                """,
+                (
+                    "{set_name}: Pick Your Card - {condition} - Complete Your Set",
+                    "{set_name}: Pick Your Card - Near Mint - Complete Your Set",
+                ),
+            )
             conn.commit()
 
     @staticmethod

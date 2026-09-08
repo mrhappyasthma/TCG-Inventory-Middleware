@@ -399,7 +399,7 @@ async function loadListingSettings() {
 async function saveListingSettings(e) {
     if (e && e.preventDefault) e.preventDefault();
     const threshold = document.getElementById("settingSingleThreshold").value || "5.00";
-    const template = document.getElementById("settingTitleTemplate").value || "{set_name}: Pick Your Card - Near Mint - Complete Your Set";
+    const template = document.getElementById("settingTitleTemplate").value || "{set_name}: Pick Your Card - {condition} - Complete Your Set";
     const groupBySet = document.getElementById("settingGroupBySet").checked;
 
     try {
@@ -430,51 +430,53 @@ async function saveListingSettings(e) {
 
 function resetListingSettings() {
     document.getElementById("settingSingleThreshold").value = "5.00";
-    document.getElementById("settingTitleTemplate").value = "{set_name}: Pick Your Card - Near Mint - Complete Your Set";
+    document.getElementById("settingTitleTemplate").value = "{set_name}: Pick Your Card - {condition} - Complete Your Set";
     document.getElementById("settingGroupBySet").checked = true;
     updateTitlePreview();
 }
 
+let titlePreviewTimer = null;
+
+// Ask the server to render the title rather than reimplementing the
+// 80-character fallback here. Two copies of that logic would inevitably drift.
 function updateTitlePreview() {
-    const setName = (document.getElementById("testSetTitleInput")?.value || "SV05: Temporal Forces").trim();
-    const template = document.getElementById("settingTitleTemplate")?.value || "{set_name}: Pick Your Card - Near Mint - Complete Your Set";
+    clearTimeout(titlePreviewTimer);
+    titlePreviewTimer = setTimeout(runTitlePreview, 200);
+}
 
-    // 1. Try default template with full 'Near Mint'
-    let title = template.replace("{set_name}", setName);
-
-    // 2. If longer than 80 chars, replace 'Near Mint' with 'NM'
-    if (title.length > 80) {
-        title = template.replace("Near Mint", "NM").replace("{set_name}", setName);
-    }
-
-    // 3. Compact fallback if still > 80 chars
-    if (title.length > 80) {
-        title = `${setName}: Pick Your Card - NM - Complete Set`;
-    }
-
-    // 4. Hard truncate set name if still > 80
-    if (title.length > 80) {
-        const suffix = ": Pick Your Card - NM";
-        const avail = 80 - suffix.length;
-        title = `${setName.substring(0, avail)}${suffix}`;
-    }
+async function runTitlePreview() {
+    const setName = (document.getElementById("testSetTitleInput")?.value || "").trim();
+    const condition = (document.getElementById("testConditionInput")?.value || "").trim();
+    const template = document.getElementById("settingTitleTemplate")?.value
+        || "{set_name}: Pick Your Card - {condition} - Complete Your Set";
 
     const displayEl = document.getElementById("generatedTitleDisplay");
     const countEl = document.getElementById("titleCharCount");
 
-    if (displayEl) displayEl.innerText = title;
-    if (countEl) {
-        countEl.innerText = `${title.length} / 80 Chars`;
-        if (title.length > 80) {
-            countEl.className = "font-mono text-rose-400 font-semibold";
-        } else {
-            countEl.className = "font-mono text-accent-cyan font-semibold";
+    try {
+        const res = await fetch("/api/listing-settings/preview-title", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ set_name: setName, condition, template })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Preview failed");
+
+        if (displayEl) displayEl.innerText = data.generated_title;
+        if (countEl) {
+            countEl.innerText = `${data.char_count} / 80 Chars`;
+            countEl.className = data.is_valid
+                ? "font-mono text-accent-cyan font-semibold"
+                : "font-mono text-rose-400 font-semibold";
         }
+    } catch (err) {
+        if (displayEl) displayEl.innerText = `Preview unavailable: ${err.message}`;
     }
 }
 
 document.getElementById("settingTitleTemplate")?.addEventListener("input", updateTitlePreview);
 document.getElementById("testSetTitleInput")?.addEventListener("input", updateTitlePreview);
+document.getElementById("testConditionInput")?.addEventListener("input", updateTitlePreview);
 
 // Admin User Management
 document.getElementById("btnAdminPanel").addEventListener("click", openAdminModal);

@@ -288,14 +288,16 @@ This is the precedence the engine actually applies, in order:
 
 Configure how the middleware splits and titles listings via the **"Listing Rules"** button on the dashboard:
 
-* **Automated Set Grouping** (`group_by_set`, default on): cards belonging to the same expansion set (e.g. `SV05: Temporal Forces`) are grouped into a single multi-variation drop-down listing. Turn this **off** to list every card individually regardless of price.
+* **Automated Set Grouping** (`group_by_set`, default on): cards sharing the same expansion set **and the same condition** are grouped into a single multi-variation drop-down listing. Condition is part of the grouping key because eBay applies one `ConditionID` to an entire listing, so a set holding both NM and LP cards correctly produces two listings rather than one mislabelled listing. Turn this **off** to list every card individually regardless of price.
 * **Single Listing Value Threshold** (`single_threshold`, default `$5.00`): cards whose effective calculated price is **equal to or above** the threshold are split out as **standalone Single listings**. This only applies while set grouping is on.
 * **Smart 80-Character Title Formatting**:
-  * Default Title: `{Set Name}: Pick Your Card - Near Mint - Complete Your Set`
-  * **Automatic Fallback**: if the set name is long enough to push the title past eBay's 80-character limit, the engine replaces `Near Mint` with `NM`, then falls back to a compact form, then truncates the set name as a last resort — so a bulk upload is never rejected for title length.
+  * Default Title: `{set_name}: Pick Your Card - {condition} - Complete Your Set`
+  * `{condition}` is substituted **verbatim** from your export, so the title always matches the cards it describes.
+  * **Automatic Fallback**: if the title exceeds eBay's 80-character limit, the **set name** is trimmed. The condition is never abbreviated or altered, because the title makes a factual claim about the cards.
 * **Parent & Child Row Generation** in `ebay_new_additions.csv`:
-  * **Parent Row**: `Relationship = Variation`, `RelationshipDetails = Card=Name1|Name2|...`, category `183454` (CCG Individual Cards), title, description and cover image.
+  * **Parent Row**: `Relationship` is left **empty**, `RelationshipDetails = Card=Name1;Name2;...`, category `183454` (CCG Individual Cards), title, description and cover image.
   * **Child Rows**: `Relationship = Variation`, `RelationshipDetails = Card=Name1`, price, quantity, `ConditionID`, `CustomLabel` (`ID1001-Bin_A-12`) and image.
+  * **Separators matter**: within one attribute eBay separates values with a semicolon; a pipe (`|`) begins a *different* attribute. A `;` or `|` appearing inside a card name is replaced with `/` so one card cannot be split into several bogus options.
 
 ---
 
@@ -324,7 +326,9 @@ To prevent that, every processed batch is fingerprinted (SHA-256 of the file con
 * **Input**: Fresh inventory CSV from SortSwift, or an eBay-style export with `*C:`-prefixed headers. Column matching is case-insensitive and accepts many aliases.
 * **Fields Read**: `Name`, `Set`, `Condition` (NM, LP, MP, HP, DM), `Printing`, `Quantity`, `SKU Id`, `TCGplayer Id`, `Card Number`, `Set Code`, `Language`, `Remarks`, `Price`, `Market Price`, `eBay Price`, `CDN Image`, `Card Back CDN Image`, `Stock Image`, `ConditionID`.
 * **Pricing**: see [How the base price is chosen](#how-the-base-price-is-chosen).
-* **Condition**: a numeric `ConditionID` column in the input is passed through verbatim; otherwise the condition string is mapped (`3000` NM, `4000` LP, `5000` MP, `6000` HP/DM).
+* **Condition**: both the `Condition` string and the numeric `ConditionID` are taken **verbatim from your export**. There is no translation table — the value originates in SortSwift and is destined for eBay or back into SortSwift, so interposing our own vocabulary would only create a third one that can disagree with both.
+  * A row missing either value is **skipped with a warning** rather than having a condition guessed for it. If you see those warnings, re-export from SortSwift with the `ConditionID` column included.
+  * One consequence: the Module A deduction CSV carries whatever string your export used (e.g. `NM`), not a normalised `Near Mint`. Matching on import is driven by `skuId` regardless.
 * **Output 1 (`ebay_inventory_updates.csv`)** — Revise:
   ```
   Action,Item Number,Custom Label,Quantity,Price

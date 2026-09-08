@@ -1,3 +1,5 @@
+import csv
+import io
 import os
 import sqlite3
 import tempfile
@@ -89,9 +91,9 @@ class TestTCGEngine(unittest.TestCase):
         self.db.upsert_variation("ID1001", "123456789099", 2)
 
         # Batch contains 1 existing live card (Revise) and 1 brand new card (Add)
-        sample_batch = """Product Name,Set Name,Condition,Printing,Quantity
-Gengar,Fossil,Near Mint,Holofoil,3
-Alakazam,Base Set,Lightly Played,Normal,1
+        sample_batch = """Product Name,Set Name,Condition,Printing,Quantity,ConditionID
+Gengar,Fossil,Near Mint,Holofoil,3,3000
+Alakazam,Base Set,Lightly Played,Normal,1,4000
 """
         res = process_batch_csv(sample_batch, self.db)
         self.assertEqual(res["revise_count"], 1)
@@ -110,22 +112,42 @@ Alakazam,Base Set,Lightly Played,Normal,1
 
     def test_variation_title_generation(self):
         from tcg_engine.batches import generate_variation_title
-        # Standard length -> keeps "Near Mint"
-        t1 = generate_variation_title("SV05: Temporal Forces")
-        self.assertEqual(t1, "SV05: Temporal Forces: Pick Your Card - Near Mint - Complete Your Set")
+
+        # The condition is substituted verbatim from the source data.
+        t1 = generate_variation_title("SV05: Temporal Forces", condition="Near Mint")
+        self.assertEqual(
+            t1, "SV05: Temporal Forces: Pick Your Card - Near Mint - Complete Your Set"
+        )
         self.assertLessEqual(len(t1), 80)
 
-        # Long set name -> automatically replaces "Near Mint" with "NM"
-        t2 = generate_variation_title("Yu-Gi-Oh! 25th Anniversary Rarity Collection II Expansion Set")
-        self.assertTrue("NM" in t2)
-        self.assertLessEqual(len(t2), 80)
+        # A short condition code passes through unchanged too.
+        t2 = generate_variation_title("SV05: Temporal Forces", condition="NM")
+        self.assertEqual(
+            t2, "SV05: Temporal Forces: Pick Your Card - NM - Complete Your Set"
+        )
+
+        # An over-long title is brought under 80 by trimming the SET NAME; the
+        # condition is never abbreviated because it is a factual claim.
+        long_set = "Yu-Gi-Oh! 25th Anniversary Rarity Collection II Expansion Set"
+        t3 = generate_variation_title(long_set, condition="Lightly Played")
+        self.assertLessEqual(len(t3), 80)
+        self.assertIn("Lightly Played", t3)
+
+        # A legacy template that hardcodes the condition still renders.
+        t4 = generate_variation_title(
+            "Base Set",
+            condition="Near Mint",
+            template="{set_name}: Pick Your Card - Near Mint - Complete Your Set",
+        )
+        self.assertLessEqual(len(t4), 80)
+        self.assertIn("Base Set", t4)
 
     def test_single_threshold_and_variation_grouping(self):
         # Card 1: Market $0.17 -> Calculated price $1.99 (< $5.00) -> grouped into Set Variation
         # Card 2: Market $4.50 -> Calculated price $7.50 (>= $5.00) -> listed as Single
-        batch_csv = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price"
-"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","Bin-1",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","",""
-"6a9f37cd1ffb1c868bf60ba1","Pokemon","","SV05: Temporal Forces","TEF","001/162","Iron Leaves ex","Ultra Rare","4.50","0.01","4.50","19.98","","NM","EN","Normal",1,"","Bin-2",542679,7805759,"760647","","https://cdn.example.com/ironleaves.jpg","","0.00","4.50","","","","","","",""
+        batch_csv = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
+"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","Bin-1",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","","","3000"
+"6a9f37cd1ffb1c868bf60ba1","Pokemon","","SV05: Temporal Forces","TEF","001/162","Iron Leaves ex","Ultra Rare","4.50","0.01","4.50","19.98","","NM","EN","Normal",1,"","Bin-2",542679,7805759,"760647","","https://cdn.example.com/ironleaves.jpg","","0.00","4.50","","","","","","","","3000"
 """
         res = process_batch_csv(batch_csv, self.db)
         self.assertEqual(res["add_count"], 2)
@@ -135,15 +157,15 @@ Alakazam,Base Set,Lightly Played,Normal,1
         # 1. Parent container row (Relationship=Variation, Title=SV05: Temporal Forces: Pick Your Card...)
         # 2. Child variation row (Deerling, CustomLabel=ID1001-Bin-1, Price=1.99)
         # 3. Single listing row (Iron Leaves ex, Relationship="", Title=Iron Leaves ex - SV05: Temporal Forces - Near Mint, Price=7.50)
-        self.assertTrue(any("SV05: Temporal Forces: Pick Your Card - Near Mint - Complete Your Set" in line and "Variation" in line for line in add_lines))
+        self.assertTrue(any("SV05: Temporal Forces: Pick Your Card - NM - Complete Your Set" in line for line in add_lines))
         self.assertTrue(any("Deerling" in line and "ID1001-Bin-1" in line and "1.99" in line for line in add_lines))
         self.assertTrue(any("Iron Leaves ex" in line and "ID1002-Bin-2" in line and "7.50" in line and "Variation" not in line for line in add_lines))
 
     def test_sortswift_real_sample(self):
         # Test with the exact user SortSwift inventory format
-        real_sample = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price"
-"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","No Remark",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","https://cdn.example.com/back.jpg","0.00","0.15","","","","","","",""
-"6a9f37cd1ffb1c868bf60ba3","Pokemon","","SV05: Temporal Forces","TEF","018/162","Grubbin","Common","0.13","0.01","0.15","2.99","","NM","EN","Normal",2,"","No Remark",542763,7806223,"760648","","https://cdn.example.com/grubbin.jpg","","0.00","0.14","","","","","","",""
+        real_sample = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
+"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","No Remark",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","https://cdn.example.com/back.jpg","0.00","0.15","","","","","","","","3000"
+"6a9f37cd1ffb1c868bf60ba3","Pokemon","","SV05: Temporal Forces","TEF","018/162","Grubbin","Common","0.13","0.01","0.15","2.99","","NM","EN","Normal",2,"","No Remark",542763,7806223,"760648","","https://cdn.example.com/grubbin.jpg","","0.00","0.14","","","","","","","","3000"
 """
         res = process_batch_csv(real_sample, self.db)
         self.assertEqual(res["add_count"], 2)
@@ -166,12 +188,16 @@ Alakazam,Base Set,Lightly Played,Normal,1
         self.assertEqual(order_res["converted_count"], 1)
         csv_lines = order_res["csv_content"].strip().splitlines()
         # Verify skuId 7805758 is present in SortSwift deduction output
-        self.assertIn("7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,Near Mint,Normal,1", csv_lines)
+        # The condition round-trips verbatim: the source export said "NM", so the
+        # deduction file says "NM". We deliberately do not normalise it to
+        # "Near Mint" -- SortSwift's own vocabulary goes back to SortSwift, and
+        # matching is driven by skuId regardless.
+        self.assertIn("7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,NM,Normal,1", csv_lines)
 
     def test_bin_remark_encoding_and_reexport(self):
         # Initial export with Remarks "Bin A-12"
-        batch_1 = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price"
-"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","Bin A-12",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","",""
+        batch_1 = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
+"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","Bin A-12",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","","","3000"
 """
         res1 = process_batch_csv(batch_1, self.db)
         self.assertEqual(res1["add_count"], 1)
@@ -190,9 +216,9 @@ Alakazam,Base Set,Lightly Played,Normal,1
         self.assertEqual(sync_res["synced_count"], 1)
 
         # Re-exporting inventory with new stock of Deerling (+2) and a brand new card (Pikachu)
-        batch_2 = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price"
-"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",2,"","Bin A-12",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","",""
-"6a9f37cd1ffb1c868bf60ba1","Pokemon","","Base Set","BS","058/102","Pikachu","Common","2.50","0.01","2.50","19.98","","NM","EN","Normal",1,"","Box 4",12345,67890,"12345","","https://cdn.example.com/pikachu.jpg","","0.00","2.50","","","","","","",""
+        batch_2 = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
+"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",2,"","Bin A-12",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","","","3000"
+"6a9f37cd1ffb1c868bf60ba1","Pokemon","","Base Set","BS","058/102","Pikachu","Common","2.50","0.01","2.50","19.98","","NM","EN","Normal",1,"","Box 4",12345,67890,"12345","","https://cdn.example.com/pikachu.jpg","","0.00","2.50","","","","","","","","3000"
 """
         res2 = process_batch_csv(batch_2, self.db)
         # Deerling was live on eBay -> routed to Revise with consolidated quantity (3 existing + 2 = 5)
@@ -265,9 +291,9 @@ Alakazam,Base Set,Lightly Played,Normal,1
     # Regression coverage for the correctness fixes
     # ------------------------------------------------------------------
 
-    TWO_CARD_BATCH = """"Set","Set Code","Card Number","Name","Market Price","Condition","Language","Printing","Quantity","Remarks","TCGplayer Id","SKU Id","CDN Image","Price"
-"SV05: Temporal Forces","TEF","016/162","Deerling","0.17","NM","EN","Normal",1,"Bin-1",542678,7805758,"https://cdn.example.com/a.jpg","0.15"
-"SV05: Temporal Forces","TEF","001/162","Iron Leaves ex","4.50","NM","EN","Normal",1,"Bin-2",542679,7805759,"https://cdn.example.com/b.jpg","4.50"
+    TWO_CARD_BATCH = """"Set","Set Code","Card Number","Name","Market Price","Condition","Language","Printing","Quantity","Remarks","TCGplayer Id","SKU Id","CDN Image","Price","*ConditionID"
+"SV05: Temporal Forces","TEF","016/162","Deerling","0.17","NM","EN","Normal",1,"Bin-1",542678,7805758,"https://cdn.example.com/a.jpg","0.15","3000"
+"SV05: Temporal Forces","TEF","001/162","Iron Leaves ex","4.50","NM","EN","Normal",1,"Bin-2",542679,7805759,"https://cdn.example.com/b.jpg","4.50","3000"
 """
 
     def test_duplicate_batch_is_refused_unless_forced(self):
@@ -359,6 +385,100 @@ Alakazam,Base Set,Lightly Played,Normal,1
             ids.add(m_id)
         self.assertEqual(ids, {"ID1001"})
         self.assertEqual(self.db.get_stats()["total_cards"], 1)
+
+    # ------------------------------------------------------------------
+    # Condition passthrough and eBay variation syntax
+    # ------------------------------------------------------------------
+
+    MIXED_CONDITION_BATCH = """"Set","Name","Market Price","Condition","Printing","Quantity","Remarks","SKU Id","*ConditionID"
+"Chilling Reign","Deerling","0.17","NM","Normal",1,"Bin-1",111,"3000"
+"Chilling Reign","Mareep","0.17","LP","Normal",1,"Bin-2",222,"4000"
+"""
+
+    BATCH_WITHOUT_CONDITION_ID = """"Set","Name","Market Price","Condition","Printing","Quantity"
+"Chilling Reign","Deerling","0.17","NM","Normal",1
+"""
+
+    BATCH_WITHOUT_CONDITION = """"Set","Name","Market Price","Condition","Printing","Quantity","Remarks","SKU Id","*ConditionID"
+"Chilling Reign","Deerling","0.17","","Normal",1,"Bin-1",111,"3000"
+"""
+
+    BATCH_WITH_PUNCTUATED_NAME = """"Set","Name","Market Price","Condition","Printing","Quantity","Remarks","SKU Id","*ConditionID"
+"Chilling Reign","Ho-Oh; Lugia | Legend","0.17","NM","Normal",1,"Bin-1",111,"3000"
+"""
+
+    def test_condition_is_passed_through_verbatim(self):
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+        # "NM" and "LP" are stored exactly as the export wrote them; they are
+        # not expanded to "Near Mint" / "Lightly Played" by any lookup table.
+        conditions = {c["condition"] for c in self.db.export_all_manifest()}
+        self.assertEqual(conditions, {"NM", "LP"})
+
+    def test_row_without_condition_id_is_skipped(self):
+        res = process_batch_csv(self.BATCH_WITHOUT_CONDITION_ID, self.db)
+        self.assertEqual(res["add_count"], 0)
+        self.assertEqual(res["skipped_count"], 1)
+        self.assertEqual(self.db.get_stats()["total_cards"], 0)
+        self.assertTrue(
+            any("ConditionID" in log["message"] for log in res["logs"]),
+            "the skip reason should name the missing column",
+        )
+
+    def test_row_without_condition_is_skipped(self):
+        res = process_batch_csv(self.BATCH_WITHOUT_CONDITION, self.db)
+        self.assertEqual(res["add_count"], 0)
+        self.assertEqual(res["skipped_count"], 1)
+
+    def test_variations_are_grouped_by_set_and_condition(self):
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+        self.assertEqual(res["add_count"], 2)
+
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        parents = [r for r in rows if not r["Relationship"]]
+        children = [r for r in rows if r["Relationship"] == "Variation"]
+
+        # One listing per (set, condition), so NM and LP do not share a parent.
+        self.assertEqual(len(parents), 2)
+        self.assertEqual(len(children), 2)
+
+        # Each parent's ConditionID matches the condition named in its title.
+        by_cond = {p["ConditionID"]: p for p in parents}
+        self.assertEqual(set(by_cond), {"3000", "4000"})
+        self.assertIn("NM", by_cond["3000"]["Title"])
+        self.assertIn("LP", by_cond["4000"]["Title"])
+
+    def test_parent_row_leaves_relationship_blank(self):
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        for r in rows:
+            if r["Title"]:
+                # Parent rows carry the title; eBay requires their Relationship
+                # to be empty so it can identify the container row.
+                self.assertEqual(r["Relationship"], "")
+                self.assertTrue(r["RelationshipDetails"].startswith("Card="))
+            else:
+                self.assertEqual(r["Relationship"], "Variation")
+
+    def test_variation_values_are_semicolon_separated(self):
+        batch = self.MIXED_CONDITION_BATCH.replace('"LP"', '"NM"').replace('"4000"', '"3000"')
+        res = process_batch_csv(batch, self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        parent = next(r for r in rows if r["Title"])
+
+        # Both cards now share one listing. Values must be semicolon separated:
+        # a pipe would be read by eBay as the start of a second attribute.
+        self.assertEqual(parent["RelationshipDetails"], "Card=Deerling;Mareep")
+        self.assertNotIn("|", parent["RelationshipDetails"])
+
+    def test_separator_characters_in_card_names_are_sanitized(self):
+        res = process_batch_csv(self.BATCH_WITH_PUNCTUATED_NAME, self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        details = [r["RelationshipDetails"] for r in rows]
+        # Neither separator may survive inside a value, or one card would be
+        # split into several bogus options.
+        for d in details:
+            self.assertNotIn(";", d.split("=", 1)[1])
+            self.assertNotIn("|", d)
 
 
 if __name__ == "__main__":

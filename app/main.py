@@ -408,7 +408,8 @@ class ListingSettingsUpdateRequest(BaseModel):
 
 class TitlePreviewRequest(BaseModel):
     set_name: str
-    template: Optional[str] = "{set_name}: Pick Your Card - Near Mint - Complete Your Set"
+    condition: str = ""
+    template: Optional[str] = "{set_name}: Pick Your Card - {condition} - Complete Your Set"
 
 
 @app.get("/api/listing-settings")
@@ -432,14 +433,19 @@ def preview_title_endpoint(
     req: TitlePreviewRequest,
     user: Dict[str, Any] = Depends(require_active_user),
 ):
-    """Test variation title generation with Near Mint -> NM fallback."""
-    from tcg_engine.batches import generate_variation_title
+    """Preview a variation title, including the 80-character fallback."""
+    from tcg_engine.batches import (
+        generate_variation_title,
+        DEFAULT_VARIATION_TITLE_TEMPLATE,
+    )
     generated_title = generate_variation_title(
         set_name=req.set_name,
-        template=req.template or "{set_name}: Pick Your Card - Near Mint - Complete Your Set",
+        condition=req.condition,
+        template=req.template or DEFAULT_VARIATION_TITLE_TEMPLATE,
     )
     return {
         "set_name": req.set_name,
+        "condition": req.condition,
         "generated_title": generated_title,
         "char_count": len(generated_title),
         "is_valid": len(generated_title) <= 80,
