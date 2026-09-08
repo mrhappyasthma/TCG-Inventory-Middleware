@@ -688,6 +688,95 @@ class Database:
         "v.ebay_parent_id",
     )
 
+    @staticmethod
+    def _build_set_filter(set_name: Optional[str]) -> Tuple[str, List[Any]]:
+        """
+        Build an exact-match filter on the expansion set.
+
+        Kept separate from the free-text search so the two compose: a set can be
+        selected and a search term typed at the same time.
+        """
+        if not set_name or not str(set_name).strip():
+            return "", []
+        return " LOWER(m.set_name) = LOWER(?) ", [str(set_name).strip()]
+
+    @classmethod
+    def _build_where(
+        cls, search: Optional[str], set_name: Optional[str] = None
+    ) -> Tuple[str, List[Any]]:
+        """Combine the search and set filters into a single WHERE clause."""
+        clauses: List[str] = []
+        params: List[Any] = []
+
+        search_sql, search_params = cls._build_search_clause(search)
+        if search_sql:
+            # _build_search_clause emits a full "WHERE (...)"; take the predicate.
+            predicate = search_sql.strip()
+            if predicate.upper().startswith("WHERE"):
+                predicate = predicate[5:].strip()
+            clauses.append(predicate)
+            params.extend(search_params)
+
+        set_sql, set_params = cls._build_set_filter(set_name)
+        if set_sql:
+            clauses.append("(" + set_sql.strip() + ")")
+            params.extend(set_params)
+
+        if not clauses:
+            return "", []
+        return " WHERE " + " AND ".join(clauses) + " ", params
+
+    def get_distinct_set_names(self) -> List[Dict[str, Any]]:
+        """
+        Every expansion set present in the catalog, with how many cards each
+        holds, so the dashboard filter only ever offers sets that exist.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.set_name AS set_name, COUNT(*) AS card_count
+                FROM manifest m
+                WHERE COALESCE(m.set_name, '') != ''
+                GROUP BY m.set_name
+                ORDER BY m.set_name COLLATE NOCASE ASC
+                """
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def set_manifest_quantity(
+        self, manifest_id: str, quantity: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Set a card's catalogued quantity to an absolute value.
+
+        Distinct from increment_manifest_quantity, which accumulates batch
+        intake. This is the manual correction path, so the figure given is the
+        figure stored. Returns the before and after values, or None if the card
+        does not exist.
+        """
+        m_id = str(manifest_id).strip()
+        new_qty = max(0, int(quantity))
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(quantity, 0) AS quantity FROM manifest WHERE manifest_id = ?",
+                (m_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            previous = row["quantity"]
+
+            cursor.execute(
+                "UPDATE manifest SET quantity = ? WHERE manifest_id = ?",
+                (new_qty, m_id),
+            )
+            conn.commit()
+
+        return {"manifest_id": m_id, "previous": previous, "current": new_qty}
+
     @classmethod
     def _build_search_clause(
         cls, search: Optional[str]
@@ -720,6 +809,7 @@ class Database:
         sort_dir: str = "ASC",
         limit: int = 50,
         offset: int = 0,
+        set_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Combined live inventory query (manifest LEFT JOIN ebay_variations).
@@ -735,6 +825,7 @@ class Database:
                 m.manifest_id,
                 m.product_name,
                 COALESCE(m.card_number, '') AS card_number,
+                COALESCE(m.tcgplayer_id, '') AS tcgplayer_id,
                 m.set_name,
                 m.condition,
                 m.printing,
@@ -746,7 +837,7 @@ class Database:
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
-        where_clause, params = self._build_search_clause(search)
+        where_clause, params = self._build_where(search, set_name)
         query += where_clause
         query += f" ORDER BY {order_by} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
@@ -756,14 +847,16 @@ class Database:
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_inventory_count(self, search: Optional[str] = None) -> int:
+    def get_inventory_count(
+        self, search: Optional[str] = None, set_name: Optional[str] = None
+    ) -> int:
         """Count total matching rows in inventory."""
         query = """
             SELECT COUNT(*) AS total
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
-        where_clause, params = self._build_search_clause(search)
+        where_clause, params = self._build_where(search, set_name)
         query += where_clause
 
         with self.get_connection() as conn:

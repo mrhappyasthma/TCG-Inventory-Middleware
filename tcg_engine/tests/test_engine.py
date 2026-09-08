@@ -1421,6 +1421,96 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(find_column(row, ["custom label (sku)"]), "ID1050-C-1")
         self.assertIsNone(find_column(row, ["Nope"]))
 
+    # ------------------------------------------------------------------
+    # Set filter, absolute quantity edits, deduction rows
+    # ------------------------------------------------------------------
+
+    TWO_SET_BATCH = """"Game","Set","Card Number","Name","Market Price","Condition","Language","Printing","Quantity","Remarks","SKU Id","TCGplayer Id","*ConditionID"
+"Pokemon","Chilling Reign","004/198","Ledyba","0.17","NM","English","Normal",3,"C-1",111,542678,"4000"
+"Pokemon","Chilling Reign","006/198","Heracross","0.17","NM","English","Normal",2,"C-1",112,542679,"4000"
+"Pokemon","Temporal Forces","016/162","Deerling","0.17","NM","English","Normal",5,"T-1",113,542680,"4000"
+"""
+
+    def test_distinct_set_names_come_from_the_catalog(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        sets = {s["set_name"]: s["card_count"] for s in self.db.get_distinct_set_names()}
+        self.assertEqual(sets, {"Chilling Reign": 2, "Temporal Forces": 1})
+
+    def test_set_filter_narrows_the_inventory(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+
+        rows = self.db.get_inventory(set_name="Chilling Reign", limit=100)
+        self.assertEqual({r["product_name"] for r in rows}, {"Ledyba", "Heracross"})
+        self.assertEqual(self.db.get_inventory_count(set_name="Chilling Reign"), 2)
+
+        # Matching is case-insensitive, since the value round-trips through a
+        # URL parameter.
+        self.assertEqual(len(self.db.get_inventory(set_name="chilling reign", limit=100)), 2)
+
+        # An empty filter means no filter, not "match nothing".
+        self.assertEqual(self.db.get_inventory_count(set_name=""), 3)
+        self.assertEqual(self.db.get_inventory_count(set_name=None), 3)
+
+    def test_set_filter_and_search_compose(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+
+        rows = self.db.get_inventory(set_name="Chilling Reign", search="Ledyba", limit=100)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.db.get_inventory_count(set_name="Chilling Reign", search="Ledyba"), 1)
+
+        # The card exists, but not in that set.
+        self.assertEqual(
+            self.db.get_inventory_count(set_name="Temporal Forces", search="Ledyba"), 0
+        )
+
+    def test_inventory_exposes_tcgplayer_id_for_linking(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        ids = {r["product_name"]: r["tcgplayer_id"] for r in self.db.get_inventory(limit=100)}
+        self.assertEqual(ids["Ledyba"], "542678")
+        # Absent rather than None, so a template can test it directly.
+        manual = self.db.get_or_create_manifest("Manual", "Some Set", "NM", "Normal")[0]
+        row = next(r for r in self.db.get_inventory(limit=100) if r["manifest_id"] == manual)
+        self.assertEqual(row["tcgplayer_id"], "")
+
+    def test_set_quantity_is_absolute_not_additive(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        card = next(c for c in self.db.export_all_manifest() if c["product_name"] == "Ledyba")
+        self.assertEqual(card["quantity"], 3)
+
+        result = self.db.set_manifest_quantity(card["manifest_id"], 1)
+        self.assertEqual(result["previous"], 3)
+        self.assertEqual(result["current"], 1)
+
+        # Batch intake accumulates; a manual correction replaces.
+        again = self.db.set_manifest_quantity(card["manifest_id"], 1)
+        self.assertEqual(again["current"], 1)
+
+    def test_set_quantity_clamps_negatives_and_reports_unknown_cards(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        card = next(c for c in self.db.export_all_manifest() if c["product_name"] == "Ledyba")
+
+        self.assertEqual(self.db.set_manifest_quantity(card["manifest_id"], -5)["current"], 0)
+        self.assertIsNone(self.db.set_manifest_quantity("ID9999", 1))
+
+    def test_deduction_row_matches_the_sortswift_shape(self):
+        from tcg_engine.orders import build_deduction_csv, deduction_row, SORTSWIFT_HEADERS
+
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        card = next(c for c in self.db.get_inventory(limit=100)
+                    if c["product_name"] == "Ledyba")
+        full = self.db.get_manifest_by_id(card["manifest_id"])
+
+        csv_text = build_deduction_csv([deduction_row(full, 2, "MANUAL-TEST")])
+        lines = csv_text.strip().splitlines()
+        self.assertEqual(lines[0], ",".join(SORTSWIFT_HEADERS))
+
+        row = list(csv.DictReader(io.StringIO(csv_text)))[0]
+        self.assertEqual(row["skuId"], "111")
+        self.assertEqual(row["productId"], "542678")
+        self.assertEqual(row["Order Number"], "MANUAL-TEST")
+        self.assertEqual(row["Product Name"], "Ledyba")
+        self.assertEqual(row["Quantity"], "2")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,7 +43,11 @@ from pydantic import BaseModel
 
 from tcg_engine.csvtools import decode_csv_bytes
 from tcg_engine.db import Database
-from tcg_engine.orders import process_orders_csv
+from tcg_engine.orders import (
+    process_orders_csv,
+    build_deduction_csv,
+    deduction_row,
+)
 from tcg_engine.batches import process_batch_csv
 from tcg_engine.sync import sync_active_listings_csv
 
@@ -103,6 +107,14 @@ class StatusUpdateRequest(BaseModel):
 
 class RoleUpdateRequest(BaseModel):
     role: str
+
+
+class QuantityUpdateRequest(BaseModel):
+    quantity: int
+    # When the quantity drops, optionally emit a SortSwift deduction file for
+    # the difference so the correction can be pushed back to SortSwift.
+    generate_deduction: bool = False
+    order_number: Optional[str] = None
 
 
 class ManualCardAddRequest(BaseModel):
@@ -469,6 +481,7 @@ def get_inventory_endpoint(
     sort_dir: str = "ASC",
     limit: int = 50,
     offset: int = 0,
+    set_name: Optional[str] = None,
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Fetch paginated, filtered, and sorted inventory list."""
@@ -478,13 +491,68 @@ def get_inventory_endpoint(
         sort_dir=sort_dir,
         limit=limit,
         offset=offset,
+        set_name=set_name,
     )
-    total = db.get_inventory_count(search=search)
+    total = db.get_inventory_count(search=search, set_name=set_name)
     return {
         "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
+    }
+
+
+@app.get("/api/inventory/sets")
+def get_inventory_sets(user: Dict[str, Any] = Depends(require_active_user)):
+    """
+    Expansion sets present in the catalog, for the dashboard filter.
+
+    Derived from the catalog rather than a fixed list, so the filter can only
+    ever offer a set that actually has cards behind it.
+    """
+    return {"sets": db.get_distinct_set_names()}
+
+
+@app.post("/api/inventory/{manifest_id}/quantity")
+def set_card_quantity(
+    manifest_id: str,
+    req: QuantityUpdateRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Set a card's catalogued quantity to an absolute value.
+
+    This is the manual correction path, so the figure supplied is the figure
+    stored -- unlike batch intake, which accumulates. When the quantity drops
+    and generate_deduction is set, a SortSwift deduction CSV for the difference
+    is returned so the same correction can be applied there.
+    """
+    if req.quantity < 0:
+        raise HTTPException(status_code=400, detail="Quantity cannot be negative.")
+
+    card = db.get_manifest_by_id(manifest_id)
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found.")
+
+    result = db.set_manifest_quantity(manifest_id, req.quantity)
+    if not result:
+        raise HTTPException(status_code=404, detail="Card not found.")
+
+    delta = result["previous"] - result["current"]
+    csv_content = None
+    if req.generate_deduction and delta > 0:
+        order_number = (req.order_number or "").strip() or f"MANUAL-{manifest_id}"
+        csv_content = build_deduction_csv(
+            [deduction_row(card, delta, order_number)]
+        )
+
+    return {
+        "success": True,
+        "manifest_id": manifest_id,
+        "previous": result["previous"],
+        "current": result["current"],
+        "deducted": delta if delta > 0 else 0,
+        "csv_content": csv_content,
     }
 
 

@@ -649,6 +649,48 @@ already linked keeps its eBay item number and quantity.
   *(Matches SortSwift's official ⭐ Recommended `skuId` deduction import specification.)*
 
 
+## 🖥️ Live Store Inventory table
+
+| Column | Behaviour |
+|---|---|
+| **Card Title** | Links to the card on TCGplayer, built from the `TCGplayer Id` in your export. Cards added manually have no ID, so they render as plain text. |
+| **Card #** | Sorted numerically (`4/198` before `133/198`), prefixed numbering after the plain numbers. |
+| **eBay Item #** | Links to the live listing. Only present once Module B has linked it. |
+| **Quantity** | Click to adjust it (see below). |
+
+An **expansion set filter** sits beside the search box, populated from the sets
+actually present in the catalog — it can never offer a set with no cards behind
+it. It **combines** with the search box rather than replacing it, so you can
+narrow to one set and then search within it. If the selected set disappears
+(after a purge, say) the filter falls back to showing everything rather than
+silently filtering to nothing.
+
+> **Note on the TCGplayer link**: it uses `https://www.tcgplayer.com/product/{id}`.
+> Their site is a single-page app that returns HTTP 200 for any ID, so this form
+> could not be verified automatically. If the links do not resolve, the pattern
+> is a single constant (`TCGPLAYER_PRODUCT_URL`) at the top of
+> `app/static/app.js`.
+
+### Adjusting a quantity by hand
+
+Clicking a **Quantity** value opens a dialog for quick corrections — a
+miscount, a card pulled for a trade, damage found after scanning.
+
+* The figure you enter is **absolute**. Unlike batch intake, which accumulates,
+  this replaces the stored value.
+* Optionally tick **Generate SortSwift deduction CSV** to get a deduction file
+  for the difference, in exactly the format a real order produces, so the same
+  correction can be applied in SortSwift.
+* A deduction is only produced when the quantity **decreases**; raising it has
+  nothing to deduct, and the dialog says so before you save.
+* The order number defaults to `MANUAL-<manifest id>` so hand corrections are
+  distinguishable from real orders in SortSwift.
+
+This adjusts the **catalog** quantity only. It does not revise the eBay
+listing — run Module A for that.
+
+---
+
 ## 📦 Quantity vs Live Stock
 
 The Live Store Inventory table shows two counts side by side so drift is

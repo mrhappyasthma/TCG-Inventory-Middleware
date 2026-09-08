@@ -35,6 +35,36 @@ def _find_header_line(text_lines: List[str]) -> int:
     return 0
 
 
+def build_deduction_csv(rows: List[Dict[str, Any]]) -> str:
+    """
+    Render rows in SortSwift's deduction import shape.
+
+    Shared by Module C and by manual quantity corrections, so a hand-made
+    adjustment produces a file identical in form to a real order.
+    """
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=SORTSWIFT_HEADERS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
+
+
+def deduction_row(
+    card: Dict[str, Any], quantity: int, order_number: str
+) -> Dict[str, Any]:
+    """Build one SortSwift deduction row from a catalog card."""
+    return {
+        "skuId": card.get("sku_id") or "",
+        "productId": card.get("tcgplayer_id") or "",
+        "Order Number": order_number,
+        "Product Name": card.get("product_name", ""),
+        "Set Name": card.get("set_name", ""),
+        "Condition": card.get("condition", ""),
+        "Printing": card.get("printing", ""),
+        "Quantity": int(quantity),
+    }
+
+
 def process_orders_csv(
     csv_text: str, db: Database
 ) -> Dict[str, Any]:
@@ -164,11 +194,7 @@ def process_orders_csv(
         })
 
     # Generate output CSV
-    output_io = io.StringIO()
-    writer = csv.DictWriter(output_io, fieldnames=SORTSWIFT_HEADERS, lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(output_rows)
-    csv_content = output_io.getvalue()
+    csv_content = build_deduction_csv(output_rows)
 
     logs.append({
         "level": "INFO",

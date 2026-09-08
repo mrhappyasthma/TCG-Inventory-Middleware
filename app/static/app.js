@@ -4,6 +4,14 @@ let googleClientId = "";
 let currentPage = 1;
 const pageSize = 20;
 let currentSearch = "";
+let currentSetFilter = "";
+
+// External link patterns. eBay's /itm/ form is long-standing.
+// TCGplayer's numeric /product/ form could not be verified from here (their
+// site is a single-page app that returns 200 for any id), so if these links
+// do not resolve this is the line to change.
+const EBAY_ITEM_URL = "https://www.ebay.com/itm/";
+const TCGPLAYER_PRODUCT_URL = "https://www.tcgplayer.com/product/";
 let currentSortBy = "manifest_id";
 let currentSortDir = "ASC";
 // Held so the "Force process anyway" button can resubmit the same upload.
@@ -70,6 +78,7 @@ async function initAuth() {
 
         if (data.is_authenticated) {
             fetchStats();
+            fetchSetFilter();
             fetchInventory();
         } else if (data.is_pending) {
             document.getElementById("pendingApprovalBanner").classList.remove("hidden");
@@ -844,6 +853,7 @@ async function handleBatchUpload(file, mode = "normal") {
         // A download-only rebuild wrote nothing, so there is nothing to refresh.
         if (!data.dry_run) {
             fetchStats();
+            fetchSetFilter();
             fetchInventory();
         }
     } catch (err) {
@@ -876,6 +886,7 @@ async function handleSyncUpload(file) {
             `Synced ${data.synced_count} variation(s) across ${listings} listing(s)`;
 
         fetchStats();
+        fetchSetFilter();
         fetchInventory();
     } catch (err) {
         logToTerminal("ERROR", `[MODULE B] ${err.message}`);
@@ -909,6 +920,15 @@ function setupTableListeners() {
             fetchInventory();
         }, 250);
     });
+
+    const setFilter = document.getElementById("inventorySetFilter");
+    if (setFilter) {
+        setFilter.addEventListener("change", (e) => {
+            currentSetFilter = e.target.value;
+            currentPage = 1;
+            fetchInventory();
+        });
+    }
 
     document.getElementById("btnOpenAddCardModal").addEventListener("click", () => {
         document.getElementById("addCardModal").classList.remove("hidden");
@@ -944,9 +964,40 @@ async function handleAddCard(e) {
         closeAddCardModal();
         logToTerminal("SUCCESS", `Card saved: [${data.manifest_id}] ${payload.product_name} (${payload.set_name})`);
         fetchStats();
+        fetchSetFilter();
         fetchInventory();
     } catch (err) {
         alert(err.message);
+    }
+}
+
+// Rebuilt after every change to the catalog so the filter never offers a set
+// that no longer has cards behind it.
+async function fetchSetFilter() {
+    const select = document.getElementById("inventorySetFilter");
+    if (!select) return;
+    try {
+        const res = await fetch("/api/inventory/sets");
+        if (!res.ok) return;
+        const sets = (await res.json()).sets || [];
+
+        const previous = currentSetFilter;
+        select.innerHTML = '<option value="">All expansion sets</option>'
+            + sets.map(s =>
+                `<option value="${escapeHtml(s.set_name)}">`
+                + `${escapeHtml(s.set_name)} (${s.card_count})</option>`
+              ).join("");
+
+        // Keep the selection if that set still exists; otherwise fall back to
+        // showing everything rather than silently filtering to nothing.
+        if (previous && sets.some(s => s.set_name === previous)) {
+            select.value = previous;
+        } else if (previous) {
+            currentSetFilter = "";
+            select.value = "";
+        }
+    } catch (err) {
+        console.error("Set filter load failed:", err);
     }
 }
 
@@ -967,7 +1018,15 @@ async function fetchStats() {
 async function fetchInventory() {
     const tbody = document.getElementById("inventoryTableBody");
     const offset = (currentPage - 1) * pageSize;
-    const url = `/api/inventory?search=${encodeURIComponent(currentSearch)}&sort_by=${currentSortBy}&sort_dir=${currentSortDir}&limit=${pageSize}&offset=${offset}`;
+    const params = new URLSearchParams({
+        search: currentSearch,
+        sort_by: currentSortBy,
+        sort_dir: currentSortDir,
+        limit: String(pageSize),
+        offset: String(offset),
+    });
+    if (currentSetFilter) params.set("set_name", currentSetFilter);
+    const url = `/api/inventory?${params.toString()}`;
 
     try {
         const res = await fetch(url);
@@ -980,7 +1039,11 @@ async function fetchInventory() {
     }
 }
 
+// The quantity dialog needs the row it was opened from.
+let lastInventoryItems = [];
+
 function renderInventoryTable(items, total, offset) {
+    lastInventoryItems = items || [];
     const tbody = document.getElementById("inventoryTableBody");
 
     if (!items || items.length === 0) {
@@ -1017,7 +1080,11 @@ function renderInventoryTable(items, total, offset) {
         return `
             <tr class="hover:bg-dark-800/80 transition-colors">
                 <td class="py-3 px-4 font-mono font-bold text-accent-cyan">${escapeHtml(item.manifest_id)}</td>
-                <td class="py-3 px-4 font-medium text-white">${escapeHtml(item.product_name)}</td>
+                <td class="py-3 px-4 font-medium text-white">${
+                    item.tcgplayer_id
+                        ? `<a href="${TCGPLAYER_PRODUCT_URL}${encodeURIComponent(item.tcgplayer_id)}" target="_blank" rel="noopener noreferrer" class="hover:text-accent-cyan hover:underline transition-colors" title="View on TCGplayer">${escapeHtml(item.product_name)}</a>`
+                        : escapeHtml(item.product_name)
+                }</td>
                 <td class="py-3 px-4 font-mono text-slate-300">${item.card_number ? escapeHtml(item.card_number) : '<span class="text-slate-600 italic">-</span>'}</td>
                 <td class="py-3 px-4 text-slate-400">${escapeHtml(item.set_name)}</td>
                 <td class="py-3 px-4">
@@ -1033,11 +1100,15 @@ function renderInventoryTable(items, total, offset) {
                 <td class="py-3 px-4 font-mono text-slate-300">
                     ${item.remarks ? `<span class="px-2 py-0.5 rounded text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800/60">${escapeHtml(item.remarks)}</span>` : '<span class="text-slate-600 italic text-[11px]">-</span>'}
                 </td>
-                <td class="py-3 px-4 font-mono text-slate-300">${item.ebay_parent_id ? escapeHtml(item.ebay_parent_id) : '<span class="text-slate-600 italic">Not on eBay</span>'}</td>
-                <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
-                    <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${qtyBadge}">
+                <td class="py-3 px-4 font-mono text-slate-300">${
+                    item.ebay_parent_id
+                        ? `<a href="${EBAY_ITEM_URL}${encodeURIComponent(item.ebay_parent_id)}" target="_blank" rel="noopener noreferrer" class="text-accent-cyan hover:underline" title="Open the eBay listing">${escapeHtml(item.ebay_parent_id)}</a>`
+                        : '<span class="text-slate-600 italic">Not on eBay</span>'
+                }</td>
+                <td class="py-3 px-4 text-center">
+                    <button onclick="openQuantityModal('${item.manifest_id}')" title="${escapeHtml(driftTitle)} Click to adjust." class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${qtyBadge} hover:ring-1 hover:ring-brand-500 transition-all cursor-pointer">
                         ${qty}
-                    </span>
+                    </button>
                 </td>
                 <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
                     <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${stockBadge}">
@@ -1088,6 +1159,98 @@ async function deleteCard(manifestId) {
         const res = await fetch(`/api/inventory/${manifestId}`, { method: "DELETE" });
         if (!res.ok) throw new Error((await res.json()).detail);
         logToTerminal("INFO", `Deleted card [${manifestId}]`);
+        fetchStats();
+        fetchSetFilter();
+        fetchInventory();
+    } catch (err) {
+        alert(err.message);
+    }
+}
+
+// -------------------------------------------------------------------
+// MANUAL QUANTITY ADJUSTMENT
+// -------------------------------------------------------------------
+
+let quantityEditManifestId = null;
+let quantityEditPrevious = 0;
+
+function openQuantityModal(manifestId) {
+    const row = (lastInventoryItems || []).find(i => i.manifest_id === manifestId);
+    quantityEditManifestId = manifestId;
+    quantityEditPrevious = row ? (row.quantity ?? 0) : 0;
+
+    document.getElementById("quantityModalCard").innerText = row
+        ? `[${row.manifest_id}] ${row.product_name}`
+          + `${row.card_number ? " #" + row.card_number : ""} - ${row.set_name}`
+        : `[${manifestId}]`;
+    document.getElementById("quantityPrevious").innerText = quantityEditPrevious;
+    document.getElementById("quantityInput").value = quantityEditPrevious;
+    document.getElementById("quantityGenerateDeduction").checked = false;
+    document.getElementById("quantityDeductionNote").classList.add("hidden");
+
+    document.getElementById("quantityModal").classList.remove("hidden");
+    syncModalScrollLock();
+    document.getElementById("quantityInput").focus();
+    document.getElementById("quantityInput").select();
+}
+
+function closeQuantityModal() {
+    document.getElementById("quantityModal").classList.add("hidden");
+    syncModalScrollLock();
+    quantityEditManifestId = null;
+}
+
+// Show what a deduction would cover before the change is committed.
+function updateQuantityDeductionNote() {
+    const note = document.getElementById("quantityDeductionNote");
+    const wanted = parseInt(document.getElementById("quantityInput").value || "0", 10);
+    const checked = document.getElementById("quantityGenerateDeduction").checked;
+    const delta = quantityEditPrevious - (isNaN(wanted) ? quantityEditPrevious : wanted);
+
+    if (checked && delta > 0) {
+        note.innerText = `A deduction CSV for ${delta} unit(s) will be produced.`;
+        note.classList.remove("hidden");
+    } else if (checked && delta <= 0) {
+        note.innerText = "No deduction: the quantity is not decreasing.";
+        note.classList.remove("hidden");
+    } else {
+        note.classList.add("hidden");
+    }
+}
+
+document.getElementById("quantityInput")?.addEventListener("input", updateQuantityDeductionNote);
+document.getElementById("quantityGenerateDeduction")?.addEventListener("change", updateQuantityDeductionNote);
+
+async function saveQuantity(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!quantityEditManifestId) return;
+
+    const quantity = parseInt(document.getElementById("quantityInput").value || "0", 10);
+    const generate = document.getElementById("quantityGenerateDeduction").checked;
+
+    try {
+        const res = await fetch(`/api/inventory/${encodeURIComponent(quantityEditManifestId)}/quantity`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ quantity, generate_deduction: generate })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to update quantity");
+
+        const id = quantityEditManifestId;
+        closeQuantityModal();
+        logToTerminal("SUCCESS",
+            `Quantity for [${id}] changed from ${data.previous} to ${data.current}.`);
+
+        if (data.csv_content) {
+            triggerBrowserDownload(data.csv_content, `sortswift_deduction_${id}.csv`);
+            logToTerminal("INFO",
+                `Deduction CSV for ${data.deducted} unit(s) downloaded for [${id}].`);
+        } else if (generate) {
+            logToTerminal("INFO",
+                "No deduction file: the quantity did not decrease.");
+        }
+
         fetchStats();
         fetchInventory();
     } catch (err) {
