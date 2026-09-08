@@ -531,6 +531,7 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
     fieldnames = [
         "manifest_id",
         "product_name",
+        "card_number",
         "set_name",
         "condition",
         "printing",

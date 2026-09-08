@@ -1141,6 +1141,67 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(counts["manifest"], 0)
         self.assertEqual(self.db.get_stats()["total_cards"], 0)
 
+    # ------------------------------------------------------------------
+    # Card # column in the inventory view
+    # ------------------------------------------------------------------
+
+    MIXED_NUMBER_BATCH = """"Game","Set","Card Number","Name","Market Price","Condition","Language","Printing","Quantity","Remarks","SKU Id","*ConditionID"
+"Pokemon","Chilling Reign","133/198","Crushing Gloves","0.17","NM","English","Normal",1,"C-1",111,"4000"
+"Pokemon","Chilling Reign","4/198","Heracross","0.17","NM","English","Normal",1,"C-1",112,"4000"
+"Pokemon","Chilling Reign","16/198","Deerling","0.17","NM","English","Normal",1,"C-1",113,"4000"
+"Pokemon","Chilling Reign","TG12/TG30","Blissey V","0.17","NM","English","Normal",1,"C-1",114,"4000"
+"""
+
+    def test_inventory_returns_the_card_number(self):
+        process_batch_csv(self.MIXED_NUMBER_BATCH, self.db)
+        rows = self.db.get_inventory(limit=100)
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertIn("card_number", r)
+        numbers = {r["product_name"]: r["card_number"] for r in rows}
+        self.assertEqual(numbers["Crushing Gloves"], "133/198")
+        self.assertEqual(numbers["Blissey V"], "TG12/TG30")
+
+    def test_card_number_sorts_numerically_both_ways(self):
+        process_batch_csv(self.MIXED_NUMBER_BATCH, self.db)
+
+        asc = [
+            r["card_number"]
+            for r in self.db.get_inventory(sort_by="card_number", sort_dir="ASC", limit=100)
+        ]
+        # 4 before 16 before 133 (a text sort would give 133, 16, 4), and
+        # prefixed numbering sorts after the plain numbers, matching how the
+        # engine orders variation options.
+        self.assertEqual(asc, ["4/198", "16/198", "133/198", "TG12/TG30"])
+
+        desc = [
+            r["card_number"]
+            for r in self.db.get_inventory(sort_by="card_number", sort_dir="DESC", limit=100)
+        ]
+        # DESC must apply to every term of the sort, not just the last one.
+        self.assertEqual(desc, list(reversed(asc)))
+
+    def test_card_number_is_searchable_and_counts_agree(self):
+        process_batch_csv(self.MIXED_NUMBER_BATCH, self.db)
+        for term, expected in (("133/198", 1), ("TG12", 1), ("/198", 3), ("nope", 0)):
+            rows = self.db.get_inventory(search=term, limit=1000)
+            total = self.db.get_inventory_count(search=term)
+            self.assertEqual(len(rows), total, f"listing and count disagree for {term!r}")
+            self.assertEqual(total, expected, f"unexpected matches for {term!r}")
+
+    def test_card_number_is_included_in_the_export(self):
+        process_batch_csv(self.MIXED_NUMBER_BATCH, self.db)
+        exported = self.db.export_all_manifest()
+        self.assertTrue(exported)
+        self.assertIn("card_number", exported[0])
+
+    def test_a_card_without_a_number_yields_an_empty_string(self):
+        batch = self.MIXED_NUMBER_BATCH.replace('"133/198"', '""')
+        process_batch_csv(batch, self.db)
+        rows = {r["product_name"]: r["card_number"] for r in self.db.get_inventory(limit=100)}
+        # Empty rather than None, so the template can render it directly.
+        self.assertEqual(rows["Crushing Gloves"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

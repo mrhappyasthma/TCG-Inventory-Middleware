@@ -71,6 +71,7 @@ def handle_export_manifest(args):
     fieldnames = [
         "manifest_id",
         "product_name",
+        "card_number",
         "set_name",
         "condition",
         "printing",

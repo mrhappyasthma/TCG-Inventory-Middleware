@@ -974,7 +974,7 @@ async function fetchInventory() {
 
         renderInventoryTable(data.items, data.total, offset);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="10" class="py-6 text-center text-rose-400">Failed to load inventory: ${err.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="11" class="py-6 text-center text-rose-400">Failed to load inventory: ${err.message}</td></tr>`;
     }
 }
 
@@ -984,7 +984,7 @@ function renderInventoryTable(items, total, offset) {
     if (!items || items.length === 0) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="10" class="py-8 text-center text-slate-500">
+                <td colspan="11" class="py-8 text-center text-slate-500">
                     No cards found. Process a SortSwift batch or add a card above.
                 </td>
             </tr>
@@ -1016,6 +1016,7 @@ function renderInventoryTable(items, total, offset) {
             <tr class="hover:bg-dark-800/80 transition-colors">
                 <td class="py-3 px-4 font-mono font-bold text-accent-cyan">${escapeHtml(item.manifest_id)}</td>
                 <td class="py-3 px-4 font-medium text-white">${escapeHtml(item.product_name)}</td>
+                <td class="py-3 px-4 font-mono text-slate-300">${item.card_number ? escapeHtml(item.card_number) : '<span class="text-slate-600 italic">-</span>'}</td>
                 <td class="py-3 px-4 text-slate-400">${escapeHtml(item.set_name)}</td>
                 <td class="py-3 px-4">
                     <span class="px-2 py-0.5 rounded text-[10px] font-medium ${conditionBadge}">

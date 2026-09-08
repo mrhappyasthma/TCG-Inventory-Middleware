@@ -597,6 +597,15 @@ class Database:
     _SORTABLE_COLUMNS = {
         "manifest_id": "m.manifest_id",
         "product_name": "m.product_name",
+        # Mirror the engine's variation ordering: plainly numbered cards first
+        # in numeric order, then prefixed ones like TG12/TG30, then blanks. A
+        # bare CAST would sort every prefixed number to 0 and hoist it to the top.
+        "card_number": (
+            "CASE WHEN COALESCE(m.card_number, '') = '' THEN 2 "
+            "WHEN m.card_number GLOB '[0-9]*' THEN 0 ELSE 1 END",
+            "CAST(m.card_number AS INTEGER)",
+            "m.card_number",
+        ),
         "set_name": "m.set_name",
         "condition": "m.condition",
         "printing": "m.printing",
@@ -611,6 +620,7 @@ class Database:
     _SEARCHABLE_COLUMNS = (
         "m.manifest_id",
         "m.product_name",
+        "m.card_number",
         "m.set_name",
         "m.condition",
         "m.printing",
@@ -655,13 +665,17 @@ class Database:
         """
         Combined live inventory query (manifest LEFT JOIN ebay_variations).
         """
-        order_col = self._SORTABLE_COLUMNS.get(sort_by, "m.manifest_id")
+        order_spec = self._SORTABLE_COLUMNS.get(sort_by, "m.manifest_id")
+        if isinstance(order_spec, str):
+            order_spec = (order_spec,)
         direction = "DESC" if str(sort_dir).upper() == "DESC" else "ASC"
+        order_by = ", ".join(f"{expr} {direction}" for expr in order_spec)
 
         query = """
             SELECT
                 m.manifest_id,
                 m.product_name,
+                COALESCE(m.card_number, '') AS card_number,
                 m.set_name,
                 m.condition,
                 m.printing,
@@ -675,7 +689,7 @@ class Database:
         """
         where_clause, params = self._build_search_clause(search)
         query += where_clause
-        query += f" ORDER BY {order_col} {direction} LIMIT ? OFFSET ?"
+        query += f" ORDER BY {order_by} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
         with self.get_connection() as conn:
@@ -904,6 +918,7 @@ class Database:
                 SELECT 
                     m.manifest_id,
                     m.product_name,
+                    COALESCE(m.card_number, '') AS card_number,
                     m.set_name,
                     m.condition,
                     m.printing,
