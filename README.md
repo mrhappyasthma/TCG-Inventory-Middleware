@@ -49,23 +49,61 @@ Google requires OAuth JavaScript origins to use **HTTPS** and **rejects raw IP a
 
 So reaching the dashboard on your NAS requires an HTTPS hostname in front of the container. The setup is walked through below.
 
-### Step 1 — Create the Google OAuth client
+### Step 1 - Create the Google OAuth client
 
-1. Go to <https://console.cloud.google.com> and create or select a project.
-2. **APIs & Services → OAuth consent screen** → User type **External**. Fill in the app name, user-support email and developer contact.
-3. Add only the `openid`, `email` and `profile` scopes. These are non-sensitive, so Google does **not** require app verification.
-4. Click **Publish app**. If you leave the app in *Testing*, only accounts listed under **Test users** can sign in.
-5. **APIs & Services → Credentials → Create Credentials → OAuth client ID** → Application type **Web application**.
-6. Under **Authorized JavaScript origins**, add both:
-   * `https://yourname.synology.me` — production
-   * `http://localhost:8080` — Windows development
-7. Leave **Authorized redirect URIs empty.** The Google Identity Services button returns the credential via `postMessage`, not an HTTP redirect.
-8. Copy the **Client ID** (it looks like `1234567890-abc123.apps.googleusercontent.com`) into your `.env`:
+Google reorganized these screens into the **Google Auth Platform**; the old
+"APIs & Services > OAuth consent screen" menu item no longer exists.
+
+1. Go to <https://console.cloud.google.com> and create or select a project
+   (the project name is internal and never shown to users).
+2. In the left nav open **APIs & Services > OAuth consent screen**, which now
+   lands on **Google Auth Platform**. If the project has never been configured,
+   click **Get started**. Otherwise use the tabs described below. Direct link:
+   <https://console.cloud.google.com/auth/overview>
+3. **Branding** tab - set the **App name** (this is what users see on the
+   consent screen, e.g. "TCG Inventory Middleware") and the **User support
+   email**. Everything else on this tab is optional.
+4. **Audience** tab - set the user type to **External**, and fill in the
+   **Developer contact information** email if prompted.
+   * While the app is in *Testing*, only accounts you list under **Test users**
+     can sign in. Add your own Google account there.
+   * Click **Publish app** to lift that restriction. With only the basic scopes
+     below, publishing needs no Google review.
+5. **Data Access** tab - click **Add or remove scopes** and select only
+   `openid`, `.../auth/userinfo.email` and `.../auth/userinfo.profile`. These
+   are non-sensitive, so Google does **not** require app verification.
+6. **Clients** tab - click **Create client**. Direct link:
+   <https://console.cloud.google.com/auth/clients>
+   * **Application type**: `Web application`
+   * **Name**: anything, e.g. "TCG Middleware Web"
+7. Under **Authorized JavaScript origins**, click **Add URI** for each of:
+   * `https://yourname.synology.me` - production (scheme + host, no path, no
+     trailing slash)
+   * `http://localhost:8080` - Windows development
+   * `http://localhost` - optional, harmless, avoids port surprises
+8. Leave **Authorized redirect URIs empty.** The Google Identity Services
+   button returns the credential to the page via `postMessage`, not an HTTP
+   redirect. Adding one here is the single most common source of confusion.
+9. Click **Create**. Copy the **Client ID** (it looks like
+   `1234567890-abc123def456.apps.googleusercontent.com`) into your `.env`:
    ```bash
-   GOOGLE_CLIENT_ID=1234567890-abc123.apps.googleusercontent.com
+   GOOGLE_CLIENT_ID=1234567890-abc123def456.apps.googleusercontent.com
    ```
-   There is **no client secret** in this flow. The Client ID alone is sufficient and is safe to expose in the browser.
-9. Origin changes can take anywhere from 5 minutes to a few hours to propagate.
+   There is **no client secret** in this flow. Google shows one, but this app
+   does not use it. The Client ID alone is sufficient and is safe to expose in
+   the browser.
+10. Restart the app. Origin changes can take anywhere from 5 minutes to a few
+    hours to propagate, so a fresh origin may be rejected briefly.
+
+**Troubleshooting**
+
+| Symptom | Cause |
+|---|---|
+| `Error 400: redirect_uri_mismatch` | You added a redirect URI. Remove it; this flow does not use one. |
+| `The given origin is not allowed for the given client ID` | The browser's address bar does not exactly match an authorized origin (scheme, host and port must all match), or the change has not propagated yet. |
+| Button does not render at all | `GOOGLE_CLIENT_ID` is unset or wrong, or the page cannot reach `accounts.google.com`. The dashboard shows an explanatory panel in this case. |
+| `Access blocked: app has not completed verification` | The app is still in *Testing* and your account is not listed under **Audience > Test users**. |
+| One Tap prompt never appears on `http://localhost` | Expected: One Tap requires HTTPS. The standard sign-in button still works. |
 
 ### Step 2 — Put HTTPS in front of the container (Synology)
 
