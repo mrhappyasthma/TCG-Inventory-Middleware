@@ -576,9 +576,28 @@ the bare `Action` header. Those were the parts most at risk of being wrong.
   *(Matches SortSwift's official ⭐ Recommended `skuId` deduction import specification.)*
 
 ### 3. eBay Active Listings Sync (Module C)
-* **Input**: Official eBay "Active Listings" report.
+* **Input**: the official eBay **Active Listings** report. Get it from
+  **Seller Hub → Reports → Download** (left menu) → *Download report* →
+  source `Listings`, type `Active Listings`, format CSV. The report is queued and
+  appears in the Downloads list once generated.
 * **Fields Read**: `Item number`, `Custom label (SKU)`, `Available quantity`.
-* **Behavior**: Ignores empty parent rows, extracts variation/single listing item IDs and quantities, and performs atomic UPSERTs into `ebay_variations`.
+* **Behavior**: extracts the manifest ID from each variation's custom label and
+  performs atomic UPSERTs into `ebay_variations`, linking every card to its live
+  eBay item number and quantity.
+* **The report contains your entire store**, not just listings this tool
+  created, so most rows are expected to be skipped. Three distinct outcomes are
+  reported separately, because conflating them made a healthy store look broken:
+
+  | Outcome | Meaning |
+  |---|---|
+  | *variation parent row(s) ignored* | The container row of a multi-variation listing. Its children carry the labels. |
+  | *listing(s) with no custom label ignored* | Ordinary listings not managed here. Entirely normal. |
+  | *custom label(s) not found in the master catalog* | **Worth investigating** — a live listing references a manifest ID your catalog no longer has. |
+
+* ⚠️ **Manifest IDs are the join key** between the catalog and your live
+  listings. Running `purge` while a listing is live orphans it: every row will
+  come back as "not found in the master catalog". Sync before purging, or end the
+  listing first.
 
 ---
 

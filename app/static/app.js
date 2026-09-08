@@ -871,7 +871,9 @@ async function handleSyncUpload(file) {
 
         const resultBox = document.getElementById("resultBoxSync");
         resultBox.classList.remove("hidden");
-        document.getElementById("syncSummaryText").innerText = `Synced ${data.synced_count} Variations`;
+        const listings = data.linked_listing_count || 0;
+        document.getElementById("syncSummaryText").innerText =
+            `Synced ${data.synced_count} variation(s) across ${listings} listing(s)`;
 
         fetchStats();
         fetchInventory();

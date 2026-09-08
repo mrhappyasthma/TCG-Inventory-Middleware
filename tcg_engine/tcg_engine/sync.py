@@ -29,13 +29,16 @@ def sync_active_listings_csv(
     logs: List[Dict[str, str]] = []
     synced_count = 0
     skipped_parent_count = 0
+    skipped_unlabelled_count = 0
     skipped_unmapped_count = 0
+    linked_item_ids = set()
 
     lines = [line for line in csv_text.splitlines() if line.strip()]
     if not lines:
         return {
             "synced_count": 0,
             "skipped_parent_count": 0,
+            "skipped_unlabelled_count": 0,
             "skipped_unmapped_count": 0,
             "logs": [{"level": "WARN", "message": "Uploaded Active Listings file is empty."}],
         }
@@ -45,6 +48,7 @@ def sync_active_listings_csv(
         return {
             "synced_count": 0,
             "skipped_parent_count": 0,
+            "skipped_unlabelled_count": 0,
             "skipped_unmapped_count": 0,
             "logs": [{"level": "ERROR", "message": "Unable to parse CSV headers in Active Listings file."}],
         }
@@ -83,9 +87,27 @@ def sync_active_listings_csv(
             ],
         )
 
-        # Skip parent container rows where Custom Label is blank
+        # A blank custom label means one of two very different things, and
+        # conflating them made an ordinary store look broken: an Active Listings
+        # report contains every listing you have, most of which were never
+        # created by this tool and legitimately carry no SKU.
         if not custom_label or not custom_label.strip():
-            skipped_parent_count += 1
+            variation_details = _find_column(
+                row,
+                [
+                    "Variation details",
+                    "Variation",
+                    "Relationship details",
+                    "RelationshipDetails",
+                ],
+            )
+            if variation_details and variation_details.strip():
+                # The container row of a multi-variation listing; its children
+                # carry the labels we actually need.
+                skipped_parent_count += 1
+            else:
+                # A listing with no custom label at all - not managed here.
+                skipped_unlabelled_count += 1
             continue
 
         raw_custom_label = custom_label.strip()
@@ -127,20 +149,35 @@ def sync_active_listings_csv(
         # Perform atomic UPSERT into ebay_variations
         db.upsert_variation(manifest_id, effective_item_id, quantity)
         synced_count += 1
+        linked_item_ids.add(effective_item_id)
 
         logs.append({
             "level": "SUCCESS",
             "message": f"Synced [{manifest_id}] {manifest_card['product_name']} -> eBay #{effective_item_id} (Live Qty: {quantity})",
         })
 
-    logs.append({
-        "level": "INFO",
-        "message": f"Sync complete: {synced_count} active variations updated, {skipped_parent_count} parent rows ignored, {skipped_unmapped_count} unmapped items skipped.",
-    })
+    summary = [
+        f"Sync complete: {synced_count} variation(s) updated "
+        f"across {len(linked_item_ids)} eBay listing(s)"
+    ]
+    if skipped_parent_count:
+        summary.append(f"{skipped_parent_count} variation parent row(s) ignored")
+    if skipped_unlabelled_count:
+        summary.append(
+            f"{skipped_unlabelled_count} listing(s) with no custom label ignored "
+            f"(not managed by this tool)"
+        )
+    if skipped_unmapped_count:
+        summary.append(
+            f"{skipped_unmapped_count} custom label(s) not found in the master catalog"
+        )
+    logs.append({"level": "INFO", "message": "; ".join(summary) + "."})
 
     return {
         "synced_count": synced_count,
+        "linked_listing_count": len(linked_item_ids),
         "skipped_parent_count": skipped_parent_count,
+        "skipped_unlabelled_count": skipped_unlabelled_count,
         "skipped_unmapped_count": skipped_unmapped_count,
         "logs": logs,
     }

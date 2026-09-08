@@ -276,7 +276,14 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 """
         res = sync_active_listings_csv(sample_active_listings, self.db)
         self.assertEqual(res["synced_count"], 2)
-        self.assertEqual(res["skipped_parent_count"], 1)
+        # Exactly one row was skipped. Which bucket it lands in depends on
+        # whether the report carries a "Variation details" column: with one, a
+        # blank label is identifiably a variation container; without one it is
+        # indistinguishable from an ordinary listing that has no SKU, and the
+        # safer of the two labels is used.
+        self.assertEqual(
+            res["skipped_parent_count"] + res["skipped_unlabelled_count"], 1
+        )
 
         # Check that DB was updated
         var1 = self.db.get_variation("ID1001")
@@ -1201,6 +1208,63 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         rows = {r["product_name"]: r["card_number"] for r in self.db.get_inventory(limit=100)}
         # Empty rather than None, so the template can render it directly.
         self.assertEqual(rows["Crushing Gloves"], "")
+
+    # ------------------------------------------------------------------
+    # Module C against the real Active Listings report shape
+    # ------------------------------------------------------------------
+
+    ACTIVE_LISTINGS_REPORT = """Item number,Title,Variation details,Custom label (SKU),Available quantity,Format,Condition
+"227379391171",Nintendo Wii Power Supply,,,"1","FIXED_PRICE","Used"
+"227496702985",4x Gwynn - Pitch Black Playset,,,"7","FIXED_PRICE","Ungraded"
+"227511361186",Chilling Reign: Pick Your Card,Card=Ledyba (004/198);Heracross (006/198),,"40","FIXED_PRICE","Ungraded"
+"227511361186",Chilling Reign: Pick Your Card,Card=Ledyba (004/198),ID1050-C-1,"1","FIXED_PRICE","Ungraded"
+"227511361186",Chilling Reign: Pick Your Card,Card=Heracross (006/198),ID1037-C-1,"3","FIXED_PRICE","Ungraded"
+"""
+
+    def _seed_live_catalog(self):
+        for mid, name in (("ID1037", "Heracross"), ("ID1050", "Ledyba")):
+            self.db.insert_manifest(
+                mid, name, "SWSH06: Chilling Reign", "NM", "Normal"
+            )
+
+    def test_sync_handles_the_real_active_listings_report(self):
+        self._seed_live_catalog()
+        res = sync_active_listings_csv(self.ACTIVE_LISTINGS_REPORT, self.db)
+
+        self.assertEqual(res["synced_count"], 2)
+        self.assertEqual(res["linked_listing_count"], 1)
+        self.assertEqual(res["skipped_unmapped_count"], 0)
+
+        links = {
+            r["manifest_id"]: (r["ebay_parent_id"], r["last_known_qty"])
+            for r in self.db.get_inventory(limit=50)
+        }
+        self.assertEqual(links["ID1050"], ("227511361186", 1))
+        self.assertEqual(links["ID1037"], ("227511361186", 3))
+
+    def test_sync_separates_variation_parents_from_unmanaged_listings(self):
+        """An Active Listings report contains every listing the seller has."""
+        self._seed_live_catalog()
+        res = sync_active_listings_csv(self.ACTIVE_LISTINGS_REPORT, self.db)
+
+        # One genuine variation container row...
+        self.assertEqual(res["skipped_parent_count"], 1)
+        # ...and two ordinary listings that simply have no SKU. Counting these
+        # as "parent rows" made a normal store look broken.
+        self.assertEqual(res["skipped_unlabelled_count"], 2)
+
+        summary = [l["message"] for l in res["logs"] if l["level"] == "INFO"][-1]
+        self.assertIn("not managed by this tool", summary)
+
+    def test_sync_reports_labels_missing_from_the_catalog(self):
+        # Catalogue deliberately left empty: this is what a purge-then-sync
+        # would look like, and it must be loudly reported rather than silent.
+        res = sync_active_listings_csv(self.ACTIVE_LISTINGS_REPORT, self.db)
+        self.assertEqual(res["synced_count"], 0)
+        self.assertEqual(res["skipped_unmapped_count"], 2)
+        self.assertTrue(
+            any("not in Master Catalog" in l["message"] for l in res["logs"])
+        )
 
 
 if __name__ == "__main__":
