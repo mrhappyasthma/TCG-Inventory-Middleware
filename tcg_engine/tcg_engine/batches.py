@@ -2,6 +2,7 @@ import csv
 import hashlib
 import io
 import os
+import re
 from typing import Dict, Any, List, Optional
 from .db import Database
 
@@ -30,6 +31,60 @@ ADD_HEADERS = [
     "PostalCode",
     CONDITION_DESCRIPTOR_COLUMN,
 ]
+
+# eBay item specifics travel in columns prefixed "C:" (the seller's own
+# templates mark required ones with a leading asterisk, e.g. "*C:Game"). The
+# SortSwift eBay-flavoured export already carries these, so they are forwarded
+# straight through rather than being reconstructed here.
+ITEM_SPECIFIC_PATTERN = re.compile(r"^\*?C:(.+)$", re.IGNORECASE)
+
+# "Game" is required for the card categories, so it is emitted even when the
+# export omits it, using a configurable default.
+GAME_ITEM_SPECIFIC = "C:Game"
+
+
+def _detect_item_specific_columns(fieldnames) -> Dict[str, str]:
+    """
+    Map each item-specific input column to its normalised output column.
+
+    Returns e.g. {"*C:Game": "C:Game", "C:Set": "C:Set"}. The asterisk is a
+    template annotation, not part of the field name, so it is stripped.
+    """
+    detected: Dict[str, str] = {}
+    for name in fieldnames or []:
+        if not name:
+            continue
+        match = ITEM_SPECIFIC_PATTERN.match(name.strip())
+        if match:
+            detected[name] = "C:" + match.group(1).strip()
+    return detected
+
+
+def _uniform_item_specifics(cards: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Keep only the specifics that every card in a variation group agrees on.
+
+    A variation listing carries ONE set of listing-level item specifics, so a
+    field that differs between cards (Card Name, Card Number) cannot be stated
+    at listing level -- the variation axis expresses it instead. Fields common
+    to the whole group (Game, Set, Language) can be.
+    """
+    if not cards:
+        return {}
+
+    shared: Dict[str, str] = {}
+    all_keys = set()
+    for c in cards:
+        all_keys.update(c.get("item_specifics", {}))
+
+    for key in all_keys:
+        values = {str(c.get("item_specifics", {}).get(key, "")).strip() for c in cards}
+        if len(values) == 1:
+            value = values.pop()
+            if value:
+                shared[key] = value
+    return shared
+
 
 # Business policy columns, emitted only when configured. eBay matches these by
 # name, case-sensitively, against the seller's Manage Business Policies page.
@@ -274,6 +329,7 @@ def process_batch_csv(
     category_id = db.get_listing_setting("category_id", "183454")
     descriptor_style = db.get_listing_setting("condition_descriptor_style", "label_id")
     postal_code = str(db.get_listing_setting("seller_postal_code", "")).strip()
+    default_game = str(db.get_listing_setting("default_game", "")).strip()
 
     # Only emit policy columns that are actually configured; a blank policy
     # name is worse than an absent column.
@@ -282,11 +338,14 @@ def process_batch_csv(
         value = str(db.get_listing_setting(setting_key, "")).strip()
         if value:
             active_policies[column] = value
-    add_headers = ADD_HEADERS + list(active_policies)
 
     # Cells appended to every generated Add row.
     common_add_fields = {"PostalCode": postal_code}
     common_add_fields.update(active_policies)
+
+    # Populated once the uploaded file's headers are known.
+    item_specific_columns: Dict[str, str] = {}
+    add_headers = ADD_HEADERS + list(active_policies) + [GAME_ITEM_SPECIFIC]
     group_by_set = str(db.get_listing_setting("group_by_set", "true")).strip().lower() not in (
         "false",
         "0",
@@ -309,6 +368,14 @@ def process_batch_csv(
             }],
             add_headers=add_headers,
         )
+
+    # Item specifics are discovered from the uploaded file's own headers, so
+    # whatever your export provides is forwarded without needing a mapping.
+    item_specific_columns = _detect_item_specific_columns(reader.fieldnames)
+    item_specific_outputs = sorted(
+        set(item_specific_columns.values()) | {GAME_ITEM_SPECIFIC}
+    )
+    add_headers = ADD_HEADERS + list(active_policies) + item_specific_outputs
 
     # Refuse a replay of an already-processed file unless explicitly forced.
     batch_hash = hashlib.sha256(csv_text.encode("utf-8", errors="replace")).hexdigest()
@@ -515,6 +582,17 @@ def process_batch_csv(
             remarks=remarks,
         )
 
+        # Forward this row's item specifics verbatim, defaulting Game because
+        # eBay requires it for the card categories.
+        row_specifics: Dict[str, str] = {}
+        for source_col, out_col in item_specific_columns.items():
+            value = str(row.get(source_col) or "").strip()
+            if value:
+                row_specifics[out_col] = value
+        if not row_specifics.get(GAME_ITEM_SPECIFIC):
+            game = str(_find_column(row, ["Game", "*C:Game", "C:Game"]) or "").strip()
+            row_specifics[GAME_ITEM_SPECIFIC] = game or default_game
+
         # Accumulate our own catalogued stock count for this card.
         db.increment_manifest_quantity(manifest_id, quantity)
 
@@ -562,6 +640,7 @@ def process_batch_csv(
                 "condition_name": condition_name,
                 "condition_id": condition_id,
                 "condition_descriptor": condition_descriptor,
+                "item_specifics": row_specifics,
                 "printing": printing,
                 "quantity": quantity,
                 "price": effective_price,
@@ -639,6 +718,7 @@ def process_batch_csv(
             "Price": "",
             CONDITION_DESCRIPTOR_COLUMN: cards[0]["condition_descriptor"],
             **common_add_fields,
+            **_uniform_item_specifics(cards),
         })
 
         # Append Child Variation Rows
@@ -698,6 +778,7 @@ def process_batch_csv(
             "Price": f"{s['price']:.2f}",
             CONDITION_DESCRIPTOR_COLUMN: s["condition_descriptor"],
             **common_add_fields,
+            **s.get("item_specifics", {}),
         })
 
     # Generate REVISE CSV

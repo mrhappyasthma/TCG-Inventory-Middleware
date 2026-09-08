@@ -803,6 +803,69 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(quantities["Deerling"], 3)
         self.assertEqual(quantities["Snover"], 7)
 
+    # ------------------------------------------------------------------
+    # eBay item specifics (C: columns) -- error 21919303
+    # ------------------------------------------------------------------
+
+    EBAY_EXPORT_BATCH = """"*C:Game","*C:Set","*C:Language","*C:Card Name","*C:Card Number","Set","Name","Market Price","Condition","Printing","Quantity","Remarks","SKU Id","*ConditionID"
+"Test TCG","Chilling Reign","English","Crushing Gloves","121/198","Chilling Reign","Crushing Gloves","0.17","NM","Normal",1,"C-1",111,"4000"
+"Test TCG","Chilling Reign","English","Heracross","004/198","Chilling Reign","Heracross","0.17","NM","Normal",1,"C-1",112,"4000"
+"""
+
+    def test_item_specific_columns_are_forwarded(self):
+        res = process_batch_csv(self.EBAY_EXPORT_BATCH, self.db)
+        header = res["add_csv"].splitlines()[0].split(",")
+
+        # The leading asterisk is a template annotation, not part of the name.
+        for column in ("C:Game", "C:Set", "C:Language"):
+            self.assertIn(column, header)
+        self.assertNotIn("*C:Game", header)
+
+    def test_parent_keeps_only_specifics_shared_by_the_whole_group(self):
+        res = process_batch_csv(self.EBAY_EXPORT_BATCH, self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        parent = next(r for r in rows if r["Title"])
+
+        # Uniform across the group -> valid at listing level.
+        self.assertEqual(parent["C:Game"], "Test TCG")
+        self.assertEqual(parent["C:Set"], "Chilling Reign")
+        self.assertEqual(parent["C:Language"], "English")
+
+        # Differs per card -> cannot be a single listing-level value, and the
+        # variation axis already expresses it.
+        self.assertEqual(parent["C:Card Name"], "")
+        self.assertEqual(parent["C:Card Number"], "")
+
+    def test_game_falls_back_to_the_configured_default(self):
+        self.db.set_listing_settings({"default_game": "Fallback Game"})
+        # A batch with no game information anywhere.
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        for r in rows:
+            if r["Title"]:
+                self.assertEqual(r["C:Game"], "Fallback Game")
+
+    def test_bare_game_column_is_normalised(self):
+        hdr = (
+            '"Game","Set","Name","Market Price","Condition","Printing",'
+            '"Quantity","Remarks","SKU Id","*ConditionID"'
+        )
+        row = '"Some Game","Chilling Reign","Deerling","0.17","NM","Normal",1,"C-1",111,"4000"'
+        res = process_batch_csv(chr(10).join([hdr, row]) + chr(10), self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        parent = next(r for r in rows if r["Title"])
+        self.assertEqual(parent["C:Game"], "Some Game")
+
+    def test_single_listing_keeps_all_of_its_own_specifics(self):
+        batch = self.EBAY_EXPORT_BATCH.replace('"0.17"', '"40.00"')
+        res = process_batch_csv(batch, self.db)
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        # Above the threshold every card is a single, so nothing is uniform-only.
+        self.assertFalse([r for r in rows if r["Relationship"] == "Variation"])
+        for r in rows:
+            self.assertEqual(r["C:Game"], "Test TCG")
+            self.assertTrue(r["C:Card Name"], "a single keeps its own card name")
+
 
 if __name__ == "__main__":
     unittest.main()

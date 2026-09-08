@@ -9,6 +9,9 @@ from typing import Optional, Dict, Any, List, Tuple
 # must match the seller's eBay business policies exactly, including case.
 # All of these are editable at runtime under Listing Rules.
 DEFAULT_SELLER_POSTAL_CODE = "94305"
+# eBay requires the "Game" item specific on card listings. Used only when the
+# uploaded export does not supply one.
+DEFAULT_GAME = "Pokémon TCG"
 DEFAULT_SHIPPING_PROFILE = "Free Shipping Cards"
 DEFAULT_RETURN_PROFILE = "No Returns"
 DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
@@ -188,6 +191,7 @@ class Database:
                     ("shipping_profile_name", DEFAULT_SHIPPING_PROFILE),
                     ("return_profile_name", DEFAULT_RETURN_PROFILE),
                     ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
+                    ("default_game", DEFAULT_GAME),
                 ]
                 cursor.executemany(
                     """
@@ -208,6 +212,7 @@ class Database:
                 ("shipping_profile_name", DEFAULT_SHIPPING_PROFILE),
                 ("return_profile_name", DEFAULT_RETURN_PROFILE),
                 ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
+                ("default_game", DEFAULT_GAME),
             ):
                 cursor.execute(
                     """

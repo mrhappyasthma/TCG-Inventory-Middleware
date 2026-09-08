@@ -395,6 +395,7 @@ async function loadListingSettings() {
         document.getElementById("settingDescriptorStyle").value =
             s.condition_descriptor_style || "label_id";
         document.getElementById("settingPostalCode").value = s.seller_postal_code || "";
+        document.getElementById("settingDefaultGame").value = s.default_game || "";
         document.getElementById("settingShippingProfile").value = s.shipping_profile_name || "";
         document.getElementById("settingReturnProfile").value = s.return_profile_name || "";
         document.getElementById("settingPaymentProfile").value = s.payment_profile_name || "";
@@ -411,6 +412,7 @@ async function saveListingSettings(e) {
     const groupBySet = document.getElementById("settingGroupBySet").checked;
     const descriptorStyle = document.getElementById("settingDescriptorStyle").value;
     const postalCode = document.getElementById("settingPostalCode").value.trim();
+    const defaultGame = document.getElementById("settingDefaultGame").value.trim();
     const shippingProfile = document.getElementById("settingShippingProfile").value.trim();
     const returnProfile = document.getElementById("settingReturnProfile").value.trim();
     const paymentProfile = document.getElementById("settingPaymentProfile").value.trim();
@@ -426,6 +428,7 @@ async function saveListingSettings(e) {
                     group_by_set: groupBySet ? "true" : "false",
                     condition_descriptor_style: descriptorStyle,
                     seller_postal_code: postalCode,
+                    default_game: defaultGame,
                     shipping_profile_name: shippingProfile,
                     return_profile_name: returnProfile,
                     payment_profile_name: paymentProfile

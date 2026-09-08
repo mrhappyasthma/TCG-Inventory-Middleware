@@ -415,6 +415,43 @@ database is the source of truth.
 * If the postal code is unset, the run logs an `ERROR` naming the eBay error code
   it will cause, so it is caught before the upload rather than after.
 
+### 🏷️ eBay item specifics (`C:` columns)
+
+eBay requires certain item specifics per category and rejects an `Add` without
+them:
+
+```
+21919303  Error - The item specific Game is missing. Add Game to this
+          listing, enter a valid value, and then try again. | Game |
+```
+
+Item specifics travel in columns prefixed `C:` (eBay's own templates mark the
+required ones with a leading asterisk, e.g. `*C:Game` — the asterisk is an
+annotation, not part of the field name).
+
+**These are forwarded from your export, not reconstructed.** Any `C:`- or
+`*C:`-prefixed column in the uploaded file is passed straight through to the
+generated Add file, so whatever specifics SortSwift's eBay-flavoured export
+provides — `Game`, `Set`, `Language`, `Card Name`, `Card Number`, `Finish` — are
+carried over without needing a mapping. Adding a new specific to your export is
+enough; no code change is required.
+
+Two rules govern where they land:
+
+* **Variation parent rows carry only the specifics every card in the group
+  agrees on.** A listing has one set of listing-level specifics, so a field that
+  differs between cards (`Card Name`, `Card Number`) cannot be stated there — the
+  variation axis already expresses it. Uniform fields (`Game`, `Set`,
+  `Language`) are included.
+* **Single listings carry all of their own specifics**, since there is no group
+  to reconcile.
+
+`Game` is special-cased because eBay always requires it: a bare `Game` column is
+normalised to `C:Game`, and if the export has no game information at all the
+**Default `C:Game` item specific** setting under Listing Rules is used (shipped
+as `Pokémon TCG`). The value must be one eBay accepts for the category — if it is
+rejected, check the exact spelling and accent against an existing listing.
+
 ### ⚠️ Possibly still incomplete
 
 Pending confirmation from a successful upload:

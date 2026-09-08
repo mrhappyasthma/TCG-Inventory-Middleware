@@ -541,7 +541,7 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
 
     return StreamingResponse(
         iter([output.getvalue()]),
-        media_type="text/csv",
+        media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=master_catalog_export.csv"},
     )
 
