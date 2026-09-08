@@ -503,7 +503,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(rows["ID1001"]["quantity"], 1)
 
         # A different batch adding the same card again accumulates rather than
-        # overwriting, matching the additive semantics of Module B.
+        # overwriting, matching the additive semantics of Module A.
         second = self.MIXED_CONDITION_BATCH.replace('"Bin-1"', '"Bin-9"')
         process_batch_csv(second, self.db, source_name="b2.csv")
         rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
@@ -1211,7 +1211,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(rows["Crushing Gloves"], "")
 
     # ------------------------------------------------------------------
-    # Module C against the real Active Listings report shape
+    # Module B against the real Active Listings report shape
     # ------------------------------------------------------------------
 
     ACTIVE_LISTINGS_REPORT = """Item number,Title,Variation details,Custom label (SKU),Available quantity,Format,Condition
@@ -1371,7 +1371,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
     def test_bom_does_not_break_the_first_column(self):
         """
         A BOM turns the first header into '﻿Item number', which matched
-        nothing and made Module C record every eBay item number as "UNKNOWN"
+        nothing and made Module B record every eBay item number as "UNKNOWN"
         while otherwise appearing to succeed. Item number is the first column of
         an Active Listings report, so it was always the casualty.
         """
@@ -1387,7 +1387,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertNotIn("UNKNOWN", item_ids)
 
     def test_bom_is_tolerated_by_every_module(self):
-        # Module B
+        # Module A
         db_b = Database(self.db_path + ".b")
         plain = process_batch_csv(self.NUMBERED_BATCH, db_b)
         db_b2 = Database(self.db_path + ".b2")
@@ -1395,7 +1395,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(plain["add_count"], with_bom["add_count"])
         self.assertEqual(with_bom["skipped_count"], 0)
 
-        # Module A
+        # Module C
         self._seed_live_catalog()
         orders = (
             "Sales Record Number,Order Number,Item Title,Custom Label,Quantity" + chr(10)

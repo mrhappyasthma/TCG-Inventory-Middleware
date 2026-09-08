@@ -10,40 +10,36 @@ This middleware connects **SortSwift** (TCGplayer Inventory Schema) and **eBay S
 
 ```mermaid
 graph TD
-    A[SortSwift Inventory Export] -->|Upload Batch| B(Module B: Batch Router)
+    A[SortSwift Inventory Export] -->|Upload Batch| B(Module A: Batch Router)
     B -->|New Cards| C[(SQLite Master Manifest)]
     B -->|Check Store State| D[(SQLite Live Store Mirror)]
     B -->|Items Live on eBay| E[ebay_inventory_updates.csv - Revise]
     B -->|New to eBay| F[ebay_new_additions.csv - Add]
 
-    G[eBay Orders CSV] -->|Upload Sales| H(Module A: Orders Converter)
+    G[eBay Orders CSV] -->|Upload Sales| H(Module C: Orders Converter)
     H -->|Custom Label Lookup| C
     H -->|Match skuId / Attributes| I[sortswift_orders_import.csv - Deductions]
 
-    J[eBay Active Listings CSV] -->|Upload Sync| K(Module C: Store State Sync)
+    J[eBay Active Listings CSV] -->|Upload Sync| K(Module B: Store State Sync)
     K -->|UPSERT ItemID & Live Qty| D
 ```
 
 ---
 
-### Dashboard order vs module letters
+### Module order
 
-The dashboard presents the three modules in **workflow order**, left to right:
+The dashboard presents the three modules in workflow order, and the letters
+follow that order:
 
-| Step on the dashboard | Module |
-|---|---|
-| 1. Process SortSwift Batch | **B** |
-| 2. Sync Active eBay Inventory | **C** |
-| 3. Process eBay Orders | **A** |
+| Step | Module | What it does |
+|---|---|---|
+| 1 | **A** | Process a SortSwift batch into eBay Add / Revise files |
+| 2 | **B** | Sync the resulting eBay listings back into the store mirror |
+| 3 | **C** | Convert eBay orders into SortSwift stock deductions |
 
-That order follows the dependency chain: a batch has to be catalogued and listed
+The order reflects the dependency chain: a batch has to be catalogued and listed
 before eBay has anything to sync back, and the sync has to have linked the item
 numbers before an order can be traced to a card.
-
-The **module letters do not renumber** with the display order. They are stable
-identifiers used by the CLI subcommands, the terminal log prefixes
-(`[MODULE B] ...`) and the section headings in this document, so renaming them
-would break more than it clarified.
 
 ---
 
@@ -255,17 +251,20 @@ The core business logic is packaged as an independent library in [`tcg_engine/`]
 # Initialize SQLite database
 python -m tcg_engine.cli init-db --db data/inventory.db
 
-# Module A: Convert eBay Orders CSV to SortSwift Deduction CSV
-python -m tcg_engine.cli orders sample_ebay_orders.csv -o sortswift_orders.csv --db data/inventory.db
-
-# Module B: Route SortSwift Batch to eBay Add vs. Revise CSVs
+# Module A: Route SortSwift Batch to eBay Add vs. Revise CSVs
 python -m tcg_engine.cli batch sortswift_batch.csv --out-dir ./output --db data/inventory.db
 
-# Module B: Re-apply a batch that has already been processed (adds quantities again)
+# Module A: Re-apply a batch that has already been processed (adds quantities again)
 python -m tcg_engine.cli batch sortswift_batch.csv --out-dir ./output --force --db data/inventory.db
 
-# Module C: Sync Active eBay Listings Report into Store State Mirror
+# Module A: Rebuild the CSVs without touching inventory
+python -m tcg_engine.cli batch sortswift_batch.csv --out-dir ./output --dry-run --db data/inventory.db
+
+# Module B: Sync Active eBay Listings Report into Store State Mirror
 python -m tcg_engine.cli sync active_listings.csv --db data/inventory.db
+
+# Module C: Convert eBay Orders CSV to SortSwift Deduction CSV
+python -m tcg_engine.cli orders sample_ebay_orders.csv -o sortswift_orders.csv --db data/inventory.db
 
 # Export Master Catalog
 python -m tcg_engine.cli export-manifest -o master_manifest.csv --db data/inventory.db
@@ -384,7 +383,7 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ## 🔁 Duplicate Batch Protection
 
-Module B **adds** quantities to the live store mirror, because a SortSwift export represents newly scanned stock. Processing the same export twice would therefore double your eBay quantities.
+Module A **adds** quantities to the live store mirror, because a SortSwift export represents newly scanned stock. Processing the same export twice would therefore double your eBay quantities.
 
 To prevent that, every processed batch is fingerprinted (SHA-256 of the file
 contents) in the `processed_batches` table. Re-uploading a file that has already
@@ -422,13 +421,13 @@ download buttons on each module card.
 
 ## 📊 CSV Schema Specifications
 
-### 1. SortSwift Inventory Export Ingestion (Module B)
+### 1. SortSwift Inventory Export Ingestion (Module A)
 * **Input**: Fresh inventory CSV from SortSwift, or an eBay-style export with `*C:`-prefixed headers. Column matching is case-insensitive and accepts many aliases.
 * **Fields Read**: `Name`, `Set`, `Condition` (NM, LP, MP, HP, DM), `Printing`, `Quantity`, `SKU Id`, `TCGplayer Id`, `Card Number`, `Set Code`, `Language`, `Remarks`, `Price`, `Market Price`, `eBay Price`, `CDN Image`, `Card Back CDN Image`, `Stock Image`, `ConditionID`.
 * **Pricing**: see [How the base price is chosen](#how-the-base-price-is-chosen).
 * **Condition**: both the `Condition` string and the numeric `ConditionID` are taken **verbatim from your export**. There is no translation table — the value originates in SortSwift and is destined for eBay or back into SortSwift, so interposing our own vocabulary would only create a third one that can disagree with both.
   * A row missing either value is **skipped with a warning** rather than having a condition guessed for it. If you see those warnings, re-export from SortSwift with the `ConditionID` column included.
-  * One consequence: the Module A deduction CSV carries whatever string your export used (e.g. `NM`), not a normalised `Near Mint`. Matching on import is driven by `skuId` regardless.
+  * One consequence: the Module C deduction CSV carries whatever string your export used (e.g. `NM`), not a normalised `Near Mint`. Matching on import is driven by `skuId` regardless.
 * **A note on eBay's card ConditionIDs**: for the card categories (`183050`, `183454`, `261328`) eBay does *not* use its general used-goods scale. Ungraded cards use IDs extending **`4000`** and graded cards use IDs extending **`2750`**. So `4000` means "Ungraded", **not** "Lightly Played". The actual grade is expressed in a separate, required **Condition Descriptor** field limited to *Near Mint or Better*, *Excellent*, *Very Good* or *Poor* — which this generator does not yet emit. See the outstanding-work note below.
 
 ### 🃏 eBay Condition Descriptors (ungraded cards)
@@ -589,17 +588,7 @@ the bare `Action` header. Those were the parts most at risk of being wrong.
   Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price,PostalCode,CD:40001,ShippingProfileName,ReturnProfileName,PaymentProfileName
   ```
 
-### 2. eBay Orders to SortSwift Deduction Ingestion (Module A)
-* **Input**: Raw eBay Orders report (`ebay_orders.csv`). Leading metadata lines are detected and skipped.
-* **Fields Read**: `Custom Label` (contains `manifest_id`), `Quantity`, `Order Number`.
-* **Output (`sortswift_orders_import.csv`)**:
-  ```csv
-  skuId,productId,Order Number,Product Name,Set Name,Condition,Printing,Quantity
-  7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,Near Mint,Normal,1
-  ```
-  *(Matches SortSwift's official ⭐ Recommended `skuId` deduction import specification.)*
-
-### 3. eBay Active Listings Sync (Module C)
+### 2. eBay Active Listings Sync (Module B)
 * **Input**: the official eBay **Active Listings** report. Get it from
   **Seller Hub → Reports → Download** (left menu) → *Download report* →
   source `Listings`, type `Active Listings`, format CSV. The report is queued and
@@ -635,7 +624,7 @@ python -m tcg_engine.cli relink active_listings.csv --db data/inventory.db
 
 It matches each live variation to a catalog card using the listing's own
 variation details (`Card=Ledyba (004/198)`), renames the card's manifest ID to
-the one in the label, and then runs the Module C sync automatically. Pass
+the one in the label, and then runs the Module B sync automatically. Pass
 `--no-sync` to only realign.
 
 It is deliberately conservative and will skip rather than guess:
@@ -649,6 +638,16 @@ Renaming carries any existing store-mirror row with it, so a card that was
 already linked keeps its eBay item number and quantity.
 
 ---
+### 3. eBay Orders to SortSwift Deduction Ingestion (Module C)
+* **Input**: Raw eBay Orders report (`ebay_orders.csv`). Leading metadata lines are detected and skipped.
+* **Fields Read**: `Custom Label` (contains `manifest_id`), `Quantity`, `Order Number`.
+* **Output (`sortswift_orders_import.csv`)**:
+  ```csv
+  skuId,productId,Order Number,Product Name,Set Name,Condition,Printing,Quantity
+  7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,Near Mint,Normal,1
+  ```
+  *(Matches SortSwift's official ⭐ Recommended `skuId` deduction import specification.)*
+
 
 ## 📦 Quantity vs Live Stock
 
@@ -657,8 +656,8 @@ visible at a glance:
 
 | Column | Meaning | Written by |
 |---|---|---|
-| **Quantity** | Total stock **you** have catalogued for that card, read from the `Quantity` column of your SortSwift export and accumulated across every batch you have processed. | Module B |
-| **Live Stock** | The quantity **eBay** last reported for it. | Module C (Active Listings sync) |
+| **Quantity** | Total stock **you** have catalogued for that card, read from the `Quantity` column of your SortSwift export and accumulated across every batch you have processed. | Module A |
+| **Live Stock** | The quantity **eBay** last reported for it. | Module B (Active Listings sync) |
 
 When the two disagree the pair is highlighted amber, with a tooltip naming both
 figures. A mismatch usually means one of:
@@ -666,7 +665,7 @@ figures. A mismatch usually means one of:
 * You have processed a batch but not yet uploaded the resulting
   `ebay_inventory_updates.csv` to eBay, so eBay is behind.
 * Cards have sold since your last Active Listings sync, so **eBay** is ahead
-  (lower) and your catalogue is stale until you run Module C again.
+  (lower) and your catalogue is stale until you run Module B again.
 * A listing was edited directly on eBay.
 
 Both figures are included in the Master Catalog CSV export, and both columns

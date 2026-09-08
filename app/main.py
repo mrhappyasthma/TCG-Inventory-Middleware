@@ -295,7 +295,7 @@ async def process_orders_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
-    Module A: Process raw eBay orders CSV & convert to SortSwift Orders Import CSV.
+    Module C: Process raw eBay orders CSV & convert to SortSwift Orders Import CSV.
     """
     content_bytes = await file.read()
     csv_text = decode_csv_bytes(content_bytes)
@@ -311,7 +311,7 @@ async def process_batch_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
-    Module B: Ingest SortSwift scan batch, auto-catalog cards, route to Add vs Revise CSVs.
+    Module A: Ingest SortSwift scan batch, auto-catalog cards, route to Add vs Revise CSVs.
 
     Quantities are additive, so re-processing the same export would inflate live
     eBay stock. Uploads are fingerprinted and a repeat of an already-processed
@@ -338,7 +338,7 @@ async def process_sync_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
-    Module C: Ingest eBay Active Listings report CSV & sync live store mirror state.
+    Module B: Ingest eBay Active Listings report CSV & sync live store mirror state.
     """
     content_bytes = await file.read()
     csv_text = decode_csv_bytes(content_bytes)

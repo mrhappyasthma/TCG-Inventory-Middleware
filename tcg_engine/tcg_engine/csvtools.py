@@ -4,7 +4,7 @@ Shared CSV helpers for reading third-party exports.
 Every module used to carry its own copy of the column lookup, which meant a
 parsing quirk had to be fixed four times. It was not: an eBay report shipped
 with a UTF-8 BOM, so its first header arrived as ``'\\ufeffItem number'``,
-matched nothing, and Module C silently recorded every eBay item number as
+matched nothing, and Module B silently recorded every eBay item number as
 "UNKNOWN" while otherwise appearing to succeed. Keeping this in one place means
 the next quirk is fixed once.
 """

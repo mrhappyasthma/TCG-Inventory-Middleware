@@ -97,7 +97,7 @@ def handle_relink(args):
 
     if not args.no_sync:
         print()
-        print("Running Module C sync with the realigned IDs...")
+        print("Running Module B sync with the realigned IDs...")
         sync = sync_active_listings_file(args.input_file, db)
         for log in sync["logs"]:
             if log["level"] != "SUCCESS":
@@ -178,19 +178,19 @@ def main():
         parents=[db_parent], help="Show inventory statistics")
     p_status.set_defaults(func=handle_status)
 
-    # orders (Module A)
+    # orders (Module C)
     p_orders = subparsers.add_parser(
         "orders",
-        parents=[db_parent], help="Module A: Convert eBay Orders CSV to SortSwift Orders Import CSV"
+        parents=[db_parent], help="Module C: Convert eBay Orders CSV to SortSwift Orders Import CSV"
     )
     p_orders.add_argument("input_file", help="Path to raw eBay orders CSV")
     p_orders.add_argument("-o", "--output", help="Output path for SortSwift import CSV")
     p_orders.set_defaults(func=handle_orders)
 
-    # batch (Module B)
+    # batch (Module A)
     p_batch = subparsers.add_parser(
         "batch",
-        parents=[db_parent], help="Module B: Route SortSwift Scan Batch to Add vs. Revise eBay CSVs"
+        parents=[db_parent], help="Module A: Route SortSwift Scan Batch to Add vs. Revise eBay CSVs"
     )
     p_batch.add_argument("input_file", help="Path to SortSwift batch CSV")
     p_batch.add_argument("--out-dir", default=".", help="Directory to save generated CSVs")
@@ -206,10 +206,10 @@ def main():
     )
     p_batch.set_defaults(func=handle_batch)
 
-    # sync (Module C)
+    # sync (Module B)
     p_sync = subparsers.add_parser(
         "sync",
-        parents=[db_parent], help="Module C: Sync active eBay listings report into store mirror database"
+        parents=[db_parent], help="Module B: Sync active eBay listings report into store mirror database"
     )
     p_sync.add_argument("input_file", help="Path to eBay Active Listings report CSV")
     p_sync.set_defaults(func=handle_sync)
@@ -224,7 +224,7 @@ def main():
     p_relink.add_argument(
         "--no-sync",
         action="store_true",
-        help="Only realign the IDs; do not run the Module C sync afterwards",
+        help="Only realign the IDs; do not run the Module B sync afterwards",
     )
     p_relink.set_defaults(func=handle_relink)
 

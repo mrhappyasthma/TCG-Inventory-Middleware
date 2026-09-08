@@ -2,10 +2,10 @@
 Recover the link between the local catalog and already-live eBay listings.
 
 Manifest IDs are the join key between this catalog and eBay: they are written
-into each listing's Custom Label, and Module A reads them back off an order to
+into each listing's Custom Label, and Module C reads them back off an order to
 work out which card sold. If the catalog is rebuilt -- after a purge, or on a
 fresh install restoring from exports -- the newly minted IDs will not match the
-labels already published on eBay, and Module C reports every row as "not in
+labels already published on eBay, and Module B reports every row as "not in
 Master Catalog".
 
 Rather than re-creating the listings, this realigns the *catalog* to the labels

@@ -681,14 +681,14 @@ function setupDropzones() {
     document.getElementById("btnDownloadOnlyBatch").addEventListener("click", () => {
         if (!pendingBatchFile) return;
         document.getElementById("batchDuplicateWarning").classList.add("hidden");
-        logToTerminal("INFO", `[MODULE B] Rebuilding files for ${pendingBatchFile.name} - inventory will not change.`);
+        logToTerminal("INFO", `[MODULE A] Rebuilding files for ${pendingBatchFile.name} - inventory will not change.`);
         handleBatchUpload(pendingBatchFile, "dry-run");
     });
 
     document.getElementById("btnForceProcessBatch").addEventListener("click", () => {
         if (!pendingBatchFile) return;
         document.getElementById("batchDuplicateWarning").classList.add("hidden");
-        logToTerminal("WARN", `[MODULE B] Force processing ${pendingBatchFile.name} - quantities will be added again.`);
+        logToTerminal("WARN", `[MODULE A] Force processing ${pendingBatchFile.name} - quantities will be added again.`);
         handleBatchUpload(pendingBatchFile, "force");
     });
 
@@ -737,7 +737,7 @@ async function handleOrdersUpload(file) {
     const formData = new FormData();
     formData.append("file", file);
 
-    logToTerminal("INFO", `[MODULE A] Uploading ${file.name} for eBay Orders processing...`);
+    logToTerminal("INFO", `[MODULE C] Uploading ${file.name} for eBay Orders processing...`);
 
     try {
         const res = await fetch("/api/process/orders", {
@@ -759,9 +759,9 @@ async function handleOrdersUpload(file) {
 
         // The file is built and held in memory; downloading is an explicit
         // click so an unwanted file is never dropped into Downloads.
-        logToTerminal("SUCCESS", `[MODULE A] sortswift_orders_import.csv is ready (${data.converted_count} items). Click to download.`);
+        logToTerminal("SUCCESS", `[MODULE C] sortswift_orders_import.csv is ready (${data.converted_count} items). Click to download.`);
     } catch (err) {
-        logToTerminal("ERROR", `[MODULE A] ${err.message}`);
+        logToTerminal("ERROR", `[MODULE C] ${err.message}`);
     }
 }
 
@@ -779,7 +779,7 @@ async function handleBatchUpload(file, mode = "normal") {
     const intent = mode === "dry-run"
         ? "rebuilding files only"
         : mode === "force" ? "force processing" : "routing";
-    logToTerminal("INFO", `[MODULE B] Uploading ${file.name} (${intent})...`);
+    logToTerminal("INFO", `[MODULE A] Uploading ${file.name} (${intent})...`);
 
     try {
         const res = await fetch("/api/process/batch", {
@@ -838,7 +838,7 @@ async function handleBatchUpload(file, mode = "normal") {
 
         logToTerminal(
             "SUCCESS",
-            `[MODULE B] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}${suffix}. Click to download.`
+            `[MODULE A] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}${suffix}. Click to download.`
         );
 
         // A download-only rebuild wrote nothing, so there is nothing to refresh.
@@ -847,7 +847,7 @@ async function handleBatchUpload(file, mode = "normal") {
             fetchInventory();
         }
     } catch (err) {
-        logToTerminal("ERROR", `[MODULE B] ${err.message}`);
+        logToTerminal("ERROR", `[MODULE A] ${err.message}`);
     }
 }
 
@@ -855,7 +855,7 @@ async function handleSyncUpload(file) {
     const formData = new FormData();
     formData.append("file", file);
 
-    logToTerminal("INFO", `[MODULE C] Uploading ${file.name} for eBay Store State synchronization...`);
+    logToTerminal("INFO", `[MODULE B] Uploading ${file.name} for eBay Store State synchronization...`);
 
     try {
         const res = await fetch("/api/process/sync", {
@@ -878,7 +878,7 @@ async function handleSyncUpload(file) {
         fetchStats();
         fetchInventory();
     } catch (err) {
-        logToTerminal("ERROR", `[MODULE C] ${err.message}`);
+        logToTerminal("ERROR", `[MODULE B] ${err.message}`);
     }
 }
 
@@ -1011,7 +1011,7 @@ function renderInventoryTable(items, total, offset) {
             ? 'bg-amber-950/80 text-amber-300 border border-amber-800'
             : 'bg-slate-900 text-slate-400 border border-slate-800';
         const driftTitle = drifted
-            ? `Catalogued ${qty}, eBay reports ${item.last_known_qty}. Run a Module C sync, or revise the listing.`
+            ? `Catalogued ${qty}, eBay reports ${item.last_known_qty}. Run a Module B sync, or revise the listing.`
             : 'Catalogued quantity matches eBay.';
 
         return `
