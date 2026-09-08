@@ -2,4 +2,5 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
 pydantic>=2.0.0
+google-auth>=2.35.0
 -e ./tcg_engine

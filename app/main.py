@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import csv
+import mimetypes
 from typing import Optional, Dict, Any, List
 
 # Ensure project root is in sys.path when running as direct script
@@ -10,7 +11,8 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Load .env file into os.environ BEFORE any other imports that read env vars at import time
-# (auth.py reads AUTH_METHOD at module level, so this must run first)
+# (auth.py reads GOOGLE_CLIENT_ID at module level and refuses to import without it,
+# so this must run first)
 _env_path = os.path.join(project_root, ".env")
 if os.path.isfile(_env_path):
     with open(_env_path, encoding="utf-8") as _ef:
@@ -48,22 +50,18 @@ try:
     from app.user_db import UserDatabase
     from app.auth import (
         AuthManager,
-        hash_password,
-        verify_password,
         create_jwt_token,
+        set_session_cookie,
         verify_google_id_token,
-        AUTH_METHOD,
         GOOGLE_CLIENT_ID,
     )
 except ImportError:
     from .user_db import UserDatabase
     from .auth import (
         AuthManager,
-        hash_password,
-        verify_password,
         create_jwt_token,
+        set_session_cookie,
         verify_google_id_token,
-        AUTH_METHOD,
         GOOGLE_CLIENT_ID,
     )
 
@@ -83,7 +81,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Mount static assets
+# Mount static assets. Register woff2 explicitly: the vendored fonts would
+# otherwise be served as application/octet-stream on some platforms.
+mimetypes.add_type("font/woff2", ".woff2")
+
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
@@ -91,17 +92,6 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 # Pydantic Schemas
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    email: Optional[str] = None
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
 class GoogleAuthRequest(BaseModel):
     id_token: str
 
@@ -146,7 +136,6 @@ def get_auth_status(request: Request):
     user = auth_manager.get_current_user_from_request(request)
     total_users = user_db.get_user_count()
     return {
-        "auth_method": AUTH_METHOD,
         "google_client_id": GOOGLE_CLIENT_ID,
         "is_authenticated": user is not None and user.get("status") == "active",
         "is_pending": user is not None and user.get("status") == "pending",
@@ -155,133 +144,57 @@ def get_auth_status(request: Request):
     }
 
 
-@app.post("/api/auth/register")
-def register_user(req: RegisterRequest, response: Response):
-    """Register a new user account."""
-    u_name = req.username.strip()
-    if len(u_name) < 3:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username must be at least 3 characters long.",
-        )
-    if len(req.password) < 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 6 characters long.",
-        )
-
-    if user_db.get_user_by_username(u_name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username is already taken.",
-        )
-
-    if req.email and user_db.get_user_by_email(req.email):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email is already registered.",
-        )
-
-    pwd_hash = hash_password(req.password)
-    user = user_db.create_user(
-        username=u_name,
-        password_hash=pwd_hash,
-        email=req.email,
-        auth_provider="local",
-    )
-
-    token = create_jwt_token({"user_id": user["id"], "username": user["username"]})
-    response.set_cookie(
-        key="session_token",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400 * 7,
-    )
-    return {
-        "success": True,
-        "user": user,
-        "message": (
-            "Registration successful. You are the initial Admin!"
-            if user["role"] == "admin"
-            else "Registration successful. Your account is pending admin approval."
-        ),
-    }
-
-
-@app.post("/api/auth/login")
-def login_user(req: LoginRequest, response: Response):
-    """Login with username and password."""
-    user = user_db.get_user_by_username(req.username.strip())
-    if not user or not user.get("password_hash"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password.",
-        )
-
-    if not verify_password(user["password_hash"], req.password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password.",
-        )
-
-    if user.get("status") == "disabled":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account has been deactivated.",
-        )
-
-    user_db.update_last_login(user["id"])
-    token = create_jwt_token({"user_id": user["id"], "username": user["username"]})
-    response.set_cookie(
-        key="session_token",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400 * 7,
-    )
-
-    return {
-        "success": True,
-        "user": user,
-        "is_pending": user.get("status") == "pending",
-        "message": (
-            "Login successful, but your account is pending admin approval."
-            if user.get("status") == "pending"
-            else "Login successful."
-        ),
-    }
-
-
 @app.post("/api/auth/google")
 def login_google(req: GoogleAuthRequest, response: Response):
-    """Sign-in / Sign-up with Google OAuth Token."""
-    google_data = verify_google_id_token(req.id_token)
-    if not google_data or "email" not in google_data:
+    """
+    Sign in (or sign up) with a Google ID token.
+
+    This is the only authentication endpoint. Accounts are keyed on the Google
+    'sub' claim so that a user changing their email address on the Google side
+    keeps the same local account and approval state.
+    """
+    claims = verify_google_id_token(req.id_token)
+    if not claims:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired Google Token.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired Google sign-in token.",
         )
 
-    email = google_data["email"].strip()
-    username = google_data.get("name") or email.split("@")[0]
+    google_sub = str(claims["sub"]).strip()
+    email = claims["email"].strip()
+    display_name = (claims.get("name") or email.split("@")[0]).strip()
 
-    # Check if user exists by email
-    user = user_db.get_user_by_email(email)
+    user = user_db.get_user_by_google_sub(google_sub)
+
     if not user:
-        # Check if username is taken, make it unique
-        candidate_username = username
+        # A record already holding this email but no matching Google subject is a
+        # stale leftover. Refuse rather than silently creating a second account,
+        # which would split approval state across two rows.
+        existing_by_email = user_db.get_user_by_email(email)
+        if existing_by_email:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "An account already exists for this email address but is not "
+                    "linked to this Google account. Ask an administrator to remove "
+                    "the stale account and sign in again."
+                ),
+            )
+
+        candidate_username = display_name
         counter = 1
         while user_db.get_user_by_username(candidate_username):
-            candidate_username = f"{username}_{counter}"
+            candidate_username = f"{display_name}_{counter}"
             counter += 1
 
         user = user_db.create_user(
             username=candidate_username,
-            password_hash=None,
+            google_sub=google_sub,
             email=email,
             auth_provider="google",
         )
+    else:
+        user_db.update_profile_from_google(user["id"], email=email)
 
     if user.get("status") == "disabled":
         raise HTTPException(
@@ -290,21 +203,17 @@ def login_google(req: GoogleAuthRequest, response: Response):
         )
 
     user_db.update_last_login(user["id"])
+    user = user_db.get_user_by_id(user["id"])
+
     token = create_jwt_token({"user_id": user["id"], "username": user["username"]})
-    response.set_cookie(
-        key="session_token",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400 * 7,
-    )
+    set_session_cookie(response, token)
 
     return {
         "success": True,
         "user": user,
         "is_pending": user.get("status") == "pending",
         "message": (
-            "Signed in with Google. Pending admin approval."
+            "Signed in with Google. Your account is pending admin approval."
             if user.get("status") == "pending"
             else "Signed in successfully."
         ),
@@ -396,14 +305,24 @@ async def process_orders_endpoint(
 @app.post("/api/process/batch")
 async def process_batch_endpoint(
     file: UploadFile = File(...),
+    force: bool = Form(False),
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
     Module B: Ingest SortSwift scan batch, auto-catalog cards, route to Add vs Revise CSVs.
+
+    Quantities are additive, so re-processing the same export would inflate live
+    eBay stock. Uploads are fingerprinted and a repeat of an already-processed
+    file is refused unless the caller explicitly passes force=true.
     """
     content_bytes = await file.read()
     csv_text = content_bytes.decode("utf-8", errors="replace")
-    result = process_batch_csv(csv_text, db)
+    result = process_batch_csv(
+        csv_text,
+        db,
+        source_name=file.filename or "upload.csv",
+        force=force,
+    )
     return result
 
 
@@ -453,7 +372,7 @@ def update_pricing_rules_endpoint(
     admin: Dict[str, Any] = Depends(require_admin_user),
 ):
     """Update pricing rules (Admin only)."""
-    rules_data = [r.dict() for r in req.rules]
+    rules_data = [r.model_dump() for r in req.rules]
     db.set_pricing_rules(rules_data)
     return {"success": True, "rules": db.get_pricing_rules()}
 
@@ -618,6 +537,28 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=master_catalog_export.csv"},
     )
+
+
+# ---------------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------------
+
+@app.get("/api/health")
+def health_check():
+    """
+    Unauthenticated liveness/readiness probe for Docker and Container Manager.
+
+    Reports degraded rather than merely 'process is up' so that a container with
+    an unreachable or unwritable data volume is surfaced as unhealthy.
+    """
+    try:
+        db.get_stats()
+        return {"status": "ok", "database": "reachable"}
+    except Exception as exc:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "degraded", "database": "unreachable", "detail": str(exc)},
+        )
 
 
 # ---------------------------------------------------------

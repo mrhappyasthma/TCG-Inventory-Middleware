@@ -5,44 +5,114 @@ import json
 import os
 import secrets
 import time
-import urllib.request
-import urllib.error
-from typing import Optional, Dict, Any, Tuple
-from fastapi import Request, HTTPException, status, Depends
+from typing import Optional, Dict, Any
+
+from fastapi import Request, HTTPException, status
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
+
 try:
     from app.user_db import UserDatabase
 except ImportError:
     from .user_db import UserDatabase
 
-# Environment configurations
-AUTH_METHOD = os.environ.get("AUTH_METHOD", "local").lower()  # "local", "google", "none"
-JWT_SECRET = os.environ.get("JWT_SECRET", "tcg-middleware-default-secret-key-change-me")
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# Authentication is Google Sign-In only. There is deliberately no local
+# username/password path and no "disabled auth" development bypass, so that
+# there is exactly one way to become an authenticated user.
+# ---------------------------------------------------------------------------
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+
+# Accepted issuers for a Google-issued ID token.
+GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+
+# Session cookie lifetime (7 days).
+SESSION_TTL_SECONDS = 86400 * 7
+
+SESSION_SECRET_FILE = os.environ.get("SESSION_SECRET_FILE", "data/.session_secret")
+
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").strip().lower() not in (
+    "false",
+    "0",
+    "no",
+)
 
 
-def hash_password(password: str) -> str:
-    """Hash a password using PBKDF2-HMAC-SHA256 with a unique salt."""
-    salt = secrets.token_hex(16)
-    key = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000
+class ConfigurationError(RuntimeError):
+    """Raised when the app is not configured well enough to authenticate anyone."""
+
+
+if not GOOGLE_CLIENT_ID:
+    raise ConfigurationError(
+        "GOOGLE_CLIENT_ID is not set.\n"
+        "\n"
+        "This application authenticates exclusively through Google Sign-In, so a\n"
+        "Google OAuth 2.0 Web application Client ID is required to start.\n"
+        "\n"
+        "Create one at https://console.cloud.google.com under\n"
+        "  APIs & Services > Credentials > Create Credentials > OAuth client ID\n"
+        "and add it to your .env file as:\n"
+        "  GOOGLE_CLIENT_ID=<your-id>.apps.googleusercontent.com\n"
+        "\n"
+        "Remember to register your Authorized JavaScript origins. Google rejects\n"
+        "raw IP addresses and plain HTTP, so a bare LAN address such as\n"
+        "http://192.168.1.50:8080 can never be authorized. Use an HTTPS domain\n"
+        "(e.g. https://yourname.synology.me) or http://localhost:8080 for dev.\n"
+        "See the README for the full setup walkthrough."
     )
-    return f"{salt}${key.hex()}"
 
 
-def verify_password(stored_password_hash: str, provided_password: str) -> bool:
-    """Verify a stored password hash against a provided password."""
+def _load_or_create_session_secret() -> str:
+    """
+    Resolve the secret used to sign session cookies.
+
+    An explicit JWT_SECRET environment variable always wins. Otherwise a random
+    secret is generated once and persisted alongside the databases, so sessions
+    survive restarts without the code ever shipping a guessable default. A
+    hardcoded fallback would be public in the repository and would let anyone
+    forge an admin session cookie.
+    """
+    env_secret = os.environ.get("JWT_SECRET", "").strip()
+    if env_secret:
+        return env_secret
+
+    if os.path.isfile(SESSION_SECRET_FILE):
+        with open(SESSION_SECRET_FILE, "r", encoding="utf-8") as f:
+            stored = f.read().strip()
+        if stored:
+            return stored
+
+    parent_dir = os.path.dirname(os.path.abspath(SESSION_SECRET_FILE))
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+
+    generated = secrets.token_urlsafe(32)
+    with open(SESSION_SECRET_FILE, "w", encoding="utf-8") as f:
+        f.write(generated)
     try:
-        salt, key_hex = stored_password_hash.split("$", 1)
-        key = hashlib.pbkdf2_hmac(
-            "sha256", provided_password.encode("utf-8"), salt.encode("utf-8"), 100000
-        )
-        return hmac.compare_digest(key.hex(), key_hex)
-    except Exception:
-        return False
+        os.chmod(SESSION_SECRET_FILE, 0o600)
+    except OSError:
+        # Windows does not honour POSIX modes; the file still lives in the
+        # non-public data directory.
+        pass
+    return generated
 
 
-def create_jwt_token(payload: Dict[str, Any], expires_in_seconds: int = 86400 * 7) -> str:
-    """Create a signed JWT-style token using HMAC-SHA256."""
+JWT_SECRET = _load_or_create_session_secret()
+
+
+# ---------------------------------------------------------------------------
+# Session tokens
+# ---------------------------------------------------------------------------
+
+def create_jwt_token(
+    payload: Dict[str, Any], expires_in_seconds: int = SESSION_TTL_SECONDS
+) -> str:
+    """Create a signed JWT-style session token using HMAC-SHA256."""
     header = {"alg": "HS256", "typ": "JWT"}
     token_payload = dict(payload)
     token_payload["exp"] = int(time.time()) + expires_in_seconds
@@ -61,67 +131,98 @@ def create_jwt_token(payload: Dict[str, Any], expires_in_seconds: int = 86400 * 
 
 
 def decode_jwt_token(token: str) -> Optional[Dict[str, Any]]:
-    """Verify and decode a JWT token."""
+    """Verify and decode a session token, returning None if it is not valid."""
     try:
         parts = token.split(".")
         if len(parts) != 3:
             return None
         header_b64, payload_b64, sig_b64 = parts
         message = f"{header_b64}.{payload_b64}".encode("utf-8")
-        expected_sig = hmac.new(JWT_SECRET.encode("utf-8"), message, hashlib.sha256).digest()
-        expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode("utf-8").rstrip("=")
+        expected_sig = hmac.new(
+            JWT_SECRET.encode("utf-8"), message, hashlib.sha256
+        ).digest()
+        expected_sig_b64 = (
+            base64.urlsafe_b64encode(expected_sig).decode("utf-8").rstrip("=")
+        )
 
         if not hmac.compare_digest(sig_b64, expected_sig_b64):
             return None
 
-        # Fix base64 padding
         padding = "=" * ((4 - len(payload_b64) % 4) % 4)
         payload_bytes = base64.urlsafe_b64decode(payload_b64 + padding)
         payload = json.loads(payload_bytes.decode("utf-8"))
 
         if "exp" in payload and payload["exp"] < time.time():
-            return None  # Expired
+            return None
         return payload
     except Exception:
         return None
 
 
-def verify_google_id_token(id_token: str) -> Optional[Dict[str, Any]]:
+def set_session_cookie(response, token: str) -> None:
+    """Attach the session cookie using consistent, hardened flags."""
+    response.set_cookie(
+        key="session_token",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=COOKIE_SECURE,
+        max_age=SESSION_TTL_SECONDS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Google ID token verification
+# ---------------------------------------------------------------------------
+
+def verify_google_id_token(token: str) -> Optional[Dict[str, Any]]:
     """
-    Verify Google OAuth ID Token via Google's tokeninfo endpoint.
-    Zero external heavy Google client library dependency.
+    Verify a Google ID token locally against Google's published signing certs.
+
+    ``verify_oauth2_token`` checks the signature, expiry and — because the
+    audience is passed explicitly — that the token was actually minted for this
+    application. That audience check is mandatory: accepting a token without it
+    would let an ID token issued for any other Google app authenticate here.
+
+    Returns the claims dict on success, or None if the token is unusable.
     """
-    try:
-        url = f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
-        req = urllib.request.Request(url, headers={"User-Agent": "TCG-Middleware"})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode("utf-8"))
-                # Optionally check audience if configured
-                if GOOGLE_CLIENT_ID and data.get("aud") != GOOGLE_CLIENT_ID:
-                    return None
-                return data
-    except Exception:
+    if not token:
         return None
-    return None
+
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except (ValueError, GoogleAuthError):
+        return None
+
+    if claims.get("iss") not in GOOGLE_ISSUERS:
+        return None
+
+    if not claims.get("sub"):
+        return None
+
+    if not claims.get("email"):
+        return None
+
+    # A Google account can carry an unverified email; treating one as an
+    # identity would let someone claim an address they do not control.
+    if claims.get("email_verified") not in (True, "true", "True"):
+        return None
+
+    return claims
 
 
 class AuthManager:
     def __init__(self, user_db: UserDatabase):
         self.user_db = user_db
 
-    def get_current_user_from_request(self, request: Request) -> Optional[Dict[str, Any]]:
-        """Extract and validate current user from session cookie or Authorization header."""
-        if AUTH_METHOD == "none":
-            # In offline/dev mode, return default active admin
-            return {
-                "id": 0,
-                "username": "local_admin",
-                "email": "admin@local",
-                "role": "admin",
-                "status": "active",
-            }
-
+    def get_current_user_from_request(
+        self, request: Request
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve the current user from the session cookie or bearer header."""
         token = request.cookies.get("session_token")
         if not token:
             auth_header = request.headers.get("Authorization")
@@ -135,16 +236,15 @@ class AuthManager:
         if not payload or "user_id" not in payload:
             return None
 
-        user = self.user_db.get_user_by_id(payload["user_id"])
-        return user
+        return self.user_db.get_user_by_id(payload["user_id"])
 
     def require_user(self, request: Request) -> Dict[str, Any]:
-        """Require authenticated and active user."""
+        """Require an authenticated, approved user."""
         user = self.get_current_user_from_request(request)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required. Please log in.",
+                detail="Authentication required. Please sign in with Google.",
             )
         if user.get("status") == "pending":
             raise HTTPException(
@@ -159,7 +259,7 @@ class AuthManager:
         return user
 
     def require_admin(self, request: Request) -> Dict[str, Any]:
-        """Require user with active status and admin role."""
+        """Require an approved user holding the admin role."""
         user = self.require_user(request)
         if user.get("role") != "admin":
             raise HTTPException(

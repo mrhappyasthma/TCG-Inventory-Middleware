@@ -6,13 +6,12 @@
     <title>TCG Inventory Middleware | SortSwift & eBay Bridge</title>
     <meta name="description" content="Containerized TCG card inventory middleware for SortSwift and eBay Seller Hub synchronization.">
     
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    
-    <!-- Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Fonts and Tailwind are vendored under /static/vendor so the dashboard
+         renders correctly on a NAS with no outbound internet access, and so we
+         are not relying on Tailwind's CDN build, which its own documentation
+         limits to prototyping. -->
+    <link rel="stylesheet" href="/static/vendor/fonts.css">
+    <script src="/static/vendor/tailwind.min.js"></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -349,7 +348,7 @@
                         <tbody id="inventoryTableBody" class="divide-y divide-slate-800/60 text-slate-300">
                             <!-- Populated dynamically via JS -->
                             <tr>
-                                <td colspan="8" class="py-8 text-center text-slate-500">Loading catalog inventory...</td>
+                                <td colspan="9" class="py-8 text-center text-slate-500">Loading catalog inventory...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -403,7 +402,7 @@
 
     </main>
 
-    <!-- AUTHENTICATION MODAL -->
+    <!-- AUTHENTICATION MODAL (Google Sign-In only) -->
     <div id="authModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
         <div class="w-full max-w-md bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative">
             <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
@@ -413,62 +412,25 @@
             </button>
 
             <div class="text-center mb-6">
+                <div class="w-12 h-12 mx-auto mb-3 rounded-2xl bg-gradient-to-tr from-brand-600 via-indigo-500 to-accent-cyan flex items-center justify-center shadow-lg shadow-brand-500/20">
+                    <svg class="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4" />
+                    </svg>
+                </div>
                 <h3 id="authModalTitle" class="text-lg font-bold font-heading text-white">Sign In to TCG Middleware</h3>
-                <p class="text-xs text-slate-400 mt-1" id="authModalSubtitle">Enter your credentials to access inventory and conversion tools.</p>
-            </div>
-
-            <!-- Tab Switcher -->
-            <div class="flex rounded-xl bg-dark-900 p-1 mb-5 border border-slate-700/80">
-                <button id="tabLogin" onclick="switchAuthTab('login')" class="flex-1 py-1.5 text-xs font-semibold rounded-lg bg-brand-600 text-white transition-all">Sign In</button>
-                <button id="tabRegister" onclick="switchAuthTab('register')" class="flex-1 py-1.5 text-xs font-semibold rounded-lg text-slate-400 hover:text-slate-200 transition-all">Register</button>
+                <p class="text-xs text-slate-400 mt-1" id="authModalSubtitle">This dashboard uses Google Sign-In. The first account to sign in becomes the administrator; everyone after that needs admin approval.</p>
             </div>
 
             <!-- Auth Error Message -->
             <div id="authErrorMsg" class="hidden mb-4 p-3 rounded-xl bg-rose-950/60 border border-rose-800 text-rose-300 text-xs"></div>
 
-            <!-- Login Form -->
-            <form id="loginForm" onsubmit="handleLogin(event)" class="space-y-4">
-                <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1">Username</label>
-                    <input type="text" id="loginUsername" required class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
+            <!-- Google Sign-In button is rendered here programmatically by app.js -->
+            <div id="googleAuthContainer" class="py-2">
+                <div id="googleSignInBtn" class="flex justify-center min-h-[44px]"></div>
+                <div id="googleAuthUnavailable" class="hidden mt-3 p-3 rounded-xl bg-amber-950/50 border border-amber-800/60 text-amber-200 text-[11px] leading-relaxed">
+                    <p class="font-semibold text-amber-100 mb-1">Google Sign-In is not available.</p>
+                    <p>The server has no <code class="font-mono">GOOGLE_CLIENT_ID</code> configured, or this page could not reach Google. Note that Google refuses OAuth origins that are raw IP addresses or plain HTTP &mdash; use an HTTPS domain or <code class="font-mono">http://localhost:8080</code>. See the README for setup steps.</p>
                 </div>
-                <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1">Password</label>
-                    <input type="password" id="loginPassword" required class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
-                </div>
-                <button type="submit" class="w-full py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20 transition-all">
-                    Sign In
-                </button>
-            </form>
-
-            <!-- Register Form (Hidden by default) -->
-            <form id="registerForm" onsubmit="handleRegister(event)" class="hidden space-y-4">
-                <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1">Username</label>
-                    <input type="text" id="regUsername" required minlength="3" class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
-                </div>
-                <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1">Email (Optional)</label>
-                    <input type="email" id="regEmail" class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
-                </div>
-                <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1">Password</label>
-                    <input type="password" id="regPassword" required minlength="6" class="w-full px-3 py-2 text-xs rounded-xl bg-dark-900 border border-slate-700 text-white focus:outline-none focus:border-brand-500">
-                </div>
-                <button type="submit" class="w-full py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20 transition-all">
-                    Create Account
-                </button>
-            </form>
-
-            <!-- Google Sign-In Container (Shown if Google Client ID is configured) -->
-            <div id="googleAuthContainer" class="hidden mt-5 pt-5 border-t border-slate-700 text-center">
-                <div class="text-[11px] text-slate-400 mb-3">Or continue with</div>
-                <div id="g_id_onload"
-                     data-client_id=""
-                     data-callback="handleGoogleCallback"
-                     data-auto_prompt="false">
-                </div>
-                <div class="g_id_signin flex justify-center" data-type="standard" data-size="large" data-theme="filled_black" data-text="sign_in_with" data-shape="pill" data-logo_alignment="left"></div>
             </div>
         </div>
     </div>
@@ -681,6 +643,17 @@
                         <span class="text-slate-400 font-mono text-sm">$</span>
                         <input type="number" id="settingSingleThreshold" step="0.50" min="0" value="5.00" class="w-28 px-3 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
                     </div>
+                </div>
+
+                <!-- Set Grouping Toggle -->
+                <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80">
+                    <label class="flex items-start gap-3 cursor-pointer">
+                        <input type="checkbox" id="settingGroupBySet" checked class="mt-0.5 w-4 h-4 rounded bg-dark-800 border-slate-600 text-brand-600 focus:ring-brand-500 focus:ring-offset-dark-900">
+                        <span>
+                            <span class="block font-semibold text-slate-200">Group cards into Set variation listings</span>
+                            <span class="block text-[11px] text-slate-400 mt-1">When enabled, cards priced below the threshold above are combined into a single multi-variation &ldquo;Pick Your Card&rdquo; listing per expansion set. When disabled, <strong>every</strong> card is listed individually regardless of price.</span>
+                        </span>
+                    </label>
                 </div>
 
                 <!-- Variation Title Template -->

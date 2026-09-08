@@ -1,6 +1,5 @@
 // Application State
 let currentUser = null;
-let currentAuthMethod = "local";
 let googleClientId = "";
 let currentPage = 1;
 const pageSize = 20;
@@ -24,18 +23,28 @@ document.addEventListener("DOMContentLoaded", () => {
 // 1. AUTHENTICATION & USER MANAGEMENT
 // -------------------------------------------------------------------
 
+// Google Sign-In readiness. The GSI client script is loaded with async/defer,
+// so the button can only be rendered once BOTH the SDK has loaded and the
+// server has told us which client ID to use. Either can win the race.
+let googleSdkReady = false;
+let authConfigLoaded = false;
+let googleButtonRendered = false;
+
+// Documented GSI hook, invoked by the Google script once it is ready.
+window.onGoogleLibraryLoad = () => {
+    googleSdkReady = true;
+    maybeRenderGoogleButton();
+};
+
 async function initAuth() {
     try {
         const res = await fetch("/api/auth/me");
         const data = await res.json();
-        currentAuthMethod = data.auth_method;
         googleClientId = data.google_client_id;
         currentUser = data.user;
 
-        if (googleClientId && window.google) {
-            const googleContainer = document.getElementById("googleAuthContainer");
-            if (googleContainer) googleContainer.classList.remove("hidden");
-        }
+        authConfigLoaded = true;
+        maybeRenderGoogleButton();
 
         updateAuthUI(data);
 
@@ -44,16 +53,54 @@ async function initAuth() {
             fetchInventory();
         } else if (data.is_pending) {
             document.getElementById("pendingApprovalBanner").classList.remove("hidden");
-        } else if (currentAuthMethod !== "none" && !data.is_authenticated) {
-            openAuthModal();
         } else {
-            // Dev mode (AUTH_METHOD=none)
-            fetchStats();
-            fetchInventory();
+            openAuthModal();
         }
+
+        // If the Google script never arrives (no outbound network, blocked
+        // domain), say so instead of leaving an empty modal.
+        setTimeout(() => {
+            if (!googleButtonRendered) showGoogleUnavailable();
+        }, 4000);
     } catch (err) {
         logToTerminal("ERROR", `Auth check failed: ${err.message}`);
     }
+}
+
+function maybeRenderGoogleButton() {
+    if (!googleSdkReady || !authConfigLoaded || googleButtonRendered) return;
+
+    const target = document.getElementById("googleSignInBtn");
+    if (!target) return;
+
+    if (!googleClientId || !window.google || !window.google.accounts || !window.google.accounts.id) {
+        showGoogleUnavailable();
+        return;
+    }
+
+    try {
+        google.accounts.id.initialize({
+            client_id: googleClientId,
+            callback: handleGoogleCallback,
+        });
+        google.accounts.id.renderButton(target, {
+            type: "standard",
+            theme: "filled_black",
+            size: "large",
+            text: "signin_with",
+            shape: "pill",
+            logo_alignment: "left",
+        });
+        googleButtonRendered = true;
+        document.getElementById("googleAuthUnavailable")?.classList.add("hidden");
+    } catch (err) {
+        logToTerminal("ERROR", `Google Sign-In could not initialize: ${err.message}`);
+        showGoogleUnavailable();
+    }
+}
+
+function showGoogleUnavailable() {
+    document.getElementById("googleAuthUnavailable")?.classList.remove("hidden");
 }
 
 function updateAuthUI(data) {
@@ -72,7 +119,7 @@ function updateAuthUI(data) {
 
         document.getElementById("userNameText").innerText = data.user.username;
         document.getElementById("userAvatarText").innerText = data.user.username[0].toUpperCase();
-        
+
         const roleBadge = document.getElementById("userRoleBadge");
         roleBadge.innerText = data.user.role.toUpperCase();
         if (data.user.role === "admin") {
@@ -101,92 +148,16 @@ function updateAuthUI(data) {
 function openAuthModal() {
     document.getElementById("authModal").classList.remove("hidden");
     document.getElementById("authErrorMsg").classList.add("hidden");
+    maybeRenderGoogleButton();
 }
 
 function closeAuthModal() {
     document.getElementById("authModal").classList.add("hidden");
 }
 
-function switchAuthTab(tab) {
-    const tabLogin = document.getElementById("tabLogin");
-    const tabRegister = document.getElementById("tabRegister");
-    const loginForm = document.getElementById("loginForm");
-    const registerForm = document.getElementById("registerForm");
-    const title = document.getElementById("authModalTitle");
-    const subtitle = document.getElementById("authModalSubtitle");
-    document.getElementById("authErrorMsg").classList.add("hidden");
-
-    if (tab === "login") {
-        tabLogin.className = "flex-1 py-1.5 text-xs font-semibold rounded-lg bg-brand-600 text-white transition-all";
-        tabRegister.className = "flex-1 py-1.5 text-xs font-semibold rounded-lg text-slate-400 hover:text-slate-200 transition-all";
-        loginForm.classList.remove("hidden");
-        registerForm.classList.add("hidden");
-        title.innerText = "Sign In to TCG Middleware";
-        subtitle.innerText = "Enter your credentials to access inventory and conversion tools.";
-    } else {
-        tabRegister.className = "flex-1 py-1.5 text-xs font-semibold rounded-lg bg-brand-600 text-white transition-all";
-        tabLogin.className = "flex-1 py-1.5 text-xs font-semibold rounded-lg text-slate-400 hover:text-slate-200 transition-all";
-        registerForm.classList.remove("hidden");
-        loginForm.classList.add("hidden");
-        title.innerText = "Create an Account";
-        subtitle.innerText = "Register an account. (First user becomes Admin, subsequent users require approval).";
-    }
-}
-
-async function handleLogin(e) {
-    e.preventDefault();
-    const u = document.getElementById("loginUsername").value;
-    const p = document.getElementById("loginPassword").value;
-    const errorBox = document.getElementById("authErrorMsg");
-    errorBox.classList.add("hidden");
-
-    try {
-        const res = await fetch("/api/auth/login", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username: u, password: p })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-            throw new Error(data.detail || "Login failed");
-        }
-        closeAuthModal();
-        logToTerminal("SUCCESS", `Logged in as ${data.user.username}`);
-        initAuth();
-    } catch (err) {
-        errorBox.innerText = err.message;
-        errorBox.classList.remove("hidden");
-    }
-}
-
-async function handleRegister(e) {
-    e.preventDefault();
-    const u = document.getElementById("regUsername").value;
-    const p = document.getElementById("regPassword").value;
-    const em = document.getElementById("regEmail").value;
-    const errorBox = document.getElementById("authErrorMsg");
-    errorBox.classList.add("hidden");
-
-    try {
-        const res = await fetch("/api/auth/register", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username: u, password: p, email: em || null })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-            throw new Error(data.detail || "Registration failed");
-        }
-        closeAuthModal();
-        logToTerminal("SUCCESS", data.message);
-        initAuth();
-    } catch (err) {
-        errorBox.innerText = err.message;
-        errorBox.classList.remove("hidden");
-    }
-}
-
 async function handleGoogleCallback(response) {
+    const errorBox = document.getElementById("authErrorMsg");
+    errorBox.classList.add("hidden");
     try {
         const res = await fetch("/api/auth/google", {
             method: "POST",
@@ -195,13 +166,14 @@ async function handleGoogleCallback(response) {
         });
         const data = await res.json();
         if (!res.ok) {
-            throw new Error(data.detail || "Google login failed");
+            throw new Error(data.detail || "Google sign-in failed");
         }
         closeAuthModal();
         logToTerminal("SUCCESS", data.message);
         initAuth();
     } catch (err) {
-        alert(`Google Sign-In Error: ${err.message}`);
+        errorBox.innerText = err.message;
+        errorBox.classList.remove("hidden");
     }
 }
 
@@ -416,6 +388,8 @@ async function loadListingSettings() {
         if (s.variation_title_template) {
             document.getElementById("settingTitleTemplate").value = s.variation_title_template;
         }
+        document.getElementById("settingGroupBySet").checked =
+            String(s.group_by_set ?? "true").toLowerCase() !== "false";
         updateTitlePreview();
     } catch (err) {
         logToTerminal("ERROR", `Failed to load listing settings: ${err.message}`);
@@ -426,6 +400,7 @@ async function saveListingSettings(e) {
     if (e && e.preventDefault) e.preventDefault();
     const threshold = document.getElementById("settingSingleThreshold").value || "5.00";
     const template = document.getElementById("settingTitleTemplate").value || "{set_name}: Pick Your Card - Near Mint - Complete Your Set";
+    const groupBySet = document.getElementById("settingGroupBySet").checked;
 
     try {
         const res = await fetch("/api/listing-settings", {
@@ -434,7 +409,8 @@ async function saveListingSettings(e) {
             body: JSON.stringify({
                 settings: {
                     single_threshold: threshold,
-                    variation_title_template: template
+                    variation_title_template: template,
+                    group_by_set: groupBySet ? "true" : "false"
                 }
             })
         });
@@ -442,7 +418,11 @@ async function saveListingSettings(e) {
         if (!res.ok) throw new Error(data.detail);
 
         closeListingModal();
-        logToTerminal("SUCCESS", `Updated Listing Rules: Single Threshold = $${parseFloat(threshold).toFixed(2)}, Title Template saved.`);
+        logToTerminal(
+            "SUCCESS",
+            `Updated Listing Rules: Single Threshold = $${parseFloat(threshold).toFixed(2)}, ` +
+            `Set Grouping = ${groupBySet ? "on" : "off"}, Title Template saved.`
+        );
     } catch (err) {
         alert(err.message);
     }
@@ -451,6 +431,7 @@ async function saveListingSettings(e) {
 function resetListingSettings() {
     document.getElementById("settingSingleThreshold").value = "5.00";
     document.getElementById("settingTitleTemplate").value = "{set_name}: Pick Your Card - Near Mint - Complete Your Set";
+    document.getElementById("settingGroupBySet").checked = true;
     updateTitlePreview();
 }
 
@@ -707,9 +688,10 @@ async function handleOrdersUpload(file) {
     }
 }
 
-async function handleBatchUpload(file) {
+async function handleBatchUpload(file, force = false) {
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("force", force ? "true" : "false");
 
     logToTerminal("INFO", `[MODULE B] Uploading ${file.name} for SortSwift Batch routing...`);
 
@@ -724,6 +706,23 @@ async function handleBatchUpload(file) {
         // Display logs
         if (data.logs) {
             data.logs.forEach(l => logToTerminal(l.level, l.message));
+        }
+
+        // Batch quantities are additive, so the server refuses a file it has
+        // already applied. Let the operator override deliberately.
+        if (data.duplicate) {
+            const proceed = confirm(
+                `"${file.name}" has already been processed.\n\n` +
+                `Processing it again will ADD its quantities to your live eBay ` +
+                `stock a second time, which is almost never what you want.\n\n` +
+                `Process it anyway?`
+            );
+            if (proceed) {
+                logToTerminal("WARN", `[MODULE B] Forcing re-processing of ${file.name}...`);
+                return handleBatchUpload(file, true);
+            }
+            logToTerminal("INFO", `[MODULE B] Skipped duplicate batch ${file.name}.`);
+            return;
         }
 
         storedGeneratedCSVs.revise = data.revise_csv;
@@ -877,7 +876,7 @@ async function fetchInventory() {
 
         renderInventoryTable(data.items, data.total, offset);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-rose-400">Failed to load inventory: ${err.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" class="py-6 text-center text-rose-400">Failed to load inventory: ${err.message}</td></tr>`;
     }
 }
 
@@ -887,7 +886,7 @@ function renderInventoryTable(items, total, offset) {
     if (!items || items.length === 0) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="8" class="py-8 text-center text-slate-500">
+                <td colspan="9" class="py-8 text-center text-slate-500">
                     No cards found. Process a SortSwift batch or add a card above.
                 </td>
             </tr>

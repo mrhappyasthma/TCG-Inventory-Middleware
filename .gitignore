@@ -24,6 +24,8 @@ data/*.db-shm
 # Environment & credentials
 .env
 .env.local
+data/.session_secret
+.session_secret
 
 # IDE & OS files
 .DS_Store
