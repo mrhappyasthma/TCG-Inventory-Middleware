@@ -172,6 +172,7 @@ class Database:
                     ("group_by_set", "true"),
                     ("variation_title_template", "{set_name}: Pick Your Card - {condition} - Complete Your Set"),
                     ("category_id", "183454"),
+                    ("condition_descriptor_style", "label_id"),
                 ]
                 cursor.executemany(
                     """
@@ -180,6 +181,15 @@ class Database:
                     """,
                     default_settings,
                 )
+
+            # Backfill settings keys added after the initial seed.
+            cursor.execute(
+                """
+                INSERT INTO listing_settings (key, value)
+                VALUES ('condition_descriptor_style', 'label_id')
+                ON CONFLICT(key) DO NOTHING
+                """
+            )
 
             # Migrate the title template off the hardcoded condition. A stored
             # value equal to the old default was never customised, so it is safe

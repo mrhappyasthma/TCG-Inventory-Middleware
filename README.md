@@ -331,24 +331,61 @@ To prevent that, every processed batch is fingerprinted (SHA-256 of the file con
   * One consequence: the Module A deduction CSV carries whatever string your export used (e.g. `NM`), not a normalised `Near Mint`. Matching on import is driven by `skuId` regardless.
 * **A note on eBay's card ConditionIDs**: for the card categories (`183050`, `183454`, `261328`) eBay does *not* use its general used-goods scale. Ungraded cards use IDs extending **`4000`** and graded cards use IDs extending **`2750`**. So `4000` means "Ungraded", **not** "Lightly Played". The actual grade is expressed in a separate, required **Condition Descriptor** field limited to *Near Mint or Better*, *Excellent*, *Very Good* or *Poor* — which this generator does not yet emit. See the outstanding-work note below.
 
-### ⚠️ Not yet emitted for eBay uploads
+### 🃏 eBay Condition Descriptors (ungraded cards)
 
-The generated `ebay_new_additions.csv` is not yet complete for a File Exchange
-`Add`. Known gaps, pending a manual test listing to confirm exactly what the
-category demands:
+eBay has required a Condition Descriptor on trading-card listings since early
+2024. For ungraded cards the descriptor is **Card Condition, ID 40001**, so the
+generated file carries a **`CD:40001`** column.
 
-* **Condition Descriptors** — required for trading cards since early 2024.
+eBay accepts exactly four ungraded grades, and SortSwift does not supply them,
+so this is one place a translation is genuinely required. Your grade is mapped
+as follows:
+
+| SortSwift grade | eBay descriptor | Game/CCG value ID | Sports value ID |
+|---|---|---|---|
+| NM / Near Mint / Mint | Near mint or better | `400010` | `400010` |
+| LP / Lightly Played | Excellent | `400015` | `400011` |
+| MP / Moderately Played | Very good | `400016` | `400012` |
+| HP / Heavily Played | Poor | `400017` | `400013` |
+| DM / Damaged | Poor | `400017` | `400013` |
+
+**The value IDs differ by card family.** Game/CCG categories (`183454`,
+`183050`) and sports singles (`261328`) share only *Near mint or better*; the
+correct table is selected automatically from your configured Category ID.
+eBay has no bucket below *Poor*, so Heavily Played and Damaged both land there.
+
+* **ConditionID stays `4000` for every ungraded card**, whatever its grade. The
+  grade is expressed only by the descriptor. `4000` means "Ungraded" — it does
+  **not** mean "Lightly Played".
+* **Cell format** is configurable under Listing Rules, because reports differ on
+  which form eBay accepts: `Excellent - (ID: 400015)` (default) or the bare
+  `400015`. Switch it if an upload is rejected.
+* **Explicit values win.** If your export already contains a `CD:40001` column,
+  it is passed through verbatim and no mapping is applied.
+* A condition that maps to none of the four grades is **skipped with a warning**
+  rather than guessed at. Graded cards (ConditionID extending `2750`) need a
+  different descriptor and are not supported yet; such rows are skipped.
+
+### ⚠️ Still not emitted for eBay uploads
+
+The generated `ebay_new_additions.csv` may still be incomplete for a File
+Exchange `Add`, pending a manual test listing to confirm what the category
+demands:
+
 * **Item location / postal code**, **shipping** details or a business-policy
   profile name, and a **return policy**.
 * The `Price` column is emitted alongside `StartPrice`; `Price` is probably not
   a valid File Exchange field for fixed-price listings and may be ignored.
+* The descriptor is written to parent, child and single rows alike, mirroring
+  how `ConditionID` is emitted. If eBay rejects it on child rows, restricting it
+  to parents is a one-line change.
 * **Output 1 (`ebay_inventory_updates.csv`)** — Revise:
   ```
   Action,Item Number,Custom Label,Quantity,Price
   ```
 * **Output 2 (`ebay_new_additions.csv`)** — Add:
   ```
-  Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price
+  Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price,CD:40001
   ```
 
 ### 2. eBay Orders to SortSwift Deduction Ingestion (Module A)

@@ -390,6 +390,8 @@ async function loadListingSettings() {
         }
         document.getElementById("settingGroupBySet").checked =
             String(s.group_by_set ?? "true").toLowerCase() !== "false";
+        document.getElementById("settingDescriptorStyle").value =
+            s.condition_descriptor_style || "label_id";
         updateTitlePreview();
     } catch (err) {
         logToTerminal("ERROR", `Failed to load listing settings: ${err.message}`);
@@ -401,6 +403,7 @@ async function saveListingSettings(e) {
     const threshold = document.getElementById("settingSingleThreshold").value || "5.00";
     const template = document.getElementById("settingTitleTemplate").value || "{set_name}: Pick Your Card - {condition} - Complete Your Set";
     const groupBySet = document.getElementById("settingGroupBySet").checked;
+    const descriptorStyle = document.getElementById("settingDescriptorStyle").value;
 
     try {
         const res = await fetch("/api/listing-settings", {
@@ -410,7 +413,8 @@ async function saveListingSettings(e) {
                 settings: {
                     single_threshold: threshold,
                     variation_title_template: template,
-                    group_by_set: groupBySet ? "true" : "false"
+                    group_by_set: groupBySet ? "true" : "false",
+                    condition_descriptor_style: descriptorStyle
                 }
             })
         });
@@ -432,6 +436,7 @@ function resetListingSettings() {
     document.getElementById("settingSingleThreshold").value = "5.00";
     document.getElementById("settingTitleTemplate").value = "{set_name}: Pick Your Card - {condition} - Complete Your Set";
     document.getElementById("settingGroupBySet").checked = true;
+    document.getElementById("settingDescriptorStyle").value = "label_id";
     updateTitlePreview();
 }
 

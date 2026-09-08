@@ -8,6 +8,10 @@ from .db import Database
 
 # eBay File Exchange / Seller Hub Headers
 REVISE_HEADERS = ["Action", "Item Number", "Custom Label", "Quantity", "Price"]
+# eBay requires a Condition Descriptor for trading cards. For ungraded cards
+# the descriptor is "Card Condition", ID 40001, so the column is "CD:40001".
+CONDITION_DESCRIPTOR_COLUMN = "CD:40001"
+
 ADD_HEADERS = [
     "Action",
     "Category",
@@ -23,6 +27,7 @@ ADD_HEADERS = [
     "Format",
     "Duration",
     "Price",
+    CONDITION_DESCRIPTOR_COLUMN,
 ]
 
 # eBay's variation syntax: within one attribute, values are separated by
@@ -31,6 +36,92 @@ ADD_HEADERS = [
 VARIATION_VALUE_SEPARATOR = ";"
 VARIATION_ATTRIBUTE_SEPARATOR = "|"
 VARIATION_ATTRIBUTE_NAME = "Card"
+
+# eBay's ConditionID for an ungraded card. Graded cards use IDs extending 2750
+# and need a different descriptor, which this engine does not yet emit.
+UNGRADED_CONDITION_ID = "4000"
+
+# eBay accepts exactly four ungraded grades, and SortSwift does not supply them,
+# so a translation is genuinely required here rather than being an invented
+# vocabulary. The numeric value IDs differ by card family: game/CCG cards and
+# sports cards share only "Near mint or better".
+EBAY_UNGRADED_VALUE_IDS = {
+    # Game / CCG / non-sport singles (e.g. category 183454)
+    "game": {
+        "Near mint or better": "400010",
+        "Excellent": "400015",
+        "Very good": "400016",
+        "Poor": "400017",
+    },
+    # Sports card singles (category 261328)
+    "sports": {
+        "Near mint or better": "400010",
+        "Excellent": "400011",
+        "Very good": "400012",
+        "Poor": "400013",
+    },
+}
+
+# eBay categories that use the sports-card value IDs.
+SPORTS_CARD_CATEGORIES = {"261328"}
+
+# SortSwift / TCGplayer grades mapped onto eBay's four ungraded buckets. eBay
+# has no separate bucket below "Poor", so Heavily Played and Damaged both land
+# there.
+CONDITION_TO_EBAY_GRADE = {
+    "nm": "Near mint or better",
+    "near mint": "Near mint or better",
+    "near mint or better": "Near mint or better",
+    "m": "Near mint or better",
+    "mint": "Near mint or better",
+    "lp": "Excellent",
+    "lightly played": "Excellent",
+    "excellent": "Excellent",
+    "mp": "Very good",
+    "moderately played": "Very good",
+    "very good": "Very good",
+    "vg": "Very good",
+    "good": "Very good",
+    "hp": "Poor",
+    "heavily played": "Poor",
+    "played": "Poor",
+    "poor": "Poor",
+    "dm": "Poor",
+    "dmg": "Poor",
+    "damaged": "Poor",
+}
+
+
+def _value_ids_for_category(category_id: str) -> Dict[str, str]:
+    """Pick the ungraded value-ID table that matches the target category."""
+    family = "sports" if str(category_id).strip() in SPORTS_CARD_CATEGORIES else "game"
+    return EBAY_UNGRADED_VALUE_IDS[family]
+
+
+def resolve_condition_descriptor(
+    condition: str,
+    category_id: str = "183454",
+    style: str = "label_id",
+) -> Optional[str]:
+    """
+    Render the CD:40001 cell for an ungraded card, or None if unmappable.
+
+    ``style`` selects the cell format, because reports differ on which eBay
+    accepts: 'label_id' produces "Excellent - (ID: 400015)" and 'id' produces
+    the bare "400015". Switch it in Listing Rules if an upload is rejected.
+    """
+    grade = CONDITION_TO_EBAY_GRADE.get(str(condition or "").strip().lower())
+    if not grade:
+        return None
+
+    value_id = _value_ids_for_category(category_id).get(grade)
+    if not value_id:
+        return None
+
+    if str(style).strip().lower() == "id":
+        return value_id
+    return f"{grade} - (ID: {value_id})"
+
 
 DEFAULT_VARIATION_TITLE_TEMPLATE = (
     "{set_name}: Pick Your Card - {condition} - Complete Your Set"
@@ -166,6 +257,7 @@ def process_batch_csv(
         DEFAULT_VARIATION_TITLE_TEMPLATE,
     )
     category_id = db.get_listing_setting("category_id", "183454")
+    descriptor_style = db.get_listing_setting("condition_descriptor_style", "label_id")
     group_by_set = str(db.get_listing_setting("group_by_set", "true")).strip().lower() not in (
         "false",
         "0",
@@ -294,6 +386,13 @@ def process_batch_csv(
             })
             continue
 
+        # An explicit descriptor in the export wins; we only derive one when the
+        # source does not supply it.
+        explicit_descriptor = _find_column(row, [
+            "CD:40001", "CD:Card Condition - (ID: 40001)", "CD_Card_Condition",
+            "Condition Descriptor", "Card Condition Descriptor",
+        ])
+
         # eBay requires a numeric ConditionID for category 183454. It must come
         # from the input; we will not infer one.
         condition_id = str(raw_condition_id or "").strip()
@@ -309,6 +408,38 @@ def process_batch_csv(
                 ),
             })
             continue
+
+        # Resolve the eBay Condition Descriptor, required for card categories.
+        if explicit_descriptor and str(explicit_descriptor).strip():
+            condition_descriptor = str(explicit_descriptor).strip()
+        elif condition_id != UNGRADED_CONDITION_ID:
+            skipped_count += 1
+            logs.append({
+                "level": "WARN",
+                "message": (
+                    f"Row {row_idx}: ConditionID {condition_id} is not the ungraded "
+                    f"value ({UNGRADED_CONDITION_ID}). Graded cards need a different "
+                    f"Condition Descriptor, which is not supported yet. Skipped."
+                ),
+            })
+            continue
+        else:
+            condition_descriptor = resolve_condition_descriptor(
+                condition_name, category_id=category_id, style=descriptor_style
+            )
+            if not condition_descriptor:
+                skipped_count += 1
+                accepted = ", ".join(sorted(set(CONDITION_TO_EBAY_GRADE.values())))
+                logs.append({
+                    "level": "WARN",
+                    "message": (
+                        f"Row {row_idx}: Condition '{condition_name}' does not map to "
+                        f"an eBay ungraded grade ({accepted}). Skipped rather than "
+                        f"guessing. Add a '{CONDITION_DESCRIPTOR_COLUMN}' column to "
+                        f"your export to set it explicitly."
+                    ),
+                })
+                continue
 
         try:
             quantity = int(qty_str.strip()) if qty_str else 1
@@ -380,6 +511,7 @@ def process_batch_csv(
                 "set_name": set_name,
                 "condition_name": condition_name,
                 "condition_id": condition_id,
+                "condition_descriptor": condition_descriptor,
                 "printing": printing,
                 "quantity": quantity,
                 "price": effective_price,
@@ -455,6 +587,7 @@ def process_batch_csv(
             "Format": "FixedPrice",
             "Duration": "GTC",
             "Price": "",
+            CONDITION_DESCRIPTOR_COLUMN: cards[0]["condition_descriptor"],
         })
 
         # Append Child Variation Rows
@@ -477,6 +610,7 @@ def process_batch_csv(
                 "Format": "FixedPrice",
                 "Duration": "GTC",
                 "Price": f"{c['price']:.2f}",
+                CONDITION_DESCRIPTOR_COLUMN: c["condition_descriptor"],
             })
 
     # 2. Standalone Single Listings (Cards >= threshold)
@@ -510,6 +644,7 @@ def process_batch_csv(
             "Format": "FixedPrice",
             "Duration": "GTC",
             "Price": f"{s['price']:.2f}",
+            CONDITION_DESCRIPTOR_COLUMN: s["condition_descriptor"],
         })
 
     # Generate REVISE CSV
