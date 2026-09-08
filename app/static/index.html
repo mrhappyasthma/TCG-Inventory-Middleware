@@ -444,7 +444,7 @@
 
     <!-- AUTHENTICATION MODAL (Google Sign-In only) -->
     <div id="authModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
-        <div class="w-full max-w-md bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative">
+        <div class="w-full max-w-md bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
             <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
                 <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
@@ -494,7 +494,7 @@
                 <p class="text-xs text-slate-400 mt-1">Approve pending user sign-ups or manage admin privileges.</p>
             </div>
 
-            <div class="overflow-x-auto flex-1">
+            <div class="overflow-auto flex-1 min-h-0">
                 <table class="w-full text-left text-xs">
                     <thead>
                         <tr class="border-b border-slate-700 bg-dark-900 text-slate-400 uppercase text-[10px]">
@@ -519,7 +519,7 @@
 
     <!-- MANUAL ADD CARD MODAL -->
     <div id="addCardModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
-        <div class="w-full max-w-lg bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative">
+        <div class="w-full max-w-lg bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
             <button onclick="closeAddCardModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
                 <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
@@ -621,7 +621,7 @@
             </div>
 
             <!-- Rules Table Editor -->
-            <div class="overflow-x-auto flex-1 mb-4">
+            <div class="overflow-auto flex-1 min-h-0 mb-4">
                 <table class="w-full text-left text-xs border-collapse">
                     <thead>
                         <tr class="border-b border-slate-700 bg-dark-900 text-slate-400 uppercase text-[10px]">
@@ -673,7 +673,11 @@
                 <p class="text-xs text-slate-400 mt-1">Configure how cards are grouped into set-level variation drop-down listings vs standalone singles.</p>
             </div>
 
-            <form id="listingRulesForm" onsubmit="saveListingSettings(event)" class="space-y-4 text-xs">
+            <form id="listingRulesForm" onsubmit="saveListingSettings(event)" class="flex flex-col flex-1 min-h-0 text-xs">
+                <!-- Scrollable field area. flex-1 alone is not enough: a flex item
+                     defaults to min-height:auto and refuses to shrink below its
+                     content, so min-h-0 is what actually lets this scroll. -->
+                <div class="space-y-4 flex-1 min-h-0 overflow-y-auto pr-1">
                 
                 <!-- Single Listing Threshold -->
                 <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-2">
@@ -775,7 +779,9 @@
                     </div>
                 </div>
 
-                <div class="flex items-center justify-between pt-3 border-t border-slate-700">
+                </div><!-- /scrollable field area -->
+
+                <div class="flex items-center justify-between pt-3 mt-3 border-t border-slate-700 shrink-0">
                     <button type="button" onclick="resetListingSettings()" class="text-xs text-slate-400 hover:text-slate-200 underline">Reset Defaults</button>
                     <div class="flex items-center gap-2">
                         <button type="button" onclick="closeListingModal()" class="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">Cancel</button>

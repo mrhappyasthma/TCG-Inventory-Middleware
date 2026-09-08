@@ -25,6 +25,18 @@ document.addEventListener("DOMContentLoaded", () => {
 // 1. AUTHENTICATION & USER MANAGEMENT
 // -------------------------------------------------------------------
 
+// -------------------------------------------------------------------
+// MODAL SCROLL LOCK
+// -------------------------------------------------------------------
+
+// While any modal is open the page behind it must not scroll, otherwise a
+// wheel gesture aimed at the dialog moves the dashboard instead.
+function syncModalScrollLock() {
+    const anyOpen = Array.from(document.querySelectorAll('[id$="Modal"]'))
+        .some(el => !el.classList.contains("hidden"));
+    document.body.classList.toggle("overflow-hidden", anyOpen);
+}
+
 // Google Sign-In readiness. The GSI client script is loaded with async/defer,
 // so the button can only be rendered once BOTH the SDK has loaded and the
 // server has told us which client ID to use. Either can win the race.
@@ -149,12 +161,14 @@ function updateAuthUI(data) {
 
 function openAuthModal() {
     document.getElementById("authModal").classList.remove("hidden");
+    syncModalScrollLock();
     document.getElementById("authErrorMsg").classList.add("hidden");
     maybeRenderGoogleButton();
 }
 
 function closeAuthModal() {
     document.getElementById("authModal").classList.add("hidden");
+    syncModalScrollLock();
 }
 
 async function handleGoogleCallback(response) {
@@ -194,11 +208,13 @@ document.getElementById("btnPricingRules").addEventListener("click", openPricing
 
 function openPricingModal() {
     document.getElementById("pricingModal").classList.remove("hidden");
+    syncModalScrollLock();
     loadPricingRules();
 }
 
 function closePricingModal() {
     document.getElementById("pricingModal").classList.add("hidden");
+    syncModalScrollLock();
 }
 
 async function loadPricingRules() {
@@ -370,11 +386,13 @@ document.getElementById("btnListingRules")?.addEventListener("click", openListin
 
 function openListingModal() {
     document.getElementById("listingModal").classList.remove("hidden");
+    syncModalScrollLock();
     loadListingSettings();
 }
 
 function closeListingModal() {
     document.getElementById("listingModal").classList.add("hidden");
+    syncModalScrollLock();
 }
 
 async function loadListingSettings() {
@@ -516,11 +534,13 @@ document.getElementById("btnAdminPanel").addEventListener("click", openAdminModa
 
 function openAdminModal() {
     document.getElementById("adminModal").classList.remove("hidden");
+    syncModalScrollLock();
     loadAdminUsers();
 }
 
 function closeAdminModal() {
     document.getElementById("adminModal").classList.add("hidden");
+    syncModalScrollLock();
 }
 
 async function loadAdminUsers() {
@@ -884,11 +904,13 @@ function setupTableListeners() {
 
     document.getElementById("btnOpenAddCardModal").addEventListener("click", () => {
         document.getElementById("addCardModal").classList.remove("hidden");
+        syncModalScrollLock();
     });
 }
 
 function closeAddCardModal() {
     document.getElementById("addCardModal").classList.add("hidden");
+    syncModalScrollLock();
 }
 
 async function handleAddCard(e) {
@@ -1125,3 +1147,13 @@ function escapeHtml(str) {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
 }
+
+// Escape closes whichever modal is open, which also releases the scroll lock.
+document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const open = Array.from(document.querySelectorAll('[id$="Modal"]'))
+        .filter(el => !el.classList.contains("hidden"));
+    if (!open.length) return;
+    open[open.length - 1].classList.add("hidden");
+    syncModalScrollLock();
+});
