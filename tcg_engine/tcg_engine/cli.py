@@ -73,6 +73,7 @@ def handle_export_manifest(args):
         "set_name",
         "condition",
         "printing",
+        "quantity",
         "ebay_parent_id",
         "last_known_qty",
     ]

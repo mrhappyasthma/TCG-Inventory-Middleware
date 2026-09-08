@@ -49,6 +49,7 @@ class Database:
                     language TEXT DEFAULT 'EN',
                     price REAL DEFAULT 0.0,
                     market_price REAL DEFAULT 0.0,
+                    quantity INTEGER DEFAULT 0,
                     cdn_image TEXT,
                     remarks TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -96,6 +97,16 @@ class Database:
                 );
                 """
             )
+            # Idempotent migration: catalogued quantity was added after the
+            # first release.
+            manifest_columns = {
+                row["name"] for row in cursor.execute("PRAGMA table_info(manifest)")
+            }
+            if "quantity" not in manifest_columns:
+                cursor.execute(
+                    "ALTER TABLE manifest ADD COLUMN quantity INTEGER DEFAULT 0"
+                )
+
             # Create indexes for fast lookups
             cursor.execute(
                 """
@@ -450,6 +461,34 @@ class Database:
                 conn.rollback()
                 raise
 
+    def increment_manifest_quantity(self, manifest_id: str, delta: int) -> int:
+        """
+        Add to the quantity we have catalogued for a card and return the total.
+
+        This is our own running count of stock taken in from SortSwift batches.
+        It is deliberately separate from ``ebay_variations.last_known_qty``,
+        which is whatever eBay last reported: comparing the two is how stock
+        drift becomes visible.
+        """
+        m_id = manifest_id.strip()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE manifest
+                SET quantity = COALESCE(quantity, 0) + ?
+                WHERE manifest_id = ?
+                """,
+                (int(delta), m_id),
+            )
+            conn.commit()
+            cursor.execute(
+                "SELECT COALESCE(quantity, 0) AS quantity FROM manifest WHERE manifest_id = ?",
+                (m_id,),
+            )
+            row = cursor.fetchone()
+            return row["quantity"] if row else 0
+
     def get_variation(self, manifest_id: str) -> Optional[Dict[str, Any]]:
         """Get live eBay variation details for a manifest_id."""
         with self.get_connection() as conn:
@@ -511,6 +550,7 @@ class Database:
         "set_name": "m.set_name",
         "condition": "m.condition",
         "printing": "m.printing",
+        "quantity": "m.quantity",
         "remarks": "m.remarks",
         "sku_id": "m.sku_id",
         "ebay_parent_id": "v.ebay_parent_id",
@@ -575,6 +615,7 @@ class Database:
                 m.set_name,
                 m.condition,
                 m.printing,
+                COALESCE(m.quantity, 0) AS quantity,
                 COALESCE(m.remarks, '') AS remarks,
                 COALESCE(m.sku_id, '') AS sku_id,
                 COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
@@ -792,6 +833,7 @@ class Database:
                     m.set_name,
                     m.condition,
                     m.printing,
+                    COALESCE(m.quantity, 0) AS quantity,
                     COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
                     COALESCE(v.last_known_qty, 0) AS last_known_qty
                 FROM manifest m

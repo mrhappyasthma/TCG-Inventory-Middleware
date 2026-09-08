@@ -341,14 +341,15 @@
                                 <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('printing')">Printing</th>
                                 <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('remarks')">Bin / Remark</th>
                                 <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('ebay_parent_id')">eBay Item #</th>
-                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')">Live Stock</th>
+                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('quantity')" title="Total quantity catalogued from your SortSwift batches.">Quantity</th>
+                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')" title="Quantity eBay last reported for this card, from an Active Listings sync.">Live Stock</th>
                                 <th class="py-3 px-4 text-right">Action</th>
                             </tr>
                         </thead>
                         <tbody id="inventoryTableBody" class="divide-y divide-slate-800/60 text-slate-300">
                             <!-- Populated dynamically via JS -->
                             <tr>
-                                <td colspan="9" class="py-8 text-center text-slate-500">Loading catalog inventory...</td>
+                                <td colspan="10" class="py-8 text-center text-slate-500">Loading catalog inventory...</td>
                             </tr>
                         </tbody>
                     </table>

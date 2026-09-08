@@ -329,6 +329,19 @@ To prevent that, every processed batch is fingerprinted (SHA-256 of the file con
 * **Condition**: both the `Condition` string and the numeric `ConditionID` are taken **verbatim from your export**. There is no translation table — the value originates in SortSwift and is destined for eBay or back into SortSwift, so interposing our own vocabulary would only create a third one that can disagree with both.
   * A row missing either value is **skipped with a warning** rather than having a condition guessed for it. If you see those warnings, re-export from SortSwift with the `ConditionID` column included.
   * One consequence: the Module A deduction CSV carries whatever string your export used (e.g. `NM`), not a normalised `Near Mint`. Matching on import is driven by `skuId` regardless.
+* **A note on eBay's card ConditionIDs**: for the card categories (`183050`, `183454`, `261328`) eBay does *not* use its general used-goods scale. Ungraded cards use IDs extending **`4000`** and graded cards use IDs extending **`2750`**. So `4000` means "Ungraded", **not** "Lightly Played". The actual grade is expressed in a separate, required **Condition Descriptor** field limited to *Near Mint or Better*, *Excellent*, *Very Good* or *Poor* — which this generator does not yet emit. See the outstanding-work note below.
+
+### ⚠️ Not yet emitted for eBay uploads
+
+The generated `ebay_new_additions.csv` is not yet complete for a File Exchange
+`Add`. Known gaps, pending a manual test listing to confirm exactly what the
+category demands:
+
+* **Condition Descriptors** — required for trading cards since early 2024.
+* **Item location / postal code**, **shipping** details or a business-policy
+  profile name, and a **return policy**.
+* The `Price` column is emitted alongside `StartPrice`; `Price` is probably not
+  a valid File Exchange field for fixed-price listings and may be ignored.
 * **Output 1 (`ebay_inventory_updates.csv`)** — Revise:
   ```
   Action,Item Number,Custom Label,Quantity,Price
@@ -352,6 +365,34 @@ To prevent that, every processed batch is fingerprinted (SHA-256 of the file con
 * **Input**: Official eBay "Active Listings" report.
 * **Fields Read**: `Item number`, `Custom label (SKU)`, `Available quantity`.
 * **Behavior**: Ignores empty parent rows, extracts variation/single listing item IDs and quantities, and performs atomic UPSERTs into `ebay_variations`.
+
+---
+
+## 📦 Quantity vs Live Stock
+
+The Live Store Inventory table shows two counts side by side so drift is
+visible at a glance:
+
+| Column | Meaning | Written by |
+|---|---|---|
+| **Quantity** | Total stock **you** have catalogued for that card, accumulated across every SortSwift batch you have processed. | Module B |
+| **Live Stock** | The quantity **eBay** last reported for it. | Module C (Active Listings sync) |
+
+When the two disagree the pair is highlighted amber, with a tooltip naming both
+figures. A mismatch usually means one of:
+
+* You have processed a batch but not yet uploaded the resulting
+  `ebay_inventory_updates.csv` to eBay, so eBay is behind.
+* Cards have sold since your last Active Listings sync, so **eBay** is ahead
+  (lower) and your catalogue is stale until you run Module C again.
+* A listing was edited directly on eBay.
+
+Both figures are included in the Master Catalog CSV export, and both columns
+are sortable, so you can bring the largest discrepancies to the top.
+
+Note that the two counts are *expected* to differ right after a batch and to
+converge after an Active Listings sync. The column is a reconciliation aid, not
+an error indicator.
 
 ---
 

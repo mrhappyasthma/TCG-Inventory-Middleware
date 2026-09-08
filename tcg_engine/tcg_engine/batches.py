@@ -334,6 +334,9 @@ def process_batch_csv(
             remarks=remarks,
         )
 
+        # Accumulate our own catalogued stock count for this card.
+        db.increment_manifest_quantity(manifest_id, quantity)
+
         ebay_custom_label = f"{manifest_id}-{clean_remark}" if clean_remark else manifest_id
 
         if is_new:

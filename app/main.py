@@ -529,6 +529,7 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
         "set_name",
         "condition",
         "printing",
+        "quantity",
         "ebay_parent_id",
         "last_known_qty",
     ]

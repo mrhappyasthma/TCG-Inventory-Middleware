@@ -878,7 +878,7 @@ async function fetchInventory() {
 
         renderInventoryTable(data.items, data.total, offset);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="9" class="py-6 text-center text-rose-400">Failed to load inventory: ${err.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="10" class="py-6 text-center text-rose-400">Failed to load inventory: ${err.message}</td></tr>`;
     }
 }
 
@@ -888,7 +888,7 @@ function renderInventoryTable(items, total, offset) {
     if (!items || items.length === 0) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="9" class="py-8 text-center text-slate-500">
+                <td colspan="10" class="py-8 text-center text-slate-500">
                     No cards found. Process a SortSwift batch or add a card above.
                 </td>
             </tr>
@@ -901,9 +901,20 @@ function renderInventoryTable(items, total, offset) {
 
     tbody.innerHTML = items.map(item => {
         const conditionBadge = getConditionBadgeClass(item.condition);
-        const stockBadge = item.last_known_qty > 0 
-            ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800' 
+        const stockBadge = item.last_known_qty > 0
+            ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800'
             : 'bg-slate-900 text-slate-500 border border-slate-800';
+
+        // Our catalogued count vs what eBay last reported. A mismatch is the
+        // interesting case, so flag it rather than making them diff by eye.
+        const qty = item.quantity ?? 0;
+        const drifted = qty !== item.last_known_qty;
+        const qtyBadge = drifted
+            ? 'bg-amber-950/80 text-amber-300 border border-amber-800'
+            : 'bg-slate-900 text-slate-400 border border-slate-800';
+        const driftTitle = drifted
+            ? `Catalogued ${qty}, eBay reports ${item.last_known_qty}. Run a Module C sync, or revise the listing.`
+            : 'Catalogued quantity matches eBay.';
 
         return `
             <tr class="hover:bg-dark-800/80 transition-colors">
@@ -924,7 +935,12 @@ function renderInventoryTable(items, total, offset) {
                     ${item.remarks ? `<span class="px-2 py-0.5 rounded text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800/60">${escapeHtml(item.remarks)}</span>` : '<span class="text-slate-600 italic text-[11px]">-</span>'}
                 </td>
                 <td class="py-3 px-4 font-mono text-slate-300">${item.ebay_parent_id ? escapeHtml(item.ebay_parent_id) : '<span class="text-slate-600 italic">Not on eBay</span>'}</td>
-                <td class="py-3 px-4 text-center">
+                <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
+                    <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${qtyBadge}">
+                        ${qty}
+                    </span>
+                </td>
+                <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
                     <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${stockBadge}">
                         ${item.last_known_qty}
                     </span>

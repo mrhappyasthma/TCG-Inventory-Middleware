@@ -480,6 +480,46 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             self.assertNotIn(";", d.split("=", 1)[1])
             self.assertNotIn("|", d)
 
+    # ------------------------------------------------------------------
+    # Catalogued quantity vs eBay's reported quantity
+    # ------------------------------------------------------------------
+
+    def test_catalog_quantity_accumulates_across_batches(self):
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db, source_name="b1.csv")
+        rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
+        self.assertEqual(rows["ID1001"]["quantity"], 1)
+
+        # A different batch adding the same card again accumulates rather than
+        # overwriting, matching the additive semantics of Module B.
+        second = self.MIXED_CONDITION_BATCH.replace('"Bin-1"', '"Bin-9"')
+        process_batch_csv(second, self.db, source_name="b2.csv")
+        rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
+        self.assertEqual(rows["ID1001"]["quantity"], 2)
+
+    def test_catalog_quantity_is_independent_of_live_stock(self):
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+        # eBay reports a different figure than we have catalogued; both must be
+        # visible side by side so the drift is apparent.
+        self.db.upsert_variation("ID1001", "112233445566", 7)
+
+        row = next(
+            r for r in self.db.get_inventory(limit=1000) if r["manifest_id"] == "ID1001"
+        )
+        self.assertEqual(row["quantity"], 1)
+        self.assertEqual(row["last_known_qty"], 7)
+
+    def test_quantity_is_sortable_and_exported(self):
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+        rows = self.db.get_inventory(sort_by="quantity", sort_dir="DESC", limit=1000)
+        self.assertIn("quantity", rows[0])
+        self.assertIn("quantity", self.db.export_all_manifest()[0])
+
+    def test_duplicate_batch_does_not_inflate_catalog_quantity(self):
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db, source_name="b.csv")
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db, source_name="b.csv")
+        rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
+        self.assertEqual(rows["ID1001"]["quantity"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
