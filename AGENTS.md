@@ -32,9 +32,20 @@
 
 ## 3. 🏷️ Business Logic & eBay Listing Rules
 
-* **Compact Sequential IDs**: Master catalog uses `ID1001`, `ID1002`, ... to bypass eBay's 50-character Custom Label SKU limits.
+* **Compact Sequential IDs**: Master catalog uses `ID1001`, `ID1002`, ... to bypass eBay's 50-character Custom Label SKU limits. IDs are allocated inside a single `BEGIN IMMEDIATE` transaction; never split the lookup and the insert across connections.
 * **Bin Location Encoding**: SortSwift remarks are encoded into eBay Custom Labels as `ID1001-Bin_A12`.
-* **Multi-Item Variation Listings**: Group cards under the `$5.00` threshold by Set Name into multi-item variation listings.
-* **Single Listings**: Cards at or above `$5.00` are listed as individual singles.
+* **Runtime settings are the source of truth**: pricing tiers (`pricing_rules`) and listing behaviour (`single_threshold`, `group_by_set`, `variation_title_template`, `category_id` in `listing_settings`) are user-editable and persisted in SQLite. Never hardcode these values in prose or logic; read them via `db.get_listing_setting` / `db.get_pricing_rules`. If documentation disagrees with the configured rules, **fix the documentation**.
+* **Multi-Item Variation Listings**: When `group_by_set` is enabled, group cards below `single_threshold` by Set Name into multi-item variation listings.
+* **Single Listings**: Cards at or above `single_threshold` are listed as individual singles, as is every card when `group_by_set` is disabled.
 * **eBay 80-Character Title Limit**: Variation titles default to `{set_name}: Pick Your Card - Near Mint - Complete Your Set`, with automatic fallback to `NM` if over 80 characters.
-* **Condition Integers**: eBay category 183454 requires numeric ConditionIDs (`3000` for NM, `4000` for LP, `5000` for MP, `6000` for HP/DM).
+* **Condition Integers**: eBay category 183454 requires numeric ConditionIDs (`3000` for NM, `4000` for LP, `5000` for MP, `6000` for HP/DM). A numeric `ConditionID` column present in the input takes precedence over string mapping.
+* **Batch quantities are additive**: Module B adds to the live store mirror, so batches are fingerprinted in `processed_batches` and a duplicate upload must be refused unless explicitly forced.
+
+---
+
+## 4. 🔐 Authentication Constraints
+
+* **Google Sign-In is the only mechanism.** Do not reintroduce local password login, a registration form, or an auth-disabled development mode, even as a testing convenience. Tests stub `verify_google_id_token` instead.
+* **`GOOGLE_CLIENT_ID` is required configuration.** The app must fail fast at startup without it rather than booting into an unusable state, and the ID token audience check must always run.
+* **Never ship a default signing secret.** `JWT_SECRET` comes from the environment, or is randomly generated and persisted to the data volume.
+* **Google rejects raw-IP and plain-HTTP OAuth origins** (only `localhost` is exempt), so the NAS deployment requires an HTTPS hostname in front of the container. Keep this constraint documented in the README.
