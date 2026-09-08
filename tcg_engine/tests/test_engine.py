@@ -189,11 +189,12 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(order_res["converted_count"], 1)
         csv_lines = order_res["csv_content"].strip().splitlines()
         # Verify skuId 7805758 is present in SortSwift deduction output
-        # The condition round-trips verbatim: the source export said "NM", so the
-        # deduction file says "NM". We deliberately do not normalise it to
-        # "Near Mint" -- SortSwift's own vocabulary goes back to SortSwift, and
-        # matching is driven by skuId regardless.
-        self.assertIn("7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,NM,Normal,1", csv_lines)
+        # Two things are pinned here. The condition round-trips verbatim: the
+        # source export said "NM", so the deduction file says "NM" rather than a
+        # normalised "Near Mint". And the quantity is NEGATIVE: SortSwift's
+        # import adds the quantity column to existing stock, so a deduction has
+        # to be expressed as a negative number or it increases inventory.
+        self.assertIn("7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,NM,Normal,-1", csv_lines)
 
     def test_bin_remark_encoding_and_reexport(self):
         # Initial export with Remarks "Bin A-12"
@@ -1509,7 +1510,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(row["productId"], "542678")
         self.assertEqual(row["Order Number"], "MANUAL-TEST")
         self.assertEqual(row["Product Name"], "Ledyba")
-        self.assertEqual(row["Quantity"], "2")
+        # Negative, because SortSwift's import adds this column to stock.
+        self.assertEqual(row["Quantity"], "-2")
 
     # ------------------------------------------------------------------
     # eBay Listings roll-up
@@ -1572,6 +1574,51 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         listings = self.db.get_ebay_listings()
         self.assertEqual(len(listings), 1)
         self.assertEqual(listings[0]["card_count"], 1)
+
+    # ------------------------------------------------------------------
+    # Deduction direction (SortSwift adds the quantity column)
+    # ------------------------------------------------------------------
+
+    def test_every_deduction_quantity_is_negative(self):
+        """
+        SortSwift's inventory import ADDS the quantity column to existing stock.
+        A positive figure therefore increases inventory, which is the opposite
+        of a deduction -- importing one previously showed up as "+1". Every
+        quantity this engine writes into a deduction file must be negative.
+        """
+        self.db.insert_manifest(
+            "ID1001", "Ledyba", "Chilling Reign", "NM", "Normal",
+            sku_id="111", tcgplayer_id="542678")
+
+        orders = (
+            "Sales Record Number,Order Number,Item Title,Custom Label,Quantity" + chr(10)
+            + "901,ORD-901,Ledyba,ID1001,3" + chr(10)
+            + "902,ORD-902,Ledyba,ID1001,1" + chr(10)
+        )
+        res = process_orders_csv(orders, self.db)
+
+        rows = list(csv.DictReader(io.StringIO(res["csv_content"])))
+        self.assertEqual(len(rows), 2)
+        quantities = [int(r["Quantity"]) for r in rows]
+        self.assertEqual(quantities, [-3, -1])
+        self.assertTrue(all(q < 0 for q in quantities))
+
+        # The reported total stays positive: it is a count of cards sold, not a
+        # figure written into the file.
+        self.assertEqual(res["converted_count"], 4)
+
+    def test_deduction_row_negates_whatever_sign_it_is_given(self):
+        from tcg_engine.orders import deduction_row
+
+        card = {"sku_id": "111", "tcgplayer_id": "542678", "product_name": "Ledyba",
+                "set_name": "Chilling Reign", "condition": "NM", "printing": "Normal"}
+
+        # Callers pass a positive count of cards removed...
+        self.assertEqual(deduction_row(card, 2, "X")["Quantity"], -2)
+        # ...and a caller that already negated must not double-negate back to
+        # positive, which would silently re-add stock.
+        self.assertEqual(deduction_row(card, -2, "X")["Quantity"], -2)
+        self.assertEqual(deduction_row(card, 0, "X")["Quantity"], 0)
 
 
 if __name__ == "__main__":

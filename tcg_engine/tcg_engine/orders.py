@@ -5,7 +5,11 @@ from typing import Dict, Any, List, Optional, Tuple
 from .csvtools import find_column as _find_column, read_csv_text, strip_bom
 from .db import Database
 
-# SortSwift / TCGplayer Import & Deduction Template Headers
+# SortSwift / TCGplayer Import & Deduction Template Headers.
+#
+# Quantities in a deduction file are NEGATIVE. SortSwift's import adds the
+# quantity column to existing stock, so a positive value would increase
+# inventory instead of reducing it.
 # SortSwift officially accepts 'skuId' (Recommended), or 'productId', 'Product Name', 'Set Name', 'Condition', 'Printing', 'Quantity'
 SORTSWIFT_HEADERS = [
     "skuId",
@@ -52,7 +56,16 @@ def build_deduction_csv(rows: List[Dict[str, Any]]) -> str:
 def deduction_row(
     card: Dict[str, Any], quantity: int, order_number: str
 ) -> Dict[str, Any]:
-    """Build one SortSwift deduction row from a catalog card."""
+    """
+    Build one SortSwift deduction row from a catalog card.
+
+    ``quantity`` is given as a positive number of cards sold or removed, and is
+    written out **negative**. SortSwift's inventory import adds the value in the
+    quantity column, so a positive figure would increase stock -- the opposite of
+    a deduction. Per its documentation, "if you place a negative number in the
+    quantity field, it will remove that amount from your existing quantity",
+    clamping at zero rather than going negative.
+    """
     return {
         "skuId": card.get("sku_id") or "",
         "productId": card.get("tcgplayer_id") or "",
@@ -61,7 +74,7 @@ def deduction_row(
         "Set Name": card.get("set_name", ""),
         "Condition": card.get("condition", ""),
         "Printing": card.get("printing", ""),
-        "Quantity": int(quantity),
+        "Quantity": -abs(int(quantity)),
     }
 
 
@@ -174,16 +187,8 @@ def process_orders_csv(
         else:
             order_num = order_num.strip()
 
-        converted_row = {
-            "skuId": card.get("sku_id") or "",
-            "productId": card.get("tcgplayer_id") or "",
-            "Order Number": order_num,
-            "Product Name": card["product_name"],
-            "Set Name": card["set_name"],
-            "Condition": card["condition"],
-            "Printing": card["printing"],
-            "Quantity": quantity,
-        }
+        # Negative: this file deducts sold stock. See deduction_row().
+        converted_row = deduction_row(card, quantity, order_num)
         output_rows.append(converted_row)
         converted_count += quantity
 

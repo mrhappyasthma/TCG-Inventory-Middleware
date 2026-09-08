@@ -644,9 +644,18 @@ already linked keeps its eBay item number and quantity.
 * **Output (`sortswift_orders_import.csv`)**:
   ```csv
   skuId,productId,Order Number,Product Name,Set Name,Condition,Printing,Quantity
-  7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,Near Mint,Normal,1
+  7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,NM,Normal,-1
   ```
-  *(Matches SortSwift's official ⭐ Recommended `skuId` deduction import specification.)*
+
+* ⚠️ **Quantities are negative.** SortSwift's inventory import *adds* the
+  quantity column to your existing stock, so a positive number increases
+  inventory — the opposite of a deduction. Its documentation is explicit: *"if
+  you place a negative number in the quantity field, it will remove that amount
+  from your existing quantity."* Stock clamps at **0** rather than going
+  negative, so over-deducting silently floors instead of erroring.
+* **Matching is by `skuId`**, which uniquely identifies the card together with
+  its condition, language and printing. `productId` is the fallback. The
+  `Remark` column is not part of the match, and this file does not send one.
 
 
 ## 🗂️ Workspace tabs
@@ -718,7 +727,8 @@ miscount, a card pulled for a trade, damage found after scanning.
   this replaces the stored value.
 * Optionally tick **Generate SortSwift deduction CSV** to get a deduction file
   for the difference, in exactly the format a real order produces, so the same
-  correction can be applied in SortSwift.
+  correction can be applied in SortSwift. The quantity in that file is
+  **negative**, because SortSwift's import adds the column to existing stock.
 * A deduction is only produced when the quantity **decreases**; raising it has
   nothing to deduct, and the dialog says so before you save.
 * The order number defaults to `MANUAL-<manifest id>` so hand corrections are
