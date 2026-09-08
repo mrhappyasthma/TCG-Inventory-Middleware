@@ -646,6 +646,31 @@
                     </div>
                 </div>
 
+                <!-- eBay Seller Requirements -->
+                <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-3">
+                    <label class="block font-semibold text-slate-200">eBay Seller Requirements</label>
+                    <p class="text-[11px] text-slate-400">eBay rejects an Add file without an item location. We send <code class="text-accent-cyan font-mono">PostalCode</code> only &mdash; <code class="font-mono">Location</code> is its alternative, and sending both is a known cause of error 10009.</p>
+                    <div>
+                        <label class="block text-[11px] text-slate-300 mb-1">Seller Postal / ZIP Code <span class="text-rose-400">*required</span></label>
+                        <input type="text" id="settingPostalCode" placeholder="e.g. 94301" class="w-40 px-3 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                    </div>
+                    <p class="text-[11px] text-slate-400 pt-1">Business policy names, copied <strong>exactly</strong> from Seller Hub &rarr; Account &rarr; Business policies. Matching is case-sensitive. Leave blank to omit the column entirely.</p>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <div>
+                            <label class="block text-[11px] text-slate-300 mb-1">Shipping policy</label>
+                            <input type="text" id="settingShippingProfile" placeholder="optional" class="w-full px-2.5 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                        </div>
+                        <div>
+                            <label class="block text-[11px] text-slate-300 mb-1">Return policy</label>
+                            <input type="text" id="settingReturnProfile" placeholder="optional" class="w-full px-2.5 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                        </div>
+                        <div>
+                            <label class="block text-[11px] text-slate-300 mb-1">Payment policy</label>
+                            <input type="text" id="settingPaymentProfile" placeholder="optional" class="w-full px-2.5 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Set Grouping Toggle -->
                 <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80">
                     <label class="flex items-start gap-3 cursor-pointer">

@@ -27,8 +27,19 @@ ADD_HEADERS = [
     "Format",
     "Duration",
     "Price",
+    "PostalCode",
     CONDITION_DESCRIPTOR_COLUMN,
 ]
+
+# Business policy columns, emitted only when configured. eBay matches these by
+# name, case-sensitively, against the seller's Manage Business Policies page.
+# When policies are used the individual Payment/Shipping/Returns fields must be
+# absent -- which they are.
+POLICY_SETTING_COLUMNS = (
+    ("shipping_profile_name", "ShippingProfileName"),
+    ("return_profile_name", "ReturnProfileName"),
+    ("payment_profile_name", "PaymentProfileName"),
+)
 
 # eBay's variation syntax: within one attribute, values are separated by
 # semicolons; a pipe separates different attributes. Card names containing
@@ -200,11 +211,15 @@ def _parse_price(val: Optional[str]) -> float:
         return 0.0
 
 
-def _empty_batch_result(logs: List[Dict[str, str]], **overrides) -> Dict[str, Any]:
+def _empty_batch_result(
+    logs: List[Dict[str, str]],
+    add_headers: Optional[List[str]] = None,
+    **overrides,
+) -> Dict[str, Any]:
     """Build a no-op batch result carrying the supplied log messages."""
     result = {
         "revise_csv": ",".join(REVISE_HEADERS) + "\n",
-        "add_csv": ",".join(ADD_HEADERS) + "\n",
+        "add_csv": ",".join(add_headers or ADD_HEADERS) + "\n",
         "revise_count": 0,
         "add_count": 0,
         "new_catalog_count": 0,
@@ -258,6 +273,20 @@ def process_batch_csv(
     )
     category_id = db.get_listing_setting("category_id", "183454")
     descriptor_style = db.get_listing_setting("condition_descriptor_style", "label_id")
+    postal_code = str(db.get_listing_setting("seller_postal_code", "")).strip()
+
+    # Only emit policy columns that are actually configured; a blank policy
+    # name is worse than an absent column.
+    active_policies = {}
+    for setting_key, column in POLICY_SETTING_COLUMNS:
+        value = str(db.get_listing_setting(setting_key, "")).strip()
+        if value:
+            active_policies[column] = value
+    add_headers = ADD_HEADERS + list(active_policies)
+
+    # Cells appended to every generated Add row.
+    common_add_fields = {"PostalCode": postal_code}
+    common_add_fields.update(active_policies)
     group_by_set = str(db.get_listing_setting("group_by_set", "true")).strip().lower() not in (
         "false",
         "0",
@@ -267,7 +296,8 @@ def process_batch_csv(
     lines = [line for line in csv_text.splitlines() if line.strip()]
     if not lines:
         return _empty_batch_result(
-            [{"level": "WARN", "message": "Uploaded SortSwift batch file is empty."}]
+            [{"level": "WARN", "message": "Uploaded SortSwift batch file is empty."}],
+            add_headers=add_headers,
         )
 
     reader = csv.DictReader(io.StringIO(csv_text))
@@ -276,7 +306,8 @@ def process_batch_csv(
             [{
                 "level": "ERROR",
                 "message": "Unable to parse CSV headers in SortSwift batch file.",
-            }]
+            }],
+            add_headers=add_headers,
         )
 
     # Refuse a replay of an already-processed file unless explicitly forced.
@@ -294,6 +325,7 @@ def process_batch_csv(
                     f"Re-upload with 'force' enabled if that is really intended."
                 ),
             }],
+            add_headers=add_headers,
             duplicate=True,
         )
 
@@ -306,6 +338,24 @@ def process_batch_csv(
         "level": "INFO",
         "message": f"Processing SortSwift scan batch with {len(lines) - 1} cards ({grouping_note})..."
     })
+    if not postal_code:
+        logs.append({
+            "level": "ERROR",
+            "message": (
+                "No seller postal code is configured, so eBay will reject this "
+                "Add file with error 10009 (No <Item.Location> exists). Set your "
+                "postal code under Listing Rules before uploading."
+            ),
+        })
+    if not active_policies:
+        logs.append({
+            "level": "WARN",
+            "message": (
+                "No eBay business policy names are configured. eBay usually "
+                "requires shipping and return details on an Add, so set your "
+                "policy names under Listing Rules if the upload is rejected."
+            ),
+        })
     if previous and force:
         logs.append({
             "level": "WARN",
@@ -588,6 +638,7 @@ def process_batch_csv(
             "Duration": "GTC",
             "Price": "",
             CONDITION_DESCRIPTOR_COLUMN: cards[0]["condition_descriptor"],
+            **common_add_fields,
         })
 
         # Append Child Variation Rows
@@ -611,6 +662,7 @@ def process_batch_csv(
                 "Duration": "GTC",
                 "Price": f"{c['price']:.2f}",
                 CONDITION_DESCRIPTOR_COLUMN: c["condition_descriptor"],
+                **common_add_fields,
             })
 
     # 2. Standalone Single Listings (Cards >= threshold)
@@ -645,6 +697,7 @@ def process_batch_csv(
             "Duration": "GTC",
             "Price": f"{s['price']:.2f}",
             CONDITION_DESCRIPTOR_COLUMN: s["condition_descriptor"],
+            **common_add_fields,
         })
 
     # Generate REVISE CSV
@@ -656,7 +709,7 @@ def process_batch_csv(
 
     # Generate ADD CSV
     add_io = io.StringIO()
-    add_writer = csv.DictWriter(add_io, fieldnames=ADD_HEADERS, lineterminator="\n")
+    add_writer = csv.DictWriter(add_io, fieldnames=add_headers, lineterminator="\n")
     add_writer.writeheader()
     add_writer.writerows(final_add_rows)
     add_csv = add_io.getvalue()

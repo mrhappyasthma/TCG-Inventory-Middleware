@@ -367,26 +367,56 @@ eBay has no bucket below *Poor*, so Heavily Played and Damaged both land there.
   rather than guessed at. Graded cards (ConditionID extending `2750`) need a
   different descriptor and are not supported yet; such rows are skipped.
 
-### ⚠️ Still not emitted for eBay uploads
+### 📍 Seller requirements: postal code and business policies
 
-The generated `ebay_new_additions.csv` may still be incomplete for a File
-Exchange `Add`, pending a manual test listing to confirm what the category
-demands:
+eBay rejects an `Add` outright without an item location, returning:
 
-* **Item location / postal code**, **shipping** details or a business-policy
-  profile name, and a **return policy**.
-* The `Price` column is emitted alongside `StartPrice`; `Price` is probably not
-  a valid File Exchange field for fixed-price listings and may be ignored.
-* The descriptor is written to parent, child and single rows alike, mirroring
-  how `ConditionID` is emitted. If eBay rejects it on child rows, restricting it
-  to parents is a one-line change.
+```
+10009  Error - No <Item.Location> exists or <Item.Location> is specified
+       as an empty tag in the request. | Item.Location |
+```
+
+Configure these under **Listing Rules**:
+
+| Setting | Column emitted | Required? |
+|---|---|---|
+| Seller Postal / ZIP Code | `PostalCode` | **Yes** — the upload fails without it |
+| Shipping policy name | `ShippingProfileName` | Only if your account uses business policies |
+| Return policy name | `ReturnProfileName` | Only if your account uses business policies |
+| Payment policy name | `PaymentProfileName` | Only if your account uses business policies |
+
+* **`PostalCode` only, never `Location`.** The two are alternatives, and
+  supplying both is a documented cause of the same 10009 error. eBay derives the
+  displayed city/state from the zip.
+* **Policy names must match exactly**, including case, as they appear under
+  Seller Hub → Account → Business policies. They are passed through verbatim.
+* **A policy left blank omits its column entirely** rather than sending an empty
+  value, which eBay would reject.
+* If the postal code is unset, the run logs an `ERROR` naming the eBay error code
+  it will cause, so it is caught before the upload rather than after.
+
+### ⚠️ Possibly still incomplete
+
+Pending confirmation from a successful upload:
+
+* The `Price` column is emitted alongside `StartPrice`; `Price` is probably not a
+  valid File Exchange field for fixed-price listings and may be ignored.
+* `PostalCode`, the Condition Descriptor and the policy columns are written to
+  parent, child and single rows alike, mirroring how `ConditionID` is emitted. If
+  eBay rejects any of them on child rows, restricting them to parents is a
+  one-line change.
+
+**Empirically confirmed by a real upload attempt:** the file parses, and eBay
+validated as far as per-row field checks without complaining about the variation
+syntax, the blank parent `Relationship`, the `CD:40001` column, the category or
+the bare `Action` header. Those were the parts most at risk of being wrong.
 * **Output 1 (`ebay_inventory_updates.csv`)** — Revise:
   ```
   Action,Item Number,Custom Label,Quantity,Price
   ```
 * **Output 2 (`ebay_new_additions.csv`)** — Add:
   ```
-  Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price,CD:40001
+  Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price,PostalCode,CD:40001
   ```
 
 ### 2. eBay Orders to SortSwift Deduction Ingestion (Module A)

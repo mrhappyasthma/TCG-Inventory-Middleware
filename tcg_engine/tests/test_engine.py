@@ -632,6 +632,78 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             any("not the ungraded value" in log["message"] for log in res["logs"])
         )
 
+    # ------------------------------------------------------------------
+    # Item location and business policies (eBay error 10009)
+    # ------------------------------------------------------------------
+
+    def test_postal_code_is_emitted_and_location_is_not(self):
+        self.db.set_listing_settings({"seller_postal_code": "94301"})
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+
+        header = res["add_csv"].splitlines()[0].split(",")
+        self.assertIn("PostalCode", header)
+        # Location and PostalCode are alternatives; sending both is a documented
+        # cause of the 10009 error this column exists to fix.
+        self.assertNotIn("Location", header)
+
+        for r in csv.DictReader(io.StringIO(res["add_csv"])):
+            self.assertEqual(r["PostalCode"], "94301")
+
+    def test_missing_postal_code_raises_an_error_log(self):
+        self.db.set_listing_settings({"seller_postal_code": ""})
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+
+        errors = [lg for lg in res["logs"] if lg["level"] == "ERROR"]
+        self.assertTrue(errors, "an unset postal code must be surfaced loudly")
+        self.assertTrue(
+            any("10009" in lg["message"] for lg in errors),
+            "the log should name the eBay error code it will cause",
+        )
+
+    def test_business_policy_columns_appear_only_when_configured(self):
+        self.db.set_listing_settings({
+            "seller_postal_code": "94301",
+            "shipping_profile_name": "Standard Free Shipping",
+        })
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+
+        header = res["add_csv"].splitlines()[0].split(",")
+        self.assertIn("ShippingProfileName", header)
+        # An unconfigured policy is omitted entirely rather than sent blank.
+        self.assertNotIn("ReturnProfileName", header)
+        self.assertNotIn("PaymentProfileName", header)
+
+        for r in csv.DictReader(io.StringIO(res["add_csv"])):
+            self.assertEqual(r["ShippingProfileName"], "Standard Free Shipping")
+
+    def test_all_business_policies_are_emitted_verbatim(self):
+        policies = {
+            "shipping_profile_name": "Standard Free Shipping",
+            "return_profile_name": "30 Day Returns",
+            "payment_profile_name": "Managed Payments",
+        }
+        self.db.set_listing_settings(dict(policies, seller_postal_code="94301"))
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+
+        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
+        self.assertTrue(rows)
+        for r in rows:
+            # Policy names are matched case-sensitively by eBay, so they must
+            # survive untouched.
+            self.assertEqual(r["ShippingProfileName"], "Standard Free Shipping")
+            self.assertEqual(r["ReturnProfileName"], "30 Day Returns")
+            self.assertEqual(r["PaymentProfileName"], "Managed Payments")
+
+    def test_empty_batch_still_reports_the_effective_headers(self):
+        self.db.set_listing_settings({
+            "seller_postal_code": "94301",
+            "shipping_profile_name": "Standard Free Shipping",
+        })
+        res = process_batch_csv("", self.db)
+        header = res["add_csv"].splitlines()[0].split(",")
+        self.assertIn("PostalCode", header)
+        self.assertIn("ShippingProfileName", header)
+
 
 if __name__ == "__main__":
     unittest.main()

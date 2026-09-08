@@ -392,6 +392,10 @@ async function loadListingSettings() {
             String(s.group_by_set ?? "true").toLowerCase() !== "false";
         document.getElementById("settingDescriptorStyle").value =
             s.condition_descriptor_style || "label_id";
+        document.getElementById("settingPostalCode").value = s.seller_postal_code || "";
+        document.getElementById("settingShippingProfile").value = s.shipping_profile_name || "";
+        document.getElementById("settingReturnProfile").value = s.return_profile_name || "";
+        document.getElementById("settingPaymentProfile").value = s.payment_profile_name || "";
         updateTitlePreview();
     } catch (err) {
         logToTerminal("ERROR", `Failed to load listing settings: ${err.message}`);
@@ -404,6 +408,10 @@ async function saveListingSettings(e) {
     const template = document.getElementById("settingTitleTemplate").value || "{set_name}: Pick Your Card - {condition} - Complete Your Set";
     const groupBySet = document.getElementById("settingGroupBySet").checked;
     const descriptorStyle = document.getElementById("settingDescriptorStyle").value;
+    const postalCode = document.getElementById("settingPostalCode").value.trim();
+    const shippingProfile = document.getElementById("settingShippingProfile").value.trim();
+    const returnProfile = document.getElementById("settingReturnProfile").value.trim();
+    const paymentProfile = document.getElementById("settingPaymentProfile").value.trim();
 
     try {
         const res = await fetch("/api/listing-settings", {
@@ -414,7 +422,11 @@ async function saveListingSettings(e) {
                     single_threshold: threshold,
                     variation_title_template: template,
                     group_by_set: groupBySet ? "true" : "false",
-                    condition_descriptor_style: descriptorStyle
+                    condition_descriptor_style: descriptorStyle,
+                    seller_postal_code: postalCode,
+                    shipping_profile_name: shippingProfile,
+                    return_profile_name: returnProfile,
+                    payment_profile_name: paymentProfile
                 }
             })
         });
@@ -422,6 +434,9 @@ async function saveListingSettings(e) {
         if (!res.ok) throw new Error(data.detail);
 
         closeListingModal();
+        if (!postalCode) {
+            logToTerminal("ERROR", "No postal code set - eBay will reject Add files with error 10009 (missing Item.Location).");
+        }
         logToTerminal(
             "SUCCESS",
             `Updated Listing Rules: Single Threshold = $${parseFloat(threshold).toFixed(2)}, ` +
