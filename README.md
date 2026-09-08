@@ -378,12 +378,17 @@ eBay rejects an `Add` outright without an item location, returning:
 
 Configure these under **Listing Rules**:
 
-| Setting | Column emitted | Required? |
+| Setting | Column emitted | Shipped default |
 |---|---|---|
-| Seller Postal / ZIP Code | `PostalCode` | **Yes** — the upload fails without it |
-| Shipping policy name | `ShippingProfileName` | Only if your account uses business policies |
-| Return policy name | `ReturnProfileName` | Only if your account uses business policies |
-| Payment policy name | `PaymentProfileName` | Only if your account uses business policies |
+| Seller Postal / ZIP Code | `PostalCode` | `94305` |
+| Shipping policy name | `ShippingProfileName` | `Free Shipping Cards` |
+| Return policy name | `ReturnProfileName` | `No Returns` |
+| Payment policy name | `PaymentProfileName` | `Immediate Payment` |
+
+These defaults are seeded on a fresh database and back-filled into an existing
+one **only where the value is currently blank** — anything you have edited is
+never overwritten. Change any of them under **Listing Rules** at any time; the
+database is the source of truth.
 
 * **`PostalCode` only, never `Location`.** The two are alternatives, and
   supplying both is a documented cause of the same 10009 error. eBay derives the
@@ -416,7 +421,7 @@ the bare `Action` header. Those were the parts most at risk of being wrong.
   ```
 * **Output 2 (`ebay_new_additions.csv`)** — Add:
   ```
-  Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price,PostalCode,CD:40001
+  Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price,PostalCode,CD:40001,ShippingProfileName,ReturnProfileName,PaymentProfileName
   ```
 
 ### 2. eBay Orders to SortSwift Deduction Ingestion (Module A)

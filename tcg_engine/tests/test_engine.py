@@ -661,9 +661,13 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         )
 
     def test_business_policy_columns_appear_only_when_configured(self):
+        # Explicitly blank the other two: they ship with defaults, and the
+        # behaviour under test is that a BLANK policy omits its column.
         self.db.set_listing_settings({
             "seller_postal_code": "94301",
             "shipping_profile_name": "Standard Free Shipping",
+            "return_profile_name": "",
+            "payment_profile_name": "",
         })
         res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
 
@@ -703,6 +707,69 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         header = res["add_csv"].splitlines()[0].split(",")
         self.assertIn("PostalCode", header)
         self.assertIn("ShippingProfileName", header)
+
+    # ------------------------------------------------------------------
+    # Shipped seller defaults (postal code + business policies)
+    # ------------------------------------------------------------------
+
+    def test_seller_settings_are_prepopulated_by_default(self):
+        settings = self.db.get_listing_settings()
+        self.assertEqual(settings["seller_postal_code"], "94305")
+        self.assertEqual(settings["shipping_profile_name"], "Free Shipping Cards")
+        self.assertEqual(settings["return_profile_name"], "No Returns")
+        self.assertEqual(settings["payment_profile_name"], "Immediate Payment")
+
+    def test_defaults_reach_the_generated_csv_with_no_configuration(self):
+        # Straight out of the box, with nothing configured, the Add file must
+        # already carry everything eBay rejected it for.
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
+
+        header = res["add_csv"].splitlines()[0].split(",")
+        for column in (
+            "PostalCode",
+            "ShippingProfileName",
+            "ReturnProfileName",
+            "PaymentProfileName",
+        ):
+            self.assertIn(column, header)
+        self.assertNotIn("Location", header)
+
+        for r in csv.DictReader(io.StringIO(res["add_csv"])):
+            self.assertEqual(r["PostalCode"], "94305")
+            self.assertEqual(r["ShippingProfileName"], "Free Shipping Cards")
+            self.assertEqual(r["ReturnProfileName"], "No Returns")
+            self.assertEqual(r["PaymentProfileName"], "Immediate Payment")
+
+        # And no error about a missing location.
+        self.assertFalse(
+            [lg for lg in res["logs"] if lg["level"] == "ERROR"],
+            "a fully defaulted run should not warn about missing seller fields",
+        )
+
+    def test_blank_seller_values_are_backfilled_on_reopen(self):
+        # Simulates a database created before these defaults existed.
+        self.db.set_listing_settings({
+            "seller_postal_code": "",
+            "shipping_profile_name": "",
+            "return_profile_name": "",
+            "payment_profile_name": "",
+        })
+        reopened = Database(self.db_path)
+        settings = reopened.get_listing_settings()
+        self.assertEqual(settings["seller_postal_code"], "94305")
+        self.assertEqual(settings["shipping_profile_name"], "Free Shipping Cards")
+        self.assertEqual(settings["return_profile_name"], "No Returns")
+
+    def test_customised_seller_values_are_never_overwritten(self):
+        self.db.set_listing_settings({
+            "seller_postal_code": "10001",
+            "shipping_profile_name": "My Custom Shipping",
+        })
+        settings = Database(self.db_path).get_listing_settings()
+        self.assertEqual(settings["seller_postal_code"], "10001")
+        self.assertEqual(settings["shipping_profile_name"], "My Custom Shipping")
+        # Untouched keys still hold their defaults.
+        self.assertEqual(settings["return_profile_name"], "No Returns")
 
 
 if __name__ == "__main__":

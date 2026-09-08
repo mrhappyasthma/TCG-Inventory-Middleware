@@ -5,6 +5,15 @@ from contextlib import contextmanager
 from typing import Optional, Dict, Any, List, Tuple
 
 
+# Default seller details used when generating eBay Add files. The policy names
+# must match the seller's eBay business policies exactly, including case.
+# All of these are editable at runtime under Listing Rules.
+DEFAULT_SELLER_POSTAL_CODE = "94305"
+DEFAULT_SHIPPING_PROFILE = "Free Shipping Cards"
+DEFAULT_RETURN_PROFILE = "No Returns"
+DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
+
+
 class Database:
     """
     SQLite Database manager for TCG inventory.
@@ -173,10 +182,12 @@ class Database:
                     ("variation_title_template", "{set_name}: Pick Your Card - {condition} - Complete Your Set"),
                     ("category_id", "183454"),
                     ("condition_descriptor_style", "label_id"),
-                    ("seller_postal_code", ""),
-                    ("shipping_profile_name", ""),
-                    ("return_profile_name", ""),
-                    ("payment_profile_name", ""),
+                    ("seller_postal_code", DEFAULT_SELLER_POSTAL_CODE),
+                    # Business policy names as configured on this seller's
+                    # account. Editable at runtime under Listing Rules.
+                    ("shipping_profile_name", DEFAULT_SHIPPING_PROFILE),
+                    ("return_profile_name", DEFAULT_RETURN_PROFILE),
+                    ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
                 ]
                 cursor.executemany(
                     """
@@ -187,18 +198,25 @@ class Database:
                 )
 
             # Backfill settings keys added after the initial seed.
+            # Backfill settings keys added after the initial seed. A key that
+            # already exists but is blank is also filled, so a database created
+            # before these defaults existed picks them up. A value the user has
+            # actually set is never overwritten.
             for _key, _default in (
                 ("condition_descriptor_style", "label_id"),
-                ("seller_postal_code", ""),
-                ("shipping_profile_name", ""),
-                ("return_profile_name", ""),
-                ("payment_profile_name", ""),
+                ("seller_postal_code", DEFAULT_SELLER_POSTAL_CODE),
+                ("shipping_profile_name", DEFAULT_SHIPPING_PROFILE),
+                ("return_profile_name", DEFAULT_RETURN_PROFILE),
+                ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
             ):
                 cursor.execute(
                     """
                     INSERT INTO listing_settings (key, value)
                     VALUES (?, ?)
-                    ON CONFLICT(key) DO NOTHING
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value
+                    WHERE listing_settings.value = ''
+                      AND excluded.value != ''
                     """,
                     (_key, _default),
                 )
