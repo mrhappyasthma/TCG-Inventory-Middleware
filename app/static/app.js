@@ -31,10 +31,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
 // While any modal is open the page behind it must not scroll, otherwise a
 // wheel gesture aimed at the dialog moves the dashboard instead.
+function openModals() {
+    // Select on the data-modal marker, NOT an id suffix: "[id$=Modal]" also
+    // matched the btnOpenLoginModal and btnOpenAddCardModal buttons, and
+    // btnOpenAddCardModal is never hidden, so the lock could never release.
+    return Array.from(document.querySelectorAll("[data-modal]"))
+        .filter(el => !el.classList.contains("hidden"));
+}
+
 function syncModalScrollLock() {
-    const anyOpen = Array.from(document.querySelectorAll('[id$="Modal"]'))
-        .some(el => !el.classList.contains("hidden"));
-    document.body.classList.toggle("overflow-hidden", anyOpen);
+    document.body.classList.toggle("overflow-hidden", openModals().length > 0);
 }
 
 // Google Sign-In readiness. The GSI client script is loaded with async/defer,
@@ -1151,8 +1157,7 @@ function escapeHtml(str) {
 // Escape closes whichever modal is open, which also releases the scroll lock.
 document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    const open = Array.from(document.querySelectorAll('[id$="Modal"]'))
-        .filter(el => !el.classList.contains("hidden"));
+    const open = openModals();
     if (!open.length) return;
     open[open.length - 1].classList.add("hidden");
     syncModalScrollLock();
