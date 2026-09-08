@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 from tcg_engine.db import Database
@@ -259,6 +260,105 @@ Alakazam,Base Set,Lightly Played,Normal,1
         var2 = self.db.get_variation("ID1002")
         self.assertEqual(var2["ebay_parent_id"], "998877665544")
         self.assertEqual(var2["last_known_qty"], 2)
+
+    # ------------------------------------------------------------------
+    # Regression coverage for the correctness fixes
+    # ------------------------------------------------------------------
+
+    TWO_CARD_BATCH = """"Set","Set Code","Card Number","Name","Market Price","Condition","Language","Printing","Quantity","Remarks","TCGplayer Id","SKU Id","CDN Image","Price"
+"SV05: Temporal Forces","TEF","016/162","Deerling","0.17","NM","EN","Normal",1,"Bin-1",542678,7805758,"https://cdn.example.com/a.jpg","0.15"
+"SV05: Temporal Forces","TEF","001/162","Iron Leaves ex","4.50","NM","EN","Normal",1,"Bin-2",542679,7805759,"https://cdn.example.com/b.jpg","4.50"
+"""
+
+    def test_duplicate_batch_is_refused_unless_forced(self):
+        first = process_batch_csv(self.TWO_CARD_BATCH, self.db, source_name="scan.csv")
+        self.assertFalse(first["duplicate"])
+        self.assertEqual(first["add_count"], 2)
+
+        # Same bytes again: refused, and nothing is applied.
+        second = process_batch_csv(self.TWO_CARD_BATCH, self.db, source_name="scan.csv")
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(second["add_count"], 0)
+        self.assertEqual(second["revise_count"], 0)
+        self.assertEqual(second["new_catalog_count"], 0)
+        self.assertTrue(
+            any("already processed" in log["message"] for log in second["logs"])
+        )
+
+        # Catalog is unchanged by the refusal.
+        self.assertEqual(self.db.get_stats()["total_cards"], 2)
+
+        # Forcing it through applies the batch again.
+        forced = process_batch_csv(
+            self.TWO_CARD_BATCH, self.db, source_name="scan.csv", force=True
+        )
+        self.assertFalse(forced["duplicate"])
+        self.assertEqual(forced["add_count"], 2)
+
+    def test_a_different_batch_is_not_treated_as_duplicate(self):
+        process_batch_csv(self.TWO_CARD_BATCH, self.db, source_name="scan.csv")
+        other = self.TWO_CARD_BATCH.replace("Deerling", "Sunkern")
+        res = process_batch_csv(other, self.db, source_name="scan2.csv")
+        self.assertFalse(res["duplicate"])
+
+    def test_group_by_set_disabled_lists_every_card_as_single(self):
+        self.db.set_listing_settings({"group_by_set": "false"})
+        res = process_batch_csv(self.TWO_CARD_BATCH, self.db)
+
+        self.assertEqual(res["add_count"], 2)
+        add_lines = res["add_csv"].strip().splitlines()
+        # No parent container row, so no row carries the Variation relationship.
+        self.assertFalse(
+            any("Variation" in line for line in add_lines[1:]),
+            "set grouping is off; no variation rows expected",
+        )
+        # The cheap card is now a single despite being below the threshold.
+        self.assertTrue(any("Deerling" in line and "1.99" in line for line in add_lines))
+
+    def test_group_by_set_enabled_still_groups(self):
+        self.db.set_listing_settings({"group_by_set": "true"})
+        res = process_batch_csv(self.TWO_CARD_BATCH, self.db)
+        add_lines = res["add_csv"].strip().splitlines()
+        self.assertTrue(any("Variation" in line for line in add_lines[1:]))
+
+    def test_search_and_count_use_the_same_columns(self):
+        process_batch_csv(self.TWO_CARD_BATCH, self.db)
+        # Bin location and SKU id are searchable; both queries must agree.
+        for term in ("Bin-1", "7805759", "Deerling", "Temporal", "nope"):
+            rows = self.db.get_inventory(search=term, limit=1000)
+            total = self.db.get_inventory_count(search=term)
+            self.assertEqual(
+                len(rows), total, f"listing and count disagree for {term!r}"
+            )
+
+    def test_remarks_and_sku_id_are_sortable(self):
+        process_batch_csv(self.TWO_CARD_BATCH, self.db)
+        desc = self.db.get_inventory(sort_by="remarks", sort_dir="DESC")
+        asc = self.db.get_inventory(sort_by="remarks", sort_dir="ASC")
+        self.assertEqual(desc[0]["remarks"], "Bin-2")
+        self.assertEqual(asc[0]["remarks"], "Bin-1")
+        # An unknown column must fall back rather than blow up.
+        fallback = self.db.get_inventory(sort_by="not_a_column")
+        self.assertEqual(fallback[0]["manifest_id"], "ID1001")
+
+    def test_natural_key_is_unique(self):
+        self.db.insert_manifest("ID1001", "Charizard", "Base Set", "Near Mint", "Holofoil")
+        # Case and whitespace variations are the same card, so a second insert
+        # under a new ID must be rejected by the unique index.
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.insert_manifest(
+                "ID1002", "charizard", "base set", "near mint", "holofoil"
+            )
+
+    def test_get_or_create_is_idempotent_under_repeat_calls(self):
+        ids = set()
+        for _ in range(10):
+            m_id, is_new, _ = self.db.get_or_create_manifest(
+                "Pikachu", "Base Set", "Near Mint", "Normal"
+            )
+            ids.add(m_id)
+        self.assertEqual(ids, {"ID1001"})
+        self.assertEqual(self.db.get_stats()["total_cards"], 1)
 
 
 if __name__ == "__main__":

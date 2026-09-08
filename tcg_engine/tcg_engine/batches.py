@@ -1,5 +1,7 @@
 import csv
+import hashlib
 import io
+import os
 from typing import Dict, Any, List, Optional
 from .db import Database
 
@@ -96,22 +98,47 @@ def _parse_price(val: Optional[str]) -> float:
         return 0.0
 
 
+def _empty_batch_result(logs: List[Dict[str, str]], **overrides) -> Dict[str, Any]:
+    """Build a no-op batch result carrying the supplied log messages."""
+    result = {
+        "revise_csv": ",".join(REVISE_HEADERS) + "\n",
+        "add_csv": ",".join(ADD_HEADERS) + "\n",
+        "revise_count": 0,
+        "add_count": 0,
+        "new_catalog_count": 0,
+        "skipped_count": 0,
+        "duplicate": False,
+        "logs": logs,
+    }
+    result.update(overrides)
+    return result
+
+
 def process_batch_csv(
-    csv_text: str, db: Database
+    csv_text: str,
+    db: Database,
+    source_name: str = "batch.csv",
+    force: bool = False,
 ) -> Dict[str, Any]:
     """
     Process fresh SortSwift inventory batch CSV.
     Routes rows into:
     1. ebay_inventory_updates.csv (REVISE - already live on eBay)
     2. ebay_new_additions.csv (ADD - new to eBay)
-    
+
     Automatically creates:
-    - Multi-item Variation Listings (grouped by Set Name for cards < $5.00 threshold)
-    - Standalone Single Listings (for high-value cards >= $5.00 threshold)
+    - Multi-item Variation Listings (grouped by Set Name, for cards below the
+      configured single-listing threshold, when 'group_by_set' is enabled)
+    - Standalone Single Listings (for cards at or above the threshold, and for
+      every card when 'group_by_set' is disabled)
+
+    Revise quantities are additive, so processing the same export twice would
+    double the live stock. Uploads are therefore fingerprinted and a repeat is
+    refused unless ``force`` is set.
     """
     logs: List[Dict[str, str]] = []
     revise_rows: List[Dict[str, Any]] = []
-    
+
     # Raw items to be added (categorized into singles vs variation sets)
     staged_singles: List[Dict[str, Any]] = []
     staged_variations: Dict[str, List[Dict[str, Any]]] = {}  # set_name -> [cards]
@@ -126,35 +153,62 @@ def process_batch_csv(
         "{set_name}: Pick Your Card - Near Mint - Complete Your Set",
     )
     category_id = db.get_listing_setting("category_id", "183454")
+    group_by_set = str(db.get_listing_setting("group_by_set", "true")).strip().lower() not in (
+        "false",
+        "0",
+        "no",
+    )
 
     lines = [line for line in csv_text.splitlines() if line.strip()]
     if not lines:
-        return {
-            "revise_csv": ",".join(REVISE_HEADERS) + "\n",
-            "add_csv": ",".join(ADD_HEADERS) + "\n",
-            "revise_count": 0,
-            "add_count": 0,
-            "new_catalog_count": 0,
-            "skipped_count": 0,
-            "logs": [{"level": "WARN", "message": "Uploaded SortSwift batch file is empty."}],
-        }
+        return _empty_batch_result(
+            [{"level": "WARN", "message": "Uploaded SortSwift batch file is empty."}]
+        )
 
     reader = csv.DictReader(io.StringIO(csv_text))
     if not reader.fieldnames:
-        return {
-            "revise_csv": ",".join(REVISE_HEADERS) + "\n",
-            "add_csv": ",".join(ADD_HEADERS) + "\n",
-            "revise_count": 0,
-            "add_count": 0,
-            "new_catalog_count": 0,
-            "skipped_count": 0,
-            "logs": [{"level": "ERROR", "message": "Unable to parse CSV headers in SortSwift batch file."}],
-        }
+        return _empty_batch_result(
+            [{
+                "level": "ERROR",
+                "message": "Unable to parse CSV headers in SortSwift batch file.",
+            }]
+        )
 
+    # Refuse a replay of an already-processed file unless explicitly forced.
+    batch_hash = hashlib.sha256(csv_text.encode("utf-8", errors="replace")).hexdigest()
+    previous = db.find_processed_batch(batch_hash)
+    if previous and not force:
+        return _empty_batch_result(
+            [{
+                "level": "WARN",
+                "message": (
+                    f"This exact batch file was already processed on "
+                    f"{previous['processed_at']} (as '{previous['source_name']}', "
+                    f"{previous['row_count']} rows). Re-processing would add its "
+                    f"quantities to your live eBay stock a second time. "
+                    f"Re-upload with 'force' enabled if that is really intended."
+                ),
+            }],
+            duplicate=True,
+        )
+
+    grouping_note = (
+        f"Single Threshold: ${single_threshold:.2f}"
+        if group_by_set
+        else "Set grouping disabled - every card listed as a single"
+    )
     logs.append({
         "level": "INFO",
-        "message": f"Processing SortSwift scan batch with {len(lines) - 1} cards (Single Threshold: ${single_threshold:.2f})..."
+        "message": f"Processing SortSwift scan batch with {len(lines) - 1} cards ({grouping_note})..."
     })
+    if previous and force:
+        logs.append({
+            "level": "WARN",
+            "message": (
+                f"Forced re-processing of a batch already handled on "
+                f"{previous['processed_at']}; quantities will be added again."
+            ),
+        })
 
     for row_idx, row in enumerate(reader, start=1):
         product_name = _find_column(row, [
@@ -299,7 +353,13 @@ def process_batch_csv(
                 "card_number": card_number or "",
             }
 
-            if effective_price >= single_threshold:
+            if not group_by_set:
+                staged_singles.append(card_entry)
+                logs.append({
+                    "level": "SUCCESS",
+                    "message": f"Row {row_idx}: [ADD SINGLE] [{ebay_custom_label}] {product_name} (set grouping disabled)",
+                })
+            elif effective_price >= single_threshold:
                 staged_singles.append(card_entry)
                 logs.append({
                     "level": "SUCCESS",
@@ -424,6 +484,14 @@ def process_batch_csv(
         "message": f"Batch routing finished: {len(revise_rows)} items to REVISE, {len(staged_variations)} Set Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
     })
 
+    # Fingerprint only after the batch has actually been applied, so a failure
+    # part-way through does not mark the file as done.
+    db.record_processed_batch(
+        sha256=batch_hash,
+        source_name=source_name,
+        row_count=len(lines) - 1,
+    )
+
     return {
         "revise_csv": revise_csv,
         "add_csv": add_csv,
@@ -431,6 +499,7 @@ def process_batch_csv(
         "add_count": total_added_cards,
         "new_catalog_count": new_catalog_count,
         "skipped_count": skipped_count,
+        "duplicate": False,
         "logs": logs,
     }
 
@@ -440,11 +509,17 @@ def process_batch_file(
     db: Database,
     revise_output_path: Optional[str] = None,
     add_output_path: Optional[str] = None,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """Process a SortSwift batch CSV file from disk."""
     with open(input_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
-    result = process_batch_csv(content, db)
+    result = process_batch_csv(
+        content,
+        db,
+        source_name=os.path.basename(input_path),
+        force=force,
+    )
     if revise_output_path and result["revise_count"] > 0:
         with open(revise_output_path, "w", encoding="utf-8", newline="") as f:
             f.write(result["revise_csv"])

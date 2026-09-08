@@ -35,9 +35,18 @@ def handle_batch(args):
     add_path = os.path.join(out_dir, "ebay_new_additions.csv")
 
     print(f"Processing SortSwift Batch from: {args.input_file}")
-    result = process_batch_file(args.input_file, db, revise_path, add_path)
+    result = process_batch_file(
+        args.input_file, db, revise_path, add_path, force=args.force
+    )
     for log in result["logs"]:
         print(f"[{log['level']}] {log['message']}")
+
+    if result.get("duplicate"):
+        print(
+            "\nBatch was NOT processed because it has been handled before. "
+            "Re-run with --force to apply it again."
+        )
+        return
 
     if result["revise_count"] > 0:
         print(f"Generated Revise CSV: {revise_path} ({result['revise_count']} items)")
@@ -120,6 +129,11 @@ def main():
     )
     p_batch.add_argument("input_file", help="Path to SortSwift batch CSV")
     p_batch.add_argument("--out-dir", default=".", help="Directory to save generated CSVs")
+    p_batch.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-process a batch file that has already been applied (adds its quantities again)",
+    )
     p_batch.set_defaults(func=handle_batch)
 
     # sync (Module C)

@@ -86,13 +86,43 @@ class Database:
                 );
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_batches (
+                    sha256 TEXT PRIMARY KEY,
+                    source_name TEXT,
+                    row_count INTEGER DEFAULT 0,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
             # Create indexes for fast lookups
             cursor.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_manifest_lookup 
+                CREATE INDEX IF NOT EXISTS idx_manifest_lookup
                 ON manifest(product_name, set_name, condition, printing);
                 """
             )
+            # Enforce the natural key so a race between two concurrent batch
+            # uploads cannot produce two manifest rows for the same card state.
+            # Tolerate failure: a database that already contains duplicates from
+            # before this constraint existed must still be able to start.
+            try:
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_manifest_natural_key
+                    ON manifest(
+                        LOWER(product_name),
+                        LOWER(set_name),
+                        LOWER(condition),
+                        LOWER(printing)
+                    );
+                    """
+                )
+            except sqlite3.IntegrityError:
+                # Pre-existing duplicates; leave them for manual reconciliation
+                # rather than blocking startup.
+                pass
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_manifest_skuid 
@@ -283,61 +313,126 @@ class Database:
         """
         Lookup card; if not found, create with next sequential ID.
         Returns: (manifest_id, is_new_record, record_dict)
+
+        The lookup, ID allocation and insert all run inside a single
+        BEGIN IMMEDIATE transaction on one connection. Splitting them across
+        connections previously allowed two concurrent batch uploads to select the
+        same "next" ID and collide on the manifest primary key.
         """
-        existing = self.find_manifest(product_name, set_name, condition, printing)
-        if existing:
-            # Update missing attributes if provided in current batch
-            updates = []
-            params = []
-            if sku_id and not existing.get("sku_id"):
-                updates.append("sku_id = ?")
-                params.append(str(sku_id).strip())
-            if tcgplayer_id and not existing.get("tcgplayer_id"):
-                updates.append("tcgplayer_id = ?")
-                params.append(str(tcgplayer_id).strip())
-            if cdn_image and not existing.get("cdn_image"):
-                updates.append("cdn_image = ?")
-                params.append(str(cdn_image).strip())
-            if price and not existing.get("price"):
-                updates.append("price = ?")
-                params.append(float(price))
-            if market_price and not existing.get("market_price"):
-                updates.append("market_price = ?")
-                params.append(float(market_price))
-            if remarks and str(remarks).strip().lower() != "no remark":
-                updates.append("remarks = ?")
-                params.append(str(remarks).strip())
+        p_name = self._normalize(product_name)
+        s_name = self._normalize(set_name)
+        cond = self._normalize(condition)
+        print_style = self._normalize(printing)
 
-            if updates:
-                with self.get_connection() as conn:
-                    cursor = conn.cursor()
-                    query = f"UPDATE manifest SET {', '.join(updates)} WHERE manifest_id = ?"
-                    params.append(existing["manifest_id"])
-                    cursor.execute(query, params)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            # IMMEDIATE takes the write lock up front, so a concurrent writer
+            # blocks here instead of racing us to the same manifest_id.
+            cursor.execute("BEGIN IMMEDIATE;")
+            try:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM manifest
+                    WHERE LOWER(product_name) = LOWER(?)
+                      AND LOWER(set_name) = LOWER(?)
+                      AND LOWER(condition) = LOWER(?)
+                      AND LOWER(printing) = LOWER(?)
+                    LIMIT 1;
+                    """,
+                    (p_name, s_name, cond, print_style),
+                )
+                row = cursor.fetchone()
+
+                if row:
+                    existing = dict(row)
+                    # Backfill attributes that were missing when the card was
+                    # first catalogued but are present in this batch.
+                    updates: List[str] = []
+                    params: List[Any] = []
+                    if sku_id and not existing.get("sku_id"):
+                        updates.append("sku_id = ?")
+                        params.append(str(sku_id).strip())
+                    if tcgplayer_id and not existing.get("tcgplayer_id"):
+                        updates.append("tcgplayer_id = ?")
+                        params.append(str(tcgplayer_id).strip())
+                    if cdn_image and not existing.get("cdn_image"):
+                        updates.append("cdn_image = ?")
+                        params.append(str(cdn_image).strip())
+                    if price and not existing.get("price"):
+                        updates.append("price = ?")
+                        params.append(float(price))
+                    if market_price and not existing.get("market_price"):
+                        updates.append("market_price = ?")
+                        params.append(float(market_price))
+                    if remarks and str(remarks).strip().lower() != "no remark":
+                        updates.append("remarks = ?")
+                        params.append(str(remarks).strip())
+
+                    if updates:
+                        params.append(existing["manifest_id"])
+                        cursor.execute(
+                            f"UPDATE manifest SET {', '.join(updates)} WHERE manifest_id = ?",
+                            params,
+                        )
+
+                    cursor.execute(
+                        "SELECT * FROM manifest WHERE manifest_id = ?",
+                        (existing["manifest_id"],),
+                    )
+                    refreshed = dict(cursor.fetchone())
                     conn.commit()
-                existing = self.get_manifest_by_id(existing["manifest_id"])
+                    return refreshed["manifest_id"], False, refreshed
 
-            return existing["manifest_id"], False, existing
+                # Allocate the next sequential ID inside the same transaction.
+                cursor.execute(
+                    """
+                    SELECT MAX(CAST(SUBSTR(manifest_id, 3) AS INTEGER)) AS max_num
+                    FROM manifest
+                    WHERE manifest_id GLOB 'ID[0-9]*';
+                    """
+                )
+                max_row = cursor.fetchone()
+                max_num = max_row["max_num"] if max_row and max_row["max_num"] else 1000
+                next_id = f"ID{int(max_num) + 1}"
 
-        # Generate next ID and insert
-        next_id = self.get_next_manifest_id()
-        record = self.insert_manifest(
-            manifest_id=next_id,
-            product_name=product_name,
-            set_name=set_name,
-            condition=condition,
-            printing=printing,
-            sku_id=sku_id,
-            tcgplayer_id=tcgplayer_id,
-            card_number=card_number,
-            set_code=set_code,
-            language=language,
-            price=price,
-            market_price=market_price,
-            cdn_image=cdn_image,
-            remarks=remarks,
-        )
-        return next_id, True, record
+                cursor.execute(
+                    """
+                    INSERT INTO manifest (
+                        manifest_id, product_name, set_name, condition, printing,
+                        sku_id, tcgplayer_id, card_number, set_code, language,
+                        price, market_price, cdn_image, remarks
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        next_id,
+                        p_name,
+                        s_name,
+                        cond,
+                        print_style,
+                        str(sku_id).strip() if sku_id else None,
+                        str(tcgplayer_id).strip() if tcgplayer_id else None,
+                        str(card_number).strip() if card_number else None,
+                        str(set_code).strip() if set_code else None,
+                        str(language).strip() if language else "EN",
+                        float(price or 0.0),
+                        float(market_price or 0.0),
+                        str(cdn_image).strip() if cdn_image else None,
+                        str(remarks).strip()
+                        if remarks and str(remarks).strip().lower() != "no remark"
+                        else None,
+                    ),
+                )
+                cursor.execute(
+                    "SELECT * FROM manifest WHERE manifest_id = ?", (next_id,)
+                )
+                record = dict(cursor.fetchone())
+                conn.commit()
+                return next_id, True, record
+            except Exception:
+                conn.rollback()
+                raise
 
     def get_variation(self, manifest_id: str) -> Optional[Dict[str, Any]]:
         """Get live eBay variation details for a manifest_id."""
@@ -392,6 +487,57 @@ class Database:
             conn.commit()
             return cursor.rowcount > 0
 
+    # Columns the inventory table is allowed to sort on, mapped to qualified SQL
+    # names. Anything not listed falls back to manifest_id.
+    _SORTABLE_COLUMNS = {
+        "manifest_id": "m.manifest_id",
+        "product_name": "m.product_name",
+        "set_name": "m.set_name",
+        "condition": "m.condition",
+        "printing": "m.printing",
+        "remarks": "m.remarks",
+        "sku_id": "m.sku_id",
+        "ebay_parent_id": "v.ebay_parent_id",
+        "last_known_qty": "v.last_known_qty",
+    }
+
+    # Columns a free-text inventory search matches against.
+    _SEARCHABLE_COLUMNS = (
+        "m.manifest_id",
+        "m.product_name",
+        "m.set_name",
+        "m.condition",
+        "m.printing",
+        "m.remarks",
+        "m.sku_id",
+        "v.ebay_parent_id",
+    )
+
+    @classmethod
+    def _build_search_clause(
+        cls, search: Optional[str]
+    ) -> Tuple[str, List[Any]]:
+        """
+        Build the shared WHERE clause for inventory listing and counting.
+
+        Both queries must match on exactly the same columns; when they drifted
+        apart, searching by bin location returned rows while the paging total
+        under-reported them.
+        """
+        if not search or not search.strip():
+            return "", []
+
+        needle = f"%{search.strip()}%"
+        conditions = " OR\n                    ".join(
+            f"{col} LIKE ?" for col in cls._SEARCHABLE_COLUMNS
+        )
+        clause = f"""
+                WHERE (
+                    {conditions}
+                )
+        """
+        return clause, [needle] * len(cls._SEARCHABLE_COLUMNS)
+
     def get_inventory(
         self,
         search: Optional[str] = None,
@@ -403,20 +549,11 @@ class Database:
         """
         Combined live inventory query (manifest LEFT JOIN ebay_variations).
         """
-        valid_columns = {
-            "manifest_id": "m.manifest_id",
-            "product_name": "m.product_name",
-            "set_name": "m.set_name",
-            "condition": "m.condition",
-            "printing": "m.printing",
-            "ebay_parent_id": "v.ebay_parent_id",
-            "last_known_qty": "v.last_known_qty",
-        }
-        order_col = valid_columns.get(sort_by, "m.manifest_id")
+        order_col = self._SORTABLE_COLUMNS.get(sort_by, "m.manifest_id")
         direction = "DESC" if str(sort_dir).upper() == "DESC" else "ASC"
 
         query = """
-            SELECT 
+            SELECT
                 m.manifest_id,
                 m.product_name,
                 m.set_name,
@@ -429,24 +566,8 @@ class Database:
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
-        params: List[Any] = []
-
-        if search and search.strip():
-            s = f"%{search.strip()}%"
-            query += """
-                WHERE (
-                    m.manifest_id LIKE ? OR
-                    m.product_name LIKE ? OR
-                    m.set_name LIKE ? OR
-                    m.condition LIKE ? OR
-                    m.printing LIKE ? OR
-                    m.remarks LIKE ? OR
-                    m.sku_id LIKE ? OR
-                    v.ebay_parent_id LIKE ?
-                )
-            """
-            params.extend([s, s, s, s, s, s, s, s])
-
+        where_clause, params = self._build_search_clause(search)
+        query += where_clause
         query += f" ORDER BY {order_col} {direction} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
@@ -462,21 +583,8 @@ class Database:
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
-        params: List[Any] = []
-
-        if search and search.strip():
-            s = f"%{search.strip()}%"
-            query += """
-                WHERE (
-                    m.manifest_id LIKE ? OR
-                    m.product_name LIKE ? OR
-                    m.set_name LIKE ? OR
-                    m.condition LIKE ? OR
-                    m.printing LIKE ? OR
-                    v.ebay_parent_id LIKE ?
-                )
-            """
-            params.extend([s, s, s, s, s, s])
+        where_clause, params = self._build_search_clause(search)
+        query += where_clause
 
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -616,6 +724,45 @@ class Database:
             cursor.execute("SELECT value FROM listing_settings WHERE key = ?", (key,))
             row = cursor.fetchone()
             return row["value"] if row else default
+
+    def find_processed_batch(self, sha256: str) -> Optional[Dict[str, Any]]:
+        """Return the record of a previously processed batch upload, if any."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT sha256, source_name, row_count, processed_at
+                FROM processed_batches
+                WHERE sha256 = ?
+                """,
+                (sha256,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def record_processed_batch(
+        self, sha256: str, source_name: str, row_count: int
+    ) -> None:
+        """
+        Fingerprint a processed batch so a duplicate upload can be detected.
+
+        Batch quantities are additive, so replaying the same export would double
+        the live eBay stock for every card in it.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO processed_batches (sha256, source_name, row_count, processed_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(sha256) DO UPDATE SET
+                    source_name = excluded.source_name,
+                    row_count = excluded.row_count,
+                    processed_at = CURRENT_TIMESTAMP;
+                """,
+                (sha256, source_name, int(row_count)),
+            )
+            conn.commit()
 
     def export_all_manifest(self) -> List[Dict[str, Any]]:
         """Export all master manifest rows."""
