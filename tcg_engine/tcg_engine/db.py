@@ -180,6 +180,7 @@ class Database:
                     ebay_parent_id TEXT NOT NULL,
                     custom_label TEXT,
                     last_known_qty INTEGER DEFAULT 0,
+                    pending_qty INTEGER,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (manifest_id) REFERENCES manifest(manifest_id) ON DELETE CASCADE
                 );
@@ -286,6 +287,18 @@ class Database:
             if "custom_label" not in {row["name"] for row in cursor.fetchall()}:
                 cursor.execute(
                     "ALTER TABLE ebay_variations ADD COLUMN custom_label TEXT"
+                )
+
+            # The quantity Module A last asked eBay for, which is not the same
+            # thing as the quantity eBay reports. Module A must not write
+            # last_known_qty: until the Revise file is actually uploaded and an
+            # Active Listings sync run, eBay knows nothing about it, and
+            # claiming otherwise hides exactly the drift the two columns exist
+            # to show. NULL means nothing is outstanding.
+            cursor.execute("PRAGMA table_info(ebay_variations)")
+            if "pending_qty" not in {row["name"] for row in cursor.fetchall()}:
+                cursor.execute(
+                    "ALTER TABLE ebay_variations ADD COLUMN pending_qty INTEGER"
                 )
 
             # Per-user scoping migration for databases created before pricing
@@ -780,7 +793,8 @@ class Database:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT manifest_id, ebay_parent_id, custom_label, last_known_qty
+                SELECT manifest_id, ebay_parent_id, custom_label,
+                       last_known_qty, pending_qty
                 FROM ebay_variations
                 WHERE manifest_id = ?
                 """,
@@ -799,6 +813,10 @@ class Database:
         """
         Insert or update an ebay_variations row.
 
+        This records what **eBay reports**, so it is Module B's to call. It
+        clears ``pending_qty``: a report from eBay supersedes whatever Module A
+        last asked for, whether or not the request was applied.
+
         ``custom_label`` is the SKU eBay knows this variation by. Passing None
         leaves any stored label alone rather than erasing it, because callers
         that only know the quantity must not destroy a label learned from
@@ -814,12 +832,14 @@ class Database:
             cursor.execute(
                 """
                 INSERT INTO ebay_variations
-                    (manifest_id, ebay_parent_id, custom_label, last_known_qty, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (manifest_id, ebay_parent_id, custom_label, last_known_qty,
+                     pending_qty, updated_at)
+                VALUES (?, ?, ?, ?, NULL, CURRENT_TIMESTAMP)
                 ON CONFLICT(manifest_id) DO UPDATE SET
                     ebay_parent_id = excluded.ebay_parent_id,
                     custom_label = COALESCE(excluded.custom_label, ebay_variations.custom_label),
                     last_known_qty = excluded.last_known_qty,
+                    pending_qty = NULL,
                     updated_at = CURRENT_TIMESTAMP;
                 """,
                 (m_id, p_id, label, qty),
@@ -831,6 +851,25 @@ class Database:
                 "custom_label": label,
                 "last_known_qty": qty,
             }
+
+    def set_pending_quantity(self, manifest_id: str, quantity: int) -> None:
+        """
+        Record the quantity Module A last asked eBay for.
+
+        Deliberately separate from ``last_known_qty``: that column means "what
+        eBay reports", and only an Active Listings sync may set it. Writing the
+        intended quantity there would make the dashboard claim eBay had been
+        updated the moment a CSV was generated, before it had been uploaded.
+
+        Only touches rows that already exist, because a card that is not linked
+        to a listing has nothing pending against it.
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                "UPDATE ebay_variations SET pending_qty = ? WHERE manifest_id = ?",
+                (int(quantity), manifest_id.strip()),
+            )
+            conn.commit()
 
     def get_live_variations(self) -> List[Dict[str, Any]]:
         """
@@ -844,8 +883,8 @@ class Database:
             cursor.execute(
                 """
                 SELECT v.manifest_id, v.ebay_parent_id, v.custom_label,
-                       v.last_known_qty, m.product_name, m.set_name,
-                       m.condition, m.remarks
+                       v.last_known_qty, v.pending_qty, m.product_name,
+                       m.set_name, m.condition, m.remarks
                 FROM ebay_variations v
                 JOIN manifest m ON m.manifest_id = v.manifest_id
                 WHERE v.ebay_parent_id IS NOT NULL
@@ -1246,7 +1285,8 @@ class Database:
                 COALESCE(m.remarks, '') AS remarks,
                 COALESCE(m.sku_id, '') AS sku_id,
                 COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
-                COALESCE(v.last_known_qty, 0) AS last_known_qty
+                COALESCE(v.last_known_qty, 0) AS last_known_qty,
+                v.pending_qty AS pending_qty
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
@@ -1624,7 +1664,8 @@ class Database:
                     m.printing,
                     COALESCE(m.quantity, 0) AS quantity,
                     COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
-                    COALESCE(v.last_known_qty, 0) AS last_known_qty
+                    COALESCE(v.last_known_qty, 0) AS last_known_qty,
+                v.pending_qty AS pending_qty
                 FROM manifest m
                 LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
                 ORDER BY m.manifest_id ASC

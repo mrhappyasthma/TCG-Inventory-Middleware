@@ -102,7 +102,7 @@
                     <div id="statActiveListings" class="text-base font-bold font-heading text-accent-cyan">0</div>
                 </div>
                 <div class="h-6 w-px bg-slate-800"></div>
-                <div class="text-left" title="Total copies eBay reports as available, from your last Active Listings sync.">
+                <div class="text-left" title="Total copies eBay reports as available, from your last Active Listings sync. Generating a Revise file does not change this -- upload it to eBay and re-sync first.">
                     <div class="text-[10px] uppercase font-semibold tracking-wider text-slate-400">Copies on eBay</div>
                     <div id="statTotalStock" class="text-base font-bold font-heading text-accent-emerald">0</div>
                 </div>
@@ -457,7 +457,7 @@
                                 <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('remarks')">Bin / Remark</th>
                                 <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('ebay_parent_id')">eBay Item #</th>
                                 <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('quantity')" title="Copies you hold, from your SortSwift inventory dump. Click a value to adjust it by hand.">On Hand</th>
-                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')" title="Copies eBay reports as available for this card, from your last Active Listings sync. Expected to differ from On Hand until you upload the Revise file.">On eBay</th>
+                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')" title="Copies eBay reports as available, from your last Active Listings sync. Only a Module B sync changes this. An amber &rarr;N means the generated Revise file asks eBay for N, which has not been applied yet.">On eBay</th>
                                 <th class="py-3 px-4 text-right">Action</th>
                             </tr>
                         </thead>

@@ -893,6 +893,36 @@ Listings report. They are two independent measurements of the same thing, which
 is the point: they should agree, and where they don't you have stock to push or
 a sync to run.
 
+### Which module may change which figure
+
+This is enforced, not merely conventional:
+
+| Figure | Only changed by |
+|---|---|
+| `On Hand` / `Copies On Hand` | **Module A** (your SortSwift dump) and the manual quantity dialog |
+| `On eBay` / `Copies on eBay` | **Module B** (an eBay Active Listings sync) |
+
+Module A does **not** touch the eBay figures. Generating a Revise CSV is not
+evidence that eBay was updated — you still have to upload the file. Instead
+Module A records what it asked for in `ebay_variations.pending_qty`, and the
+table shows it as an amber **`→N`** beside the eBay figure:
+
+```
+Ledyba     On Hand=5   On eBay=3  →5 pending
+```
+
+Read as: *you hold 5, eBay is still selling 3, and the file you just generated
+asks eBay for 5.* Upload it, run a Module B sync, and the arrow disappears as
+`On eBay` becomes 5.
+
+Before this, Module A wrote the eBay figures itself the moment a CSV was
+generated. That made the dashboard claim eBay had been updated when it had not,
+and it hid the very drift these two columns exist to reveal.
+
+Module B reconciles in the other direction: a card that is linked to a listing
+but **absent** from the report is no longer live on eBay, so its figure drops to
+`0` rather than sitting stale forever. Each one is logged.
+
 ---
 
 ## 👥 Per-user rules

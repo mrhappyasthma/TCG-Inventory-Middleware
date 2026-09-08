@@ -1152,16 +1152,25 @@ function renderInventoryTable(items, total, offset) {
             ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800'
             : 'bg-slate-900 text-slate-500 border border-slate-800';
 
-        // Our catalogued count vs what eBay last reported. A mismatch is the
-        // interesting case, so flag it rather than making them diff by eye.
+        // Our count vs what eBay last reported. A mismatch is the interesting
+        // case, so flag it rather than making them diff by eye.
         const qty = item.quantity ?? 0;
         const drifted = qty !== item.last_known_qty;
         const qtyBadge = drifted
             ? 'bg-amber-950/80 text-amber-300 border border-amber-800'
             : 'bg-slate-900 text-slate-400 border border-slate-800';
-        const driftTitle = drifted
-            ? `Catalogued ${qty}, eBay reports ${item.last_known_qty}. Run a Module B sync, or revise the listing.`
-            : 'Catalogued quantity matches eBay.';
+
+        // What Module A last asked eBay for. eBay has not been told until the
+        // Revise file is uploaded and a sync run, so showing this separately
+        // is what makes the gap explicable instead of mysterious.
+        const pending = item.pending_qty;
+        const hasPending = pending !== null && pending !== undefined
+            && pending !== item.last_known_qty;
+        const driftTitle = hasPending
+            ? `You hold ${qty}. eBay reports ${item.last_known_qty}. The generated Revise file asks eBay for ${pending} \u2014 upload it to eBay, then run a Module B sync.`
+            : drifted
+            ? `You hold ${qty}, eBay reports ${item.last_known_qty}. Run Module A to generate a Revise file, or Module B to re-sync.`
+            : 'Your count matches what eBay reports.';
 
         return `
             <tr class="hover:bg-dark-800/80 transition-colors">
@@ -1196,10 +1205,11 @@ function renderInventoryTable(items, total, offset) {
                         ${qty}
                     </button>
                 </td>
-                <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
+                <td class="py-3 px-4 text-center whitespace-nowrap" title="${escapeHtml(driftTitle)}">
                     <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${stockBadge}">
                         ${item.last_known_qty}
                     </span>
+                    ${hasPending ? `<span class="ml-1 text-[10px] font-mono text-amber-400" title="Pending: the Revise file asks for ${pending}">&rarr;${pending}</span>` : ""}
                 </td>
                 <td class="py-3 px-4 text-right">
                     <button onclick="deleteCard('${item.manifest_id}')" class="text-slate-500 hover:text-rose-400 p-1 transition-colors" title="Delete Card">

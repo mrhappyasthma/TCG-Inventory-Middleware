@@ -1022,21 +1022,37 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             "the skip reason should explain why an ID cannot be minted",
         )
 
-    def test_dry_run_does_not_double_the_revise_quantity_in_add_mode(self):
+    def test_add_mode_accumulates_on_ebays_figure_then_on_pending(self):
+        """
+        Add mode starts from what eBay reports, and from then on from what we
+        last asked eBay for -- otherwise two scan batches uploaded before a
+        sync would both start from the same base and the first would be lost.
+        """
         process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db,
                           source_name="b.csv", quantity_mode="add")
-        # Put a card live on eBay so the revise path is exercised.
+        # eBay reports 3 for this card, which also clears anything pending.
         self.db.upsert_variation("ID1001", "998877665544", 3)
+        self.assertIsNone(self.db.get_variation("ID1001")["pending_qty"])
 
-        res = process_batch_csv(
-            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv",
-            dry_run=True, quantity_mode="add",
+        first = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b1.csv",
+            quantity_mode="add", force=True,
         )
-        revise = list(csv.DictReader(io.StringIO(res["revise_csv"])))
-        self.assertTrue(revise)
-        # The mirror already includes this batch, so the file reports it as-is
-        # rather than adding the batch quantity a second time.
-        self.assertEqual(revise[0]["Quantity"], "3")
+        revise = list(csv.DictReader(io.StringIO(first["revise_csv"])))
+        self.assertEqual(revise[0]["Quantity"], "4", "eBay's 3 plus this file's 1")
+
+        # eBay has not been told yet, so its own figure must not have moved.
+        variation = self.db.get_variation("ID1001")
+        self.assertEqual(variation["last_known_qty"], 3)
+        self.assertEqual(variation["pending_qty"], 4)
+
+        second = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b2.csv",
+            quantity_mode="add", force=True,
+        )
+        revise = list(csv.DictReader(io.StringIO(second["revise_csv"])))
+        self.assertEqual(revise[0]["Quantity"], "5",
+                         "builds on the outstanding 4, not on eBay's stale 3")
         self.assertEqual(self.db.get_variation("ID1001")["last_known_qty"], 3)
 
     def test_dry_run_matches_a_real_run_in_set_mode(self):
@@ -2093,9 +2109,13 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
                       for r in self.db.export_all_manifest()}
         self.assertEqual(catalogued["Ledyba"], 3, "2 + 1 across two bins")
         self.assertEqual(catalogued["Heracross"], 2)
-        self.assertEqual(
-            self.db.get_variation(ids["Ledyba"])["last_known_qty"], 3
-        )
+
+        # Module A records what it asked for, and must leave eBay's own figure
+        # alone until an Active Listings sync moves it.
+        variation = self.db.get_variation(ids["Ledyba"])
+        self.assertEqual(variation["pending_qty"], 3)
+        self.assertEqual(variation["last_known_qty"], 0,
+                         "generating a CSV must not claim eBay was updated")
 
     def test_full_dump_revises_absent_cards_to_zero(self):
         """A card missing from a full dump has sold out and must be pulled."""
@@ -2119,9 +2139,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         # Blank price means "do not change the price"; this row is about stock.
         self.assertEqual(zeroed[0]["Price"], "")
 
-        self.assertEqual(
-            self.db.get_variation(ids["Heracross"])["last_known_qty"], 0
-        )
+        variation = self.db.get_variation(ids["Heracross"])
+        self.assertEqual(variation["pending_qty"], 0, "we asked eBay for zero")
         catalogued = {r["product_name"]: r["quantity"]
                       for r in self.db.export_all_manifest()}
         self.assertEqual(catalogued["Heracross"], 0)
@@ -2130,13 +2149,23 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         ), "the operator must be told which cards were pulled")
 
     def test_absent_card_already_at_zero_is_not_re_zeroed(self):
-        """Avoid emitting a pointless Revise row on every later upload."""
+        """
+        Avoid a pointless Revise row on every later upload, while still
+        re-asking until eBay confirms. The first smaller dump has something to
+        zero because the full dump left a non-zero request outstanding.
+        """
         self._seed_live_dump()
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="d0.csv",
+                          force=True)
+
         smaller = chr(10).join(self.FULL_DUMP.splitlines()[:3]) + chr(10)
-        process_batch_csv(smaller, self.db, source_name="d1.csv")
+        first = process_batch_csv(smaller, self.db, source_name="d1.csv")
+        self.assertEqual(first["zeroed_count"], 1)
+
         again = process_batch_csv(smaller, self.db, source_name="d2.csv",
                                   force=True)
-        self.assertEqual(again["zeroed_count"], 0)
+        self.assertEqual(again["zeroed_count"], 0,
+                         "zero is already the outstanding request")
 
     def test_add_mode_does_not_zero_absent_cards(self):
         """
@@ -2293,6 +2322,115 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
                 self.db.calculate_price(base),
                 f"base={base}",
             )
+    # -- Module A must not touch eBay's reported figures -------------------
+
+    def test_module_a_never_moves_the_ebay_mirror(self):
+        """
+        The dashboard's "On eBay" figures come only from an Active Listings
+        sync. Generating a CSV is not evidence that eBay was updated, and
+        pretending otherwise hides the drift the two columns exist to show.
+        """
+        ids = self._seed_live_dump()
+        mid = ids["Ledyba"]
+
+        # Pretend eBay reported 7 at the last sync.
+        self.db.upsert_variation(mid, "227511361186", 7,
+                                 custom_label=f"{mid}-Bin_A-1")
+        before = self.db.get_stats()
+
+        for mode in ("set", "add"):
+            process_batch_csv(self.FULL_DUMP, self.db,
+                              source_name=f"{mode}.csv", force=True,
+                              quantity_mode=mode)
+            after = self.db.get_stats()
+            self.assertEqual(
+                after["total_stock"], before["total_stock"],
+                f"{mode} mode moved Copies on eBay",
+            )
+            self.assertEqual(
+                after["active_listings"], before["active_listings"],
+                f"{mode} mode moved Cards on eBay",
+            )
+            self.assertEqual(
+                self.db.get_variation(mid)["last_known_qty"], 7,
+                f"{mode} mode overwrote eBay's reported quantity",
+            )
+
+        # On Hand did change, which is Module A's business.
+        self.assertGreater(self.db.get_stats()["total_on_hand"], 0)
+
+    def test_a_sync_clears_the_outstanding_request(self):
+        """
+        Once eBay reports back, what we asked for is history -- otherwise the
+        UI would keep showing a pending change that has already landed.
+        """
+        ids = self._seed_live_dump()
+        mid = ids["Ledyba"]
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="d.csv",
+                          force=True)
+        self.assertEqual(self.db.get_variation(mid)["pending_qty"], 3)
+
+        report = (
+            "Item number,Custom label,Available quantity,Title" + chr(10)
+            + f"227511361186,{mid},3,Chilling Reign: Pick Your Card" + chr(10)
+        )
+        sync_active_listings_csv(report, self.db)
+
+        variation = self.db.get_variation(mid)
+        self.assertEqual(variation["last_known_qty"], 3, "now eBay has told us")
+        self.assertIsNone(variation["pending_qty"], "nothing outstanding")
+        self.assertEqual(self.db.get_stats()["total_stock"], 3)
+
+    def test_pending_is_exposed_to_the_inventory_view(self):
+        """The UI needs it to explain why On Hand and On eBay disagree."""
+        self._seed_live_dump()
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="d.csv",
+                          force=True)
+        rows = {r["product_name"]: r
+                for r in self.db.get_inventory(limit=50)}
+        self.assertEqual(rows["Ledyba"]["quantity"], 3)
+        self.assertEqual(rows["Ledyba"]["last_known_qty"], 0)
+        self.assertEqual(rows["Ledyba"]["pending_qty"], 3)
+    def test_sync_zeroes_cards_missing_from_the_report(self):
+        """
+        A linked card absent from an Active Listings report is not live on
+        eBay any more. Keeping its old figure would report stock eBay does not
+        have -- the same failure as Module A writing the column speculatively.
+        """
+        ids = self._seed_live_dump()
+        header = "Item number,Custom label,Available quantity,Title"
+        both = (header + chr(10)
+                + f"227511361186,{ids['Ledyba']},3,Pick Your Card" + chr(10)
+                + f"227511361186,{ids['Heracross']},2,Pick Your Card" + chr(10))
+        sync_active_listings_csv(both, self.db)
+        self.assertEqual(self.db.get_stats()["total_stock"], 5)
+
+        # Heracross sold out and dropped off the report.
+        only_ledyba = (header + chr(10)
+                       + f"227511361186,{ids['Ledyba']},3,Pick Your Card" + chr(10))
+        res = sync_active_listings_csv(only_ledyba, self.db)
+
+        self.assertEqual(res["delisted_count"], 1)
+        self.assertEqual(
+            self.db.get_variation(ids["Heracross"])["last_known_qty"], 0
+        )
+        self.assertEqual(self.db.get_stats()["total_stock"], 3)
+        self.assertTrue(any(
+            "no longer has it" in lg["message"] for lg in res["logs"]
+        ))
+
+        # Idempotent: already zero, so nothing more to report.
+        again = sync_active_listings_csv(only_ledyba, self.db)
+        self.assertEqual(again["delisted_count"], 0)
+
+    def test_sync_does_not_zero_cards_it_has_never_linked(self):
+        """A card with no listing link cannot be delisted from one."""
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="d.csv")
+        header = "Item number,Custom label,Available quantity,Title"
+        res = sync_active_listings_csv(header + chr(10), self.db)
+        self.assertEqual(res["delisted_count"], 0)
+        self.assertEqual(self.db.get_stats()["total_on_hand"], 5,
+                         "on-hand is Module A's and must be untouched")
 
 if __name__ == "__main__":
     unittest.main()

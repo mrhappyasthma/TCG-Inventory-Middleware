@@ -859,20 +859,21 @@ def process_batch_csv(
             if replace_quantities:
                 new_consolidated_qty = file_totals[manifest_id]
                 qty_note = f"= {new_consolidated_qty}"
-            elif dry_run:
-                # The batch has already been applied, so the mirror already
-                # includes it; adding again would overstate the file.
-                new_consolidated_qty = prev_qty
-                qty_note = f"+{quantity} => Total {new_consolidated_qty}"
             else:
-                new_consolidated_qty = prev_qty + quantity
+                # Accumulate on whatever we most recently asked eBay for, or on
+                # eBay's own figure if nothing is outstanding. Reading only
+                # last_known_qty would make two scan batches uploaded before a
+                # sync both start from the same base, losing the first one.
+                outstanding = variation.get("pending_qty")
+                base_qty = prev_qty if outstanding is None else int(outstanding)
+                new_consolidated_qty = base_qty + file_totals[manifest_id]
                 qty_note = f"+{quantity} => Total {new_consolidated_qty}"
 
             if not dry_run:
-                db.upsert_variation(
-                    manifest_id, ebay_item_id, new_consolidated_qty,
-                    custom_label=revise_label,
-                )
+                # Record what we are asking for -- NOT what eBay reports. Only
+                # a Module B sync may move last_known_qty, because until this
+                # file is uploaded eBay knows nothing about it.
+                db.set_pending_quantity(manifest_id, new_consolidated_qty)
 
             revise_entry = {
                 "Action": "Revise",
@@ -1074,8 +1075,15 @@ def process_batch_csv(
             live_id = live["manifest_id"]
             if live_id in file_totals:
                 continue
-            if int(live.get("last_known_qty") or 0) == 0:
-                # Already at zero on eBay; nothing to say.
+            outstanding = live.get("pending_qty")
+            believed_qty = (
+                int(live.get("last_known_qty") or 0)
+                if outstanding is None
+                else int(outstanding)
+            )
+            if believed_qty == 0:
+                # Already zero on eBay, or already asked to be. Re-emitting the
+                # row on every dump would be noise.
                 continue
 
             item_id = str(live["ebay_parent_id"]).strip()
@@ -1094,7 +1102,8 @@ def process_batch_csv(
             zeroed_count += 1
 
             if not dry_run:
-                db.upsert_variation(live_id, item_id, 0, custom_label=label)
+                # Same rule: we are asking eBay for zero, not observing it.
+                db.set_pending_quantity(live_id, 0)
                 db.set_manifest_quantity(live_id, 0)
 
             logs.append({
@@ -1103,8 +1112,8 @@ def process_batch_csv(
                     f"[SOLD OUT] #{item_id} [{label}] "
                     f"{live.get('product_name') or live_id} "
                     f"({live.get('set_name') or '?'} | {live.get('condition') or '?'}) "
-                    f"is not in this dump, so its eBay quantity is set to 0 "
-                    f"(was {live.get('last_known_qty')})."
+                    f"is not in this dump, so the file asks eBay to set it to "
+                    f"0 (eBay currently reports {live.get('last_known_qty')})."
                 ),
             })
 

@@ -24,6 +24,7 @@ def sync_active_listings_csv(
     skipped_unlabelled_count = 0
     skipped_unmapped_count = 0
     linked_item_ids = set()
+    seen_manifest_ids = set()
 
     lines = [line for line in csv_text.splitlines() if line.strip()]
     if not lines:
@@ -147,16 +148,44 @@ def sync_active_listings_csv(
         )
         synced_count += 1
         linked_item_ids.add(effective_item_id)
+        seen_manifest_ids.add(manifest_id)
 
         logs.append({
             "level": "SUCCESS",
             "message": f"Synced [{manifest_id}] {manifest_card['product_name']} -> eBay #{effective_item_id} (Live Qty: {quantity})",
         })
 
+    # A card linked to a listing but absent from the report is not live on eBay
+    # any more -- it sold out, or the listing ended. Leaving its last known
+    # quantity in place would keep reporting stock eBay does not have, which is
+    # the same failure as Module A writing this column speculatively. Only a
+    # sync may set it, and this is a sync.
+    delisted_count = 0
+    for live in db.get_live_variations():
+        if live["manifest_id"] in seen_manifest_ids:
+            continue
+        if int(live.get("last_known_qty") or 0) == 0:
+            continue
+        db.upsert_variation(live["manifest_id"], live["ebay_parent_id"], 0)
+        delisted_count += 1
+        logs.append({
+            "level": "WARN",
+            "message": (
+                f"[{live['manifest_id']}] {live.get('product_name') or '?'} "
+                f"({live.get('set_name') or '?'} | {live.get('condition') or '?'}) "
+                f"is not in this Active Listings report, so eBay no longer has "
+                f"it. Its live quantity is now 0 (was {live.get('last_known_qty')})."
+            ),
+        })
+
     summary = [
         f"Sync complete: {synced_count} variation(s) updated "
         f"across {len(linked_item_ids)} eBay listing(s)"
     ]
+    if delisted_count:
+        summary.append(
+            f"{delisted_count} card(s) no longer on eBay set to 0"
+        )
     if skipped_parent_count:
         summary.append(f"{skipped_parent_count} variation parent row(s) ignored")
     if skipped_unlabelled_count:
@@ -172,6 +201,7 @@ def sync_active_listings_csv(
 
     return {
         "synced_count": synced_count,
+        "delisted_count": delisted_count,
         "linked_listing_count": len(linked_item_ids),
         "skipped_parent_count": skipped_parent_count,
         "skipped_unlabelled_count": skipped_unlabelled_count,
