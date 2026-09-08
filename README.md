@@ -649,6 +649,44 @@ already linked keeps its eBay item number and quantity.
   *(Matches SortSwift's official ⭐ Recommended `skuId` deduction import specification.)*
 
 
+## 🗂️ Workspace tabs
+
+The three working views share one tabbed area so the page stays a fixed height
+rather than growing with your catalog:
+
+| Tab | Shows |
+|---|---|
+| **Live Store Inventory** | The master catalog joined with live eBay links. Default view. |
+| **eBay Listings** | Your live listings as eBay sees them, rolled up per item number. |
+| **Terminal Console** | The operational log. |
+
+Because the console can now be hidden, its tab carries an **unread counter** of
+log lines that arrived while you were elsewhere, and the badge turns red if any
+of them was an error — otherwise a failure could land on an invisible tab and go
+unnoticed. Opening the tab clears it.
+
+### eBay Listings
+
+Derived from the store mirror rather than stored separately: the mirror is keyed
+by card, so this groups by eBay item number to show the store the way eBay
+presents it.
+
+| Column | Meaning |
+|---|---|
+| **eBay Item #** | Links to the live listing. |
+| **Expansion Set** / **Condition** | Taken from the cards on the listing. If a listing spans more than one, it says so in amber rather than showing only the first. |
+| **Cards** | How many catalog cards are linked to this listing. |
+| **Catalog Qty** | What your catalog holds across those cards. |
+| **Live Qty** | What eBay last reported. Amber when it disagrees with Catalog Qty. |
+| **Last Synced** | When Module B last touched this listing. |
+
+The view is empty until a Module B sync has linked something, and refreshes
+automatically after each sync. A listing spanning several sets or conditions is
+usually a sign the grouping went wrong, which is why it is flagged rather than
+hidden.
+
+---
+
 ## 🖥️ Live Store Inventory table
 
 | Column | Behaviour |

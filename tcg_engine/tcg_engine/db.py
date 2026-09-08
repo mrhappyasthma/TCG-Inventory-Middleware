@@ -726,6 +726,40 @@ class Database:
             return "", []
         return " WHERE " + " AND ".join(clauses) + " ", params
 
+    def get_ebay_listings(self) -> List[Dict[str, Any]]:
+        """
+        One row per live eBay listing, aggregated from the store mirror.
+
+        The mirror is keyed by card, so a multi-variation listing appears as
+        many rows sharing an ebay_parent_id. Grouping by that id gives the
+        store as eBay sees it: how many cards each listing carries, what eBay
+        reports it holding, and what the catalog thinks it holds. A gap between
+        the last two is the same drift the inventory table highlights, rolled
+        up to the listing.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    v.ebay_parent_id                        AS ebay_parent_id,
+                    COUNT(*)                               AS card_count,
+                    COALESCE(SUM(v.last_known_qty), 0)     AS live_quantity,
+                    COALESCE(SUM(m.quantity), 0)           AS catalog_quantity,
+                    COUNT(DISTINCT m.set_name)             AS set_count,
+                    MIN(m.set_name)                        AS set_name,
+                    COUNT(DISTINCT m.condition)            AS condition_count,
+                    MIN(m.condition)                       AS condition,
+                    MAX(v.updated_at)                      AS last_synced
+                FROM ebay_variations v
+                JOIN manifest m ON m.manifest_id = v.manifest_id
+                WHERE COALESCE(v.ebay_parent_id, '') != ''
+                GROUP BY v.ebay_parent_id
+                ORDER BY MAX(v.updated_at) DESC, v.ebay_parent_id ASC
+                """
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
     def get_distinct_set_names(self) -> List[Dict[str, Any]]:
         """
         Every expansion set present in the catalog, with how many cards each

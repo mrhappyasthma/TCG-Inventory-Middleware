@@ -1511,6 +1511,68 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(row["Product Name"], "Ledyba")
         self.assertEqual(row["Quantity"], "2")
 
+    # ------------------------------------------------------------------
+    # eBay Listings roll-up
+    # ------------------------------------------------------------------
+
+    def test_ebay_listings_is_empty_before_any_sync(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        # Cards exist but nothing is linked, so there are no listings to show.
+        self.assertEqual(self.db.get_ebay_listings(), [])
+
+    def test_ebay_listings_groups_variations_by_item_number(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        by_name = {c["product_name"]: c["manifest_id"]
+                   for c in self.db.export_all_manifest()}
+
+        # Two cards on one listing, one card on another.
+        self.db.upsert_variation(by_name["Ledyba"], "111222333444", 3)
+        self.db.upsert_variation(by_name["Heracross"], "111222333444", 2)
+        self.db.upsert_variation(by_name["Deerling"], "555666777888", 1)
+
+        listings = {l["ebay_parent_id"]: l for l in self.db.get_ebay_listings()}
+        self.assertEqual(set(listings), {"111222333444", "555666777888"})
+
+        multi = listings["111222333444"]
+        self.assertEqual(multi["card_count"], 2)
+        self.assertEqual(multi["live_quantity"], 5)      # 3 + 2 from eBay
+        self.assertEqual(multi["catalog_quantity"], 5)   # 3 + 2 catalogued
+        self.assertEqual(multi["set_name"], "Chilling Reign")
+        self.assertEqual(multi["set_count"], 1)
+        self.assertEqual(multi["condition_count"], 1)
+        self.assertTrue(multi["last_synced"])
+
+        single = listings["555666777888"]
+        self.assertEqual(single["card_count"], 1)
+        # Catalogued 5, eBay reports 1: the drift the view highlights.
+        self.assertEqual(single["catalog_quantity"], 5)
+        self.assertEqual(single["live_quantity"], 1)
+
+    def test_ebay_listings_flags_a_listing_spanning_several_sets(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        by_name = {c["product_name"]: c["manifest_id"]
+                   for c in self.db.export_all_manifest()}
+
+        # Cards from two different sets sharing one listing should be visible
+        # as such rather than silently reported as the first set only.
+        self.db.upsert_variation(by_name["Ledyba"], "999", 1)
+        self.db.upsert_variation(by_name["Deerling"], "999", 1)
+
+        listing = self.db.get_ebay_listings()[0]
+        self.assertEqual(listing["card_count"], 2)
+        self.assertEqual(listing["set_count"], 2)
+
+    def test_ebay_listings_ignores_rows_with_no_item_number(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        by_name = {c["product_name"]: c["manifest_id"]
+                   for c in self.db.export_all_manifest()}
+        self.db.upsert_variation(by_name["Ledyba"], "111222333444", 1)
+        self.db.upsert_variation(by_name["Heracross"], "", 4)
+
+        listings = self.db.get_ebay_listings()
+        self.assertEqual(len(listings), 1)
+        self.assertEqual(listings[0]["card_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -502,6 +502,17 @@ def get_inventory_endpoint(
     }
 
 
+@app.get("/api/ebay-listings")
+def get_ebay_listings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
+    """
+    Live eBay listings, rolled up from the store mirror.
+
+    Derived rather than stored: the mirror is keyed by card, so this groups by
+    eBay item number to show the store the way eBay presents it.
+    """
+    return {"listings": db.get_ebay_listings()}
+
+
 @app.get("/api/inventory/sets")
 def get_inventory_sets(user: Dict[str, Any] = Depends(require_active_user)):
     """

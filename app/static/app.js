@@ -24,6 +24,7 @@ let storedGeneratedCSVs = {
 
 // Initialize Application
 document.addEventListener("DOMContentLoaded", () => {
+    switchWorkspaceTab("inventory");
     initAuth();
     setupDropzones();
     setupTableListeners();
@@ -885,6 +886,9 @@ async function handleSyncUpload(file) {
         document.getElementById("syncSummaryText").innerText =
             `Synced ${data.synced_count} variation(s) across ${listings} listing(s)`;
 
+        // The listings view is derived from what this just wrote.
+        fetchEbayListings();
+
         fetchStats();
         fetchSetFilter();
         fetchInventory();
@@ -1269,12 +1273,155 @@ function getConditionBadgeClass(condition) {
 }
 
 // -------------------------------------------------------------------
+// WORKSPACE TABS
+// -------------------------------------------------------------------
+
+const WORKSPACE_TABS = {
+    inventory: { panel: "panelInventory", button: "tabBtnInventory" },
+    listings: { panel: "panelListings", button: "tabBtnListings" },
+    console: { panel: "panelConsole", button: "tabBtnConsole" },
+};
+
+const TAB_ACTIVE = "text-white border-brand-500";
+const TAB_IDLE = "text-slate-400 hover:text-slate-200 border-transparent";
+
+let activeWorkspaceTab = "inventory";
+// Log lines that arrived while the console was hidden. Without this, an error
+// would land on an invisible tab and never be noticed.
+let consoleUnread = 0;
+let consoleUnreadHasError = false;
+
+function switchWorkspaceTab(key) {
+    if (!WORKSPACE_TABS[key]) return;
+    activeWorkspaceTab = key;
+
+    for (const [name, ids] of Object.entries(WORKSPACE_TABS)) {
+        const panel = document.getElementById(ids.panel);
+        const button = document.getElementById(ids.button);
+        const active = name === key;
+        if (panel) panel.classList.toggle("hidden", !active);
+        if (button) {
+            button.className =
+                "workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg "
+                + "border-b-2 transition-colors "
+                + (active ? TAB_ACTIVE : TAB_IDLE);
+        }
+    }
+
+    if (key === "console") {
+        clearConsoleUnread();
+        const box = document.getElementById("terminalLogBox");
+        if (box) box.scrollTop = box.scrollHeight;
+    }
+    // Listings are derived from the store mirror, so refetch on entry rather
+    // than showing whatever was true when the page loaded.
+    if (key === "listings") fetchEbayListings();
+}
+
+function clearConsoleUnread() {
+    consoleUnread = 0;
+    consoleUnreadHasError = false;
+    const badge = document.getElementById("consoleUnreadBadge");
+    if (badge) badge.classList.add("hidden");
+}
+
+function noteConsoleActivity(level) {
+    if (activeWorkspaceTab === "console") return;
+    consoleUnread += 1;
+    if (level === "ERROR") consoleUnreadHasError = true;
+
+    const badge = document.getElementById("consoleUnreadBadge");
+    if (!badge) return;
+    badge.innerText = consoleUnread > 99 ? "99+" : String(consoleUnread);
+    badge.className =
+        "ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold font-mono align-middle "
+        + (consoleUnreadHasError
+            ? "bg-rose-900 text-rose-100"
+            : "bg-slate-700 text-slate-200");
+}
+
+// -------------------------------------------------------------------
+// EBAY LISTINGS VIEW
+// -------------------------------------------------------------------
+
+async function fetchEbayListings() {
+    const tbody = document.getElementById("ebayListingsTableBody");
+    const summary = document.getElementById("ebayListingsSummary");
+    if (!tbody) return;
+
+    try {
+        const res = await fetch("/api/ebay-listings");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to load listings");
+
+        const listings = data.listings || [];
+        if (!listings.length) {
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="7" class="py-8 text-center text-slate-500">
+                        No linked eBay listings yet. Upload an Active Listings report
+                        to Module B to link your catalog to live listings.
+                    </td>
+                </tr>`;
+            if (summary) summary.innerText = "0 listings";
+            return;
+        }
+
+        tbody.innerHTML = listings.map(l => {
+            const drifted = l.catalog_quantity !== l.live_quantity;
+            const liveBadge = drifted
+                ? "bg-amber-950/80 text-amber-300 border border-amber-800"
+                : "bg-emerald-950/80 text-emerald-400 border border-emerald-800";
+            const driftTitle = drifted
+                ? `Catalogued ${l.catalog_quantity}, eBay reports ${l.live_quantity}.`
+                : "Catalogued quantity matches eBay.";
+
+            // A listing should hold one set and one condition; say so when it
+            // does not, rather than silently showing only the first.
+            const setLabel = l.set_count > 1
+                ? `<span class="text-amber-300" title="This listing spans ${l.set_count} sets">${escapeHtml(l.set_name)} +${l.set_count - 1} more</span>`
+                : escapeHtml(l.set_name || "-");
+            const condLabel = l.condition_count > 1
+                ? `<span class="text-amber-300" title="This listing spans ${l.condition_count} conditions">${escapeHtml(l.condition)} +${l.condition_count - 1} more</span>`
+                : escapeHtml(l.condition || "-");
+
+            return `
+                <tr class="hover:bg-dark-800/80 transition-colors">
+                    <td class="py-3 px-4 font-mono">
+                        <a href="${EBAY_ITEM_URL}${encodeURIComponent(l.ebay_parent_id)}" target="_blank" rel="noopener noreferrer" class="text-accent-cyan hover:underline" title="Open the eBay listing">${escapeHtml(l.ebay_parent_id)}</a>
+                    </td>
+                    <td class="py-3 px-4 text-slate-400">${setLabel}</td>
+                    <td class="py-3 px-4">${condLabel}</td>
+                    <td class="py-3 px-4 text-center font-mono text-slate-300">${l.card_count}</td>
+                    <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
+                        <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono bg-slate-900 text-slate-400 border border-slate-800">${l.catalog_quantity}</span>
+                    </td>
+                    <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
+                        <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${liveBadge}">${l.live_quantity}</span>
+                    </td>
+                    <td class="py-3 px-4 text-slate-500 text-[11px] font-mono">${escapeHtml(l.last_synced || "-")}</td>
+                </tr>`;
+        }).join("");
+
+        const cards = listings.reduce((n, l) => n + l.card_count, 0);
+        const live = listings.reduce((n, l) => n + l.live_quantity, 0);
+        if (summary) {
+            summary.innerText =
+                `${listings.length} listing(s), ${cards} linked card(s), ${live} unit(s) live on eBay`;
+        }
+    } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="7" class="py-6 text-center text-rose-400">Failed to load listings: ${escapeHtml(err.message)}</td></tr>`;
+    }
+}
+
+// -------------------------------------------------------------------
 // 4. TERMINAL LOG CONSOLE
 // -------------------------------------------------------------------
 
 function logToTerminal(level, message) {
     const consoleBox = document.getElementById("terminalLogBox");
     const now = new Date().toLocaleTimeString();
+    noteConsoleActivity(level);
 
     let levelColor = "text-slate-400";
     let badgeClass = "text-slate-400";
@@ -1308,6 +1455,7 @@ function logToTerminal(level, message) {
 function clearConsoleLogs() {
     const consoleBox = document.getElementById("terminalLogBox");
     consoleBox.innerHTML = `<div class="text-slate-500">[SYSTEM] Terminal logs cleared.</div>`;
+    clearConsoleUnread();
 }
 
 function escapeHtml(str) {
