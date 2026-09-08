@@ -9,10 +9,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy dependency specifications
 COPY requirements.txt .
-COPY tcg_engine/ ./tcg_engine/
 
-# Install python dependencies and core tcg-engine library
-RUN pip install --no-cache-dir -r requirements.txt
+# The engine is staged and installed OUTSIDE the workdir on purpose. Its repo
+# layout is tcg_engine/tcg_engine/, so copying the outer directory into /app
+# would leave /app/tcg_engine present at runtime; Python then imports
+# "tcg_engine" as a namespace package pointing at that directory, shadowing the
+# installed distribution. Submodules still resolve, so it appears to work until
+# something imports the package itself.
+COPY tcg_engine/ /src/tcg_engine/
+RUN pip install --no-cache-dir /src/tcg_engine \
+ && grep -v '^-e ' requirements.txt > /tmp/requirements-web.txt \
+ && pip install --no-cache-dir -r /tmp/requirements-web.txt \
+ && rm -rf /src /tmp/requirements-web.txt
 
 # Copy application files
 COPY app/ ./app/

@@ -2,5 +2,10 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
 pydantic>=2.0.0
-google-auth>=2.35.0
+# The [requests] extra is required: google.auth.transport.requests, which
+# verify_oauth2_token needs, imports the requests library and google-auth
+# does not depend on it otherwise. Without the extra the app imports fine
+# on a machine that happens to have requests installed and fails on a
+# clean one, such as the container.
+google-auth[requests]>=2.35.0
 -e ./tcg_engine

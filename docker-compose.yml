@@ -8,8 +8,12 @@ services:
       # port directly: Google Sign-In cannot authorize a raw IP or plain HTTP origin.
       - "${HOST_PORT:-8080}:8080"
     volumes:
-      # Maps persistent data directory on Synology NAS (adjust path if needed)
-      - /volume1/docker/tcg-middleware:/data
+      # Databases and the session secret live in ./data beside this file, so the
+      # whole deployment is one folder. Relative to the project directory rather
+      # than an absolute /volume1 path, which keeps the file portable. NOTE: if
+      # this pointed at the project root instead, the databases would be written
+      # among the source files.
+      - ./data:/data
     environment:
       - DATABASE_URL=/data/inventory.db
       - USER_DATABASE_URL=/data/users.db
