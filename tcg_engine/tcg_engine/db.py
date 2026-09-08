@@ -539,6 +539,65 @@ class Database:
             row = cursor.fetchone()
             return row["quantity"] if row else 0
 
+    def find_manifest_by_identity(
+        self, product_name: str, card_number: str = ""
+    ) -> List[Dict[str, Any]]:
+        """
+        Find catalog cards by name, optionally narrowed by card number.
+
+        Used to recover the catalog-to-eBay link when manifest IDs have
+        diverged: the card's identity is the only reliable join left. Returns
+        every match so the caller can refuse to act on an ambiguous one rather
+        than guessing.
+        """
+        name = self._normalize(product_name)
+        number = str(card_number or "").strip()
+
+        sql = "SELECT * FROM manifest WHERE LOWER(product_name) = LOWER(?)"
+        params: List[Any] = [name]
+        if number:
+            sql += " AND LOWER(COALESCE(card_number, '')) = LOWER(?)"
+            params.append(number)
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            return [dict(r) for r in cursor.fetchall()]
+
+    def rename_manifest(self, old_id: str, new_id: str) -> bool:
+        """
+        Change a card's manifest ID, carrying any store-mirror row with it.
+
+        The ID is referenced by ebay_variations, so both tables are updated in
+        one transaction. Foreign keys are disabled for the duration because the
+        constraint is declared ON DELETE CASCADE, which does not help an
+        UPDATE and would reject the intermediate state.
+        """
+        old = str(old_id).strip()
+        new = str(new_id).strip()
+        if not old or not new or old == new:
+            return False
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=OFF;")
+            cursor.execute("BEGIN IMMEDIATE;")
+            try:
+                cursor.execute(
+                    "UPDATE manifest SET manifest_id = ? WHERE manifest_id = ?",
+                    (new, old),
+                )
+                changed = cursor.rowcount > 0
+                cursor.execute(
+                    "UPDATE ebay_variations SET manifest_id = ? WHERE manifest_id = ?",
+                    (new, old),
+                )
+                conn.commit()
+                return changed
+            except Exception:
+                conn.rollback()
+                raise
+
     def get_variation(self, manifest_id: str) -> Optional[Dict[str, Any]]:
         """Get live eBay variation details for a manifest_id."""
         with self.get_connection() as conn:

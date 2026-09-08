@@ -249,6 +249,9 @@ python -m tcg_engine.cli sync active_listings.csv --db data/inventory.db
 # Export Master Catalog
 python -m tcg_engine.cli export-manifest -o master_manifest.csv --db data/inventory.db
 
+# Recover the catalog-to-eBay link after a rebuild (see below)
+python -m tcg_engine.cli relink active_listings.csv --db data/inventory.db
+
 # Purge the catalog for a clean test run (see below)
 python -m tcg_engine.cli purge --db data/inventory.db
 ```
@@ -595,9 +598,34 @@ the bare `Action` header. Those were the parts most at risk of being wrong.
   | *custom label(s) not found in the master catalog* | **Worth investigating** — a live listing references a manifest ID your catalog no longer has. |
 
 * ⚠️ **Manifest IDs are the join key** between the catalog and your live
-  listings. Running `purge` while a listing is live orphans it: every row will
-  come back as "not found in the master catalog". Sync before purging, or end the
-  listing first.
+  listings. Running `purge` while a listing is live orphans it: every row comes
+  back as "not found in the master catalog" and the sync reports 0 updated.
+
+### 🔗 Recovering the link after a purge (`relink`)
+
+If the catalog was rebuilt while listings were already live, the new manifest
+IDs will not match the Custom Labels eBay holds. Rather than re-creating the
+listings, realign the **catalog** to the labels already published — the listing
+is the externally visible artefact, a manifest ID is an internal detail:
+
+```powershell
+python -m tcg_engine.cli relink active_listings.csv --db data/inventory.db
+```
+
+It matches each live variation to a catalog card using the listing's own
+variation details (`Card=Ledyba (004/198)`), renames the card's manifest ID to
+the one in the label, and then runs the Module C sync automatically. Pass
+`--no-sync` to only realign.
+
+It is deliberately conservative and will skip rather than guess:
+
+* A card it cannot find in the catalog is reported, not invented.
+* A name matching **several** catalog cards is left alone as ambiguous.
+* If the target ID is already used by a different card, it refuses and says so.
+* Running it twice is a no-op; the second run reports everything already correct.
+
+Renaming carries any existing store-mirror row with it, so a card that was
+already linked keeps its eBay item number and quantity.
 
 ---
 

@@ -8,6 +8,7 @@ from tcg_engine.db import Database
 from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import process_batch_csv
 from tcg_engine.sync import sync_active_listings_csv
+from tcg_engine.relink import relink_from_active_listings, parse_option_name
 
 
 class TestTCGEngine(unittest.TestCase):
@@ -1265,6 +1266,101 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertTrue(
             any("not in Master Catalog" in l["message"] for l in res["logs"])
         )
+
+    # ------------------------------------------------------------------
+    # Recovering the catalog-to-eBay link after IDs diverge
+    # ------------------------------------------------------------------
+
+    DIVERGED_REPORT = """Item number,Title,Variation details,Custom label (SKU),Available quantity
+"227511361186",Pick Your Card,Card=Ledyba (004/198);Heracross (006/198),,"3"
+"227511361186",Pick Your Card,Card=Ledyba (004/198),ID1050-C-1,"1"
+"227511361186",Pick Your Card,Card=Heracross (006/198),ID1037-C-1,"2"
+"""
+
+    def _rebuilt_catalog(self):
+        """A catalog rebuilt after a purge: same cards, different IDs."""
+        self.db.insert_manifest(
+            "ID1001", "Ledyba", "SWSH06: Chilling Reign", "NM", "Normal",
+            card_number="004/198")
+        self.db.insert_manifest(
+            "ID1002", "Heracross", "SWSH06: Chilling Reign", "NM", "Normal",
+            card_number="006/198")
+
+    def test_option_name_parsing(self):
+        self.assertEqual(parse_option_name("Ledyba (004/198)"), ("Ledyba", "004/198"))
+        self.assertEqual(
+            parse_option_name("Rapid Strike Scroll of the Skies (151/198)"),
+            ("Rapid Strike Scroll of the Skies", "151/198"),
+        )
+        self.assertEqual(parse_option_name("Blissey V (TG12/TG30)"), ("Blissey V", "TG12/TG30"))
+        # No number at all.
+        self.assertEqual(parse_option_name("Mystery Promo"), ("Mystery Promo", ""))
+
+    def test_sync_fails_before_relink_when_ids_diverge(self):
+        self._rebuilt_catalog()
+        res = sync_active_listings_csv(self.DIVERGED_REPORT, self.db)
+        self.assertEqual(res["synced_count"], 0)
+        self.assertEqual(res["skipped_unmapped_count"], 2)
+
+    def test_relink_realigns_ids_then_sync_succeeds(self):
+        self._rebuilt_catalog()
+
+        rl = relink_from_active_listings(self.DIVERGED_REPORT, self.db)
+        self.assertEqual(rl["renamed_count"], 2)
+        self.assertEqual(rl["unmatched_count"], 0)
+
+        # The catalog now uses the IDs eBay already has.
+        self.assertIsNotNone(self.db.get_manifest_by_id("ID1050"))
+        self.assertIsNotNone(self.db.get_manifest_by_id("ID1037"))
+        self.assertIsNone(self.db.get_manifest_by_id("ID1001"))
+
+        # Same cards, nothing lost.
+        names = {c["product_name"] for c in self.db.export_all_manifest()}
+        self.assertEqual(names, {"Ledyba", "Heracross"})
+
+        res = sync_active_listings_csv(self.DIVERGED_REPORT, self.db)
+        self.assertEqual(res["synced_count"], 2)
+        self.assertEqual(res["skipped_unmapped_count"], 0)
+
+    def test_relink_is_idempotent(self):
+        self._rebuilt_catalog()
+        relink_from_active_listings(self.DIVERGED_REPORT, self.db)
+        again = relink_from_active_listings(self.DIVERGED_REPORT, self.db)
+        self.assertEqual(again["renamed_count"], 0)
+        self.assertEqual(again["already_linked_count"], 2)
+
+    def test_relink_refuses_when_the_target_id_is_taken(self):
+        self._rebuilt_catalog()
+        # A different card already occupies ID1050.
+        self.db.insert_manifest(
+            "ID1050", "Some Other Card", "Other Set", "NM", "Normal",
+            card_number="999/198")
+
+        rl = relink_from_active_listings(self.DIVERGED_REPORT, self.db)
+        self.assertEqual(rl["conflict_count"], 1)
+        # The occupant is untouched and Ledyba keeps its original ID.
+        self.assertEqual(
+            self.db.get_manifest_by_id("ID1050")["product_name"], "Some Other Card"
+        )
+        self.assertIsNotNone(self.db.get_manifest_by_id("ID1001"))
+
+    def test_relink_skips_cards_it_cannot_identify(self):
+        # Empty catalog: nothing to match the listing against.
+        rl = relink_from_active_listings(self.DIVERGED_REPORT, self.db)
+        self.assertEqual(rl["renamed_count"], 0)
+        self.assertEqual(rl["unmatched_count"], 2)
+
+    def test_rename_carries_the_store_mirror_row(self):
+        self._rebuilt_catalog()
+        self.db.upsert_variation("ID1001", "227511361186", 7)
+
+        self.db.rename_manifest("ID1001", "ID1050")
+
+        self.assertIsNone(self.db.get_variation("ID1001"))
+        moved = self.db.get_variation("ID1050")
+        self.assertIsNotNone(moved)
+        self.assertEqual(moved["ebay_parent_id"], "227511361186")
+        self.assertEqual(moved["last_known_qty"], 7)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ import sys
 from .db import Database
 from .orders import process_orders_file
 from .batches import process_batch_file
-from .sync import sync_active_listings_file
+from .sync import sync_active_listings_file, sync_active_listings_csv
+from .relink import relink_from_file
 
 
 def _get_db(db_path: str) -> Database:
@@ -84,6 +85,28 @@ def handle_export_manifest(args):
         writer.writeheader()
         writer.writerows(items)
     print(f"Exported {len(items)} catalog records to: {output_path}")
+
+
+def handle_relink(args):
+    """Realign catalog manifest IDs to the labels on live eBay listings."""
+    db = _get_db(args.db)
+    print(f"Relinking catalog against: {args.input_file}")
+    result = relink_from_file(args.input_file, db)
+    for log in result["logs"]:
+        print(f"[{log['level']}] {log['message']}")
+
+    if not args.no_sync:
+        print()
+        print("Running Module C sync with the realigned IDs...")
+        sync = sync_active_listings_file(args.input_file, db)
+        for log in sync["logs"]:
+            if log["level"] != "SUCCESS":
+                print(f"[{log['level']}] {log['message']}")
+        print()
+        print(
+            f"Synced {sync['synced_count']} variation(s) across "
+            f"{sync.get('linked_listing_count', 0)} listing(s)."
+        )
 
 
 def handle_purge(args):
@@ -190,6 +213,20 @@ def main():
     )
     p_sync.add_argument("input_file", help="Path to eBay Active Listings report CSV")
     p_sync.set_defaults(func=handle_sync)
+
+    # relink
+    p_relink = subparsers.add_parser(
+        "relink",
+        parents=[db_parent],
+        help="Realign catalog manifest IDs to the Custom Labels on live eBay listings",
+    )
+    p_relink.add_argument("input_file", help="Path to eBay Active Listings report CSV")
+    p_relink.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Only realign the IDs; do not run the Module C sync afterwards",
+    )
+    p_relink.set_defaults(func=handle_relink)
 
     # purge
     p_purge = subparsers.add_parser(
