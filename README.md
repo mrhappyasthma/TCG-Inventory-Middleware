@@ -305,6 +305,12 @@ remove and exits.
 
 Pricing is driven entirely by the rules stored in the `pricing_rules` table, which you edit from the **Pricing Rules** screen on the dashboard. **The database is the source of truth** — the figures below are only the defaults the app ships with, and they stop being accurate the moment you edit a tier.
 
+**Pricing rules and listing settings are per-user.** Each signed-in account has
+its own set, so two people sharing an instance can list the same catalog at
+different prices, under different titles, against different eBay business
+policies. See [Per-user rules](#-per-user-rules) for how inheritance and reset
+work.
+
 * **Rule Types Supported**:
   1. **Fixed Base Price ($)** (`fixed`) — the card is listed at a flat price, ignoring its market value.
   2. **Market Price + Diff ($)** (`markup_fixed`) — adds a fixed dollar amount to the base price.
@@ -800,34 +806,90 @@ an error indicator.
 
 ---
 
+## 👥 Per-user rules
+
+**Pricing rules** and **listing settings** belong to the account that saved
+them. The catalog is shared — one manifest ID per card, for everyone — but no
+computed eBay price is ever stored in it. Prices exist only in the generated
+CSV, which is why per-user pricing cannot put two users in conflict: each gets
+their own file from the same shared inventory.
+
+Listing settings are per-user for a plainer reason. The postal code, the
+shipping/return/payment profile names and the title template all describe *your*
+eBay seller account, and there is no sensible single value for them once more
+than one person is listing.
+
+### Inheritance and reset
+
+Both tables carry a `user_id`, and **scope `0` is the shared baseline**. A real
+user id is never 0, because SQLite `AUTOINCREMENT` starts at 1.
+
+* A user who has never saved **inherits** the shared baseline. The dialog shows
+  a `SHARED DEFAULTS` badge.
+* The first save writes their **own** copy, scoped to their id. The badge
+  changes to `YOURS`, and nobody else's rules move.
+* **Reset Defaults** deletes their own rows so they inherit again. On the shared
+  baseline itself there is nothing above it to inherit, so a reset there
+  rewrites the shipped defaults.
+
+The two tables differ in how they resolve, deliberately:
+
+| | Resolution |
+|---|---|
+| `pricing_rules` | **All or nothing.** The rules partition a price range; a half-inherited set could leave gaps or overlaps. |
+| `listing_settings` | **Merged key by key.** Overriding your postal code should not mean re-entering the other ten fields, and you should still pick up a setting added by a later migration. |
+
+Editing either is **no longer admin-only** — the rules are yours, and saving
+them cannot change anyone else's output. Only the shared inventory and the
+database files remain administrative.
+
+Databases created before this change have all their existing rows migrated into
+scope `0`, so whatever you had configured becomes the baseline everyone
+inherits rather than being replaced by raw shipped defaults.
+
+The command line has no signed-in user, so `tcg-engine` reads and writes the
+shared baseline.
+
+---
+
 ## 💾 Backup and restore
 
-The inventory database holds more than the CSV export can carry: the catalog,
-eBay links, catalogued quantities, pricing rules, listing settings and cover
-photo overrides.
-
-Both live behind the **Database** button in the top navigation, which appears
-for administrators only and carries an `ADMIN` badge. The endpoints enforce that
-too — hiding the button is not the control, and a non-admin request returns
-`403` whether or not the button was ever on screen.
+Everything lives behind the **Database** button in the top navigation, which
+appears for administrators only and carries an `ADMIN` badge. The endpoints
+enforce that too — hiding the button is not the control, and a non-admin request
+returns `403` whether or not the button was ever on screen.
 
 ### Backup
 
-**Download backup** produces `tcg-inventory-<timestamp>.db`.
+The panel lists **every database file the deployment owns**, each with its own
+download button, plus **Download all (.zip)** for the lot:
 
-Taken server-side with `VACUUM INTO`, which checkpoints the write-ahead log into
-the file. This matters: both databases run in **WAL mode**, so copying a `.db`
-by hand can capture a database whose most recent commits are still sitting in a
-`-wal` sidecar. The download can never be stale that way, and needs no sidecar
-files alongside it.
+| File | Holds |
+|---|---|
+| `tcg-inventory-<timestamp>.db` | Catalog, eBay links, catalogued quantities, per-user pricing rules and listing settings, cover photo overrides |
+| `tcg-users-<timestamp>.db` | Google accounts, roles, approval status. No passwords and no OAuth secrets — sign-in is delegated to Google |
 
-User accounts are **not** included — they live in a separate `users.db`, and the
-session secret is a separate file again.
+The zip also contains a `README.txt` describing each member, because a bare pair
+of `.db` files is not self-describing six months later.
+
+Every snapshot is taken server-side with `VACUUM INTO`, which checkpoints the
+write-ahead log into the output. This matters: both databases run in **WAL
+mode**, so copying a `.db` by hand can capture a database whose most recent
+commits are still sitting in a `-wal` sidecar. A downloaded snapshot can never
+be stale that way, and needs no sidecar files alongside it.
+
+The session secret is a separate file again and is in neither database.
 
 ### Restore
 
 **Restore** replaces the inventory database from a backup file. It replaces the
 data **every** user sees, so it is not a personal action.
+
+Restore covers the **inventory database only**. Uploading a `users.db` is
+deliberately not offered: replacing the account table can change who holds
+admin, or remove your own account, locking you out of the instance that would
+let you undo it. To move accounts, copy `users.db` into place with the container
+stopped.
 
 The flow is deliberately two-step:
 
@@ -861,7 +923,7 @@ delete it and the next Google sign-in becomes admin.
 
 All master catalog cards, live eBay item links, and user accounts are saved under the mounted data volume:
 
-* `/data/inventory.db` &rarr; Catalog, live store mirror, pricing rules, listing settings, batch fingerprints
+* `/data/inventory.db` &rarr; Catalog, live store mirror, per-user pricing rules and listing settings, batch fingerprints
 * `/data/users.db` &rarr; User accounts & admin privileges
 * `/data/.session_secret` &rarr; Auto-generated session-signing secret (only if `JWT_SECRET` is not set)
 

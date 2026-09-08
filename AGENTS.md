@@ -60,6 +60,7 @@
 ---
 
 * **The inventory is shared, not per-user.** There is no owner column on a card, so both backup and restore are administrative and live behind the admin-only Database panel. Enforce it on the endpoint, not just by hiding the control.
+* **Pricing rules and listing settings *are* per-user.** Both tables carry a `user_id`, and `SHARED_SCOPE = 0` is the baseline a user inherits until their first save. Never add a query against either table that omits the scope: an unscoped `DELETE` or `SELECT` silently mixes every user's rules together. Thread the caller's `user["id"]` from the endpoint down through `process_batch_csv`; the engine's default of `SHARED_SCOPE` exists for the command line, which has no signed-in user, and is the wrong thing for a request. Pricing rules resolve all-or-nothing, listing settings merge key by key -- see the README for why.
 * **Both databases run in WAL mode.** Never copy a `.db` file directly to snapshot it -- recent commits may still be in a `-wal` sidecar. Use `VACUUM INTO`, which checkpoints into a single self-contained file.
 
 ---

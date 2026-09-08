@@ -5,7 +5,7 @@ import os
 import re
 from typing import Dict, Any, List, Optional
 from .csvtools import find_column as _find_column, read_csv_text, strip_bom
-from .db import Database
+from .db import Database, SHARED_SCOPE
 
 
 # eBay File Exchange / Seller Hub Headers
@@ -378,6 +378,7 @@ def process_batch_csv(
     source_name: str = "batch.csv",
     force: bool = False,
     dry_run: bool = False,
+    user_id: int = SHARED_SCOPE,
 ) -> Dict[str, Any]:
     """
     Process fresh SortSwift inventory batch CSV.
@@ -394,6 +395,13 @@ def process_batch_csv(
     Revise quantities are additive, so processing the same export twice would
     double the live stock. Uploads are therefore fingerprinted and a repeat is
     refused unless ``force`` is set.
+
+    ``user_id`` selects whose pricing rules and listing settings to apply.
+    Both are per-user, so two sellers can process the same export and each get
+    their own prices, title template and business policy names. The catalogue
+    itself is shared, but no computed price is stored in it -- prices live only
+    in the generated CSV -- so per-user rules cannot conflict there. Defaults to
+    the shared baseline, which is what the command line uses.
 
     ``dry_run`` regenerates the output files **without writing anything**: no
     catalogue entries, no quantity accumulation, no store-mirror updates and no
@@ -417,25 +425,38 @@ def process_batch_csv(
     skipped_count = 0
 
     # Load configuration settings
-    single_threshold = float(db.get_listing_setting("single_threshold", "5.00"))
+    single_threshold = float(
+        db.get_listing_setting("single_threshold", "5.00", user_id=user_id)
+    )
     title_template = db.get_listing_setting(
         "variation_title_template",
         DEFAULT_VARIATION_TITLE_TEMPLATE,
+        user_id=user_id,
     )
-    category_id = db.get_listing_setting("category_id", "183454")
-    descriptor_style = db.get_listing_setting("condition_descriptor_style", "label_id")
-    postal_code = str(db.get_listing_setting("seller_postal_code", "")).strip()
-    default_game = str(db.get_listing_setting("default_game", "")).strip()
+    category_id = db.get_listing_setting("category_id", "183454", user_id=user_id)
+    descriptor_style = db.get_listing_setting(
+        "condition_descriptor_style", "label_id", user_id=user_id
+    )
+    postal_code = str(
+        db.get_listing_setting("seller_postal_code", "", user_id=user_id)
+    ).strip()
+    default_game = str(
+        db.get_listing_setting("default_game", "", user_id=user_id)
+    ).strip()
     option_template = db.get_listing_setting(
-        "variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE
+        "variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE, user_id=user_id
     )
-    cover_image_url = str(db.get_listing_setting("cover_image_url", "")).strip()
+    cover_image_url = str(
+        db.get_listing_setting("cover_image_url", "", user_id=user_id)
+    ).strip()
 
     # Only emit policy columns that are actually configured; a blank policy
     # name is worse than an absent column.
     active_policies = {}
     for setting_key, column in POLICY_SETTING_COLUMNS:
-        value = str(db.get_listing_setting(setting_key, "")).strip()
+        value = str(
+            db.get_listing_setting(setting_key, "", user_id=user_id)
+        ).strip()
         if value:
             active_policies[column] = value
 
@@ -446,7 +467,9 @@ def process_batch_csv(
     # Populated once the uploaded file's headers are known.
     item_specific_columns: Dict[str, str] = {}
     add_headers = ADD_HEADERS + list(active_policies) + [GAME_ITEM_SPECIFIC]
-    group_by_set = str(db.get_listing_setting("group_by_set", "true")).strip().lower() not in (
+    group_by_set = str(
+        db.get_listing_setting("group_by_set", "true", user_id=user_id)
+    ).strip().lower() not in (
         "false",
         "0",
         "no",
@@ -608,7 +631,9 @@ def process_batch_csv(
         if ebay_price_val > 0:
             effective_price = ebay_price_val
         else:
-            effective_price, _ = db.calculate_price(raw_base_price)
+            effective_price, _ = db.calculate_price(
+                raw_base_price, user_id=user_id
+            )
 
         if not product_name or not set_name:
             skipped_count += 1
@@ -1013,6 +1038,7 @@ def process_batch_file(
     add_output_path: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
+    user_id: int = SHARED_SCOPE,
 ) -> Dict[str, Any]:
     """Process a SortSwift batch CSV file from disk."""
     content = read_csv_text(input_path)
@@ -1022,6 +1048,7 @@ def process_batch_file(
         source_name=os.path.basename(input_path),
         force=force,
         dry_run=dry_run,
+        user_id=user_id,
     )
     if revise_output_path and result["revise_count"] > 0:
         with open(revise_output_path, "w", encoding="utf-8", newline="") as f:

@@ -1,6 +1,8 @@
+import io
 import os
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -283,6 +285,149 @@ class TestWebApp(unittest.TestCase):
             json={"settings": {"single_threshold": "5.00", "group_by_set": "true"}},
         )
 
+    # -- per-user rules ----------------------------------------------------
+
+    def approved_non_admin_client(self):
+        """
+        A second signed-in session, in its own client so the cookie jars do
+        not collide. Reuses the account test_04 already approved.
+        """
+        other = TestClient(app)
+        with mock.patch(
+            "app.main.verify_google_id_token",
+            return_value=google_claims("google-sub-second", "second@example.com",
+                                       "Second User"),
+        ):
+            res = other.post("/api/auth/google", json={"id_token": "stub-token"})
+        self.assertEqual(res.json()["user"]["role"], "user")
+        self.assertEqual(res.json()["user"]["status"], "active")
+        return other
+
+    def test_15_rules_are_per_user_and_not_admin_gated(self):
+        """
+        A non-admin may edit their own rules, and doing so must not touch the
+        admin's. Both endpoints were admin-only before rules became per-user.
+        """
+        other = self.approved_non_admin_client()
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        before = self.client.get("/api/pricing-rules").json()
+        self.assertFalse(before["is_own"], "the admin has not saved their own")
+
+        res = other.post("/api/pricing-rules", json={"rules": [
+            {"min_price": 0.0, "max_price": None, "rule_type": "fixed",
+             "rule_value": 9.99, "sort_order": 1},
+        ]})
+        self.assertEqual(res.status_code, 200, "a non-admin may save their own")
+        self.assertTrue(res.json()["is_own"])
+
+        self.assertEqual(
+            other.post("/api/pricing-rules/preview",
+                       json={"price": 0.30}).json()["calculated_price"], 9.99)
+        self.assertEqual(
+            self.client.post("/api/pricing-rules/preview",
+                             json={"price": 0.30}).json()["calculated_price"], 2.49)
+        self.assertEqual(self.client.get("/api/pricing-rules").json()["rules"],
+                         before["rules"], "the admin's rules must not move")
+
+        # Reset gives the inherited set back.
+        undone = other.post("/api/pricing-rules/reset").json()
+        self.assertFalse(undone["is_own"])
+        self.assertEqual(
+            other.post("/api/pricing-rules/preview",
+                       json={"price": 0.30}).json()["calculated_price"], 2.49)
+
+        # Anonymous callers are still refused.
+        anon = TestClient(app)
+        self.assertEqual(anon.post("/api/pricing-rules",
+                                   json={"rules": []}).status_code, 401)
+
+    def test_15b_listing_settings_merge_per_user(self):
+        """One override must not hide the inherited keys, and reset undoes it."""
+        other = self.approved_non_admin_client()
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        baseline_zip = db.get_listing_setting("seller_postal_code")
+
+        self.assertEqual(
+            other.post("/api/listing-settings",
+                       json={"settings": {"seller_postal_code": "10001"}}
+                       ).status_code, 200, "a non-admin may save their own")
+
+        mine = other.get("/api/listing-settings").json()
+        theirs = self.client.get("/api/listing-settings").json()
+        self.assertEqual(mine["settings"]["seller_postal_code"], "10001")
+        self.assertIn("seller_postal_code", mine["own_keys"])
+        self.assertNotIn("seller_postal_code", theirs["own_keys"])
+        self.assertEqual(theirs["settings"]["seller_postal_code"], baseline_zip)
+
+        # Same key set: overriding one field does not drop the inherited rest.
+        self.assertEqual(set(mine["settings"]), set(theirs["settings"]))
+
+        reset = other.post("/api/listing-settings/reset").json()
+        self.assertEqual(reset["own_keys"], [])
+        self.assertEqual(reset["settings"]["seller_postal_code"], baseline_zip)
+
+    # -- database downloads ------------------------------------------------
+
+    def test_16_every_database_file_is_downloadable_by_admin(self):
+        """Each database downloads as a real SQLite snapshot, plus a zip of all."""
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        listing = self.client.get("/api/database/files")
+        self.assertEqual(listing.status_code, 200)
+        names = {f["name"] for f in listing.json()["files"]}
+        self.assertEqual(names, {"inventory", "users"})
+        for entry in listing.json()["files"]:
+            for key in ("label", "description", "filename", "size_bytes",
+                        "summary"):
+                self.assertIn(key, entry)
+
+        magic = b"SQLite format 3" + bytes([0])
+        for name in ("inventory", "users"):
+            res = self.client.get("/api/database/download/" + name)
+            self.assertEqual(res.status_code, 200, name)
+            self.assertTrue(res.content.startswith(magic), name)
+            self.assertIn("attachment",
+                          res.headers.get("content-disposition", ""))
+
+        self.assertEqual(
+            self.client.get("/api/database/download/nope").status_code, 404)
+
+        bundle = self.client.get("/api/database/bundle")
+        self.assertEqual(bundle.status_code, 200)
+        self.assertEqual(bundle.headers["content-type"], "application/zip")
+        with zipfile.ZipFile(io.BytesIO(bundle.content)) as archive:
+            self.assertIsNone(archive.testzip())
+            members = archive.namelist()
+            self.assertIn("README.txt", members)
+            dbs = [m for m in members if m.endswith(".db")]
+            self.assertEqual(len(dbs), 2)
+            for member in dbs:
+                self.assertTrue(archive.read(member).startswith(magic), member)
+
+    def test_17_database_downloads_require_admin(self):
+        """Approved is not enough; every download is administrative."""
+        other = self.approved_non_admin_client()
+
+        for path in ("/api/database/files",
+                     "/api/database/download/inventory",
+                     "/api/database/download/users",
+                     "/api/database/bundle",
+                     "/api/inventory/database"):
+            self.assertEqual(other.get(path).status_code, 403, path)
+
+        anon = TestClient(app)
+        for path in ("/api/database/files", "/api/database/bundle"):
+            self.assertEqual(anon.get(path).status_code, 401, path)
+
+        # Restore stays admin-only too.
+        self.assertEqual(
+            other.post("/api/inventory/database",
+                       files={"file": ("x.db", b"x", "application/octet-stream")},
+                       data={"confirm": "false"}).status_code, 403)
+
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
 
 if __name__ == "__main__":
     unittest.main()

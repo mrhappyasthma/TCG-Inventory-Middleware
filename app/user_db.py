@@ -206,3 +206,29 @@ class UserDatabase:
             cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
             conn.commit()
             return cursor.rowcount > 0
+
+    def count_users(self) -> int:
+        """How many accounts the database holds, for backup summaries."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) AS count FROM users")
+            return int(cursor.fetchone()["count"])
+
+    def export_snapshot(self, dest_path: str) -> str:
+        """
+        Write a consistent single-file copy of the user database.
+
+        Mirrors the inventory database's exporter: VACUUM INTO checkpoints the
+        write-ahead log into the output, so the result carries every committed
+        change and needs no -wal/-shm sidecars. Copying users.db by hand while
+        the app is running can miss the most recent sign-in.
+        """
+        dest = os.path.abspath(dest_path)
+        parent = os.path.dirname(dest)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+        if os.path.exists(dest):
+            os.remove(dest)
+        with self.get_connection() as conn:
+            conn.execute("VACUUM INTO ?", (dest,))
+        return dest

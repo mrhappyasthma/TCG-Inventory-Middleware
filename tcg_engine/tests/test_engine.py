@@ -1794,6 +1794,207 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.db.set_listing_cover_image("123", "https://cdn/x.jpg")
         self.assertEqual(self.db.get_listing_cover_image("123"), "https://cdn/x.jpg")
 
+    # -- per-user pricing rules and listing settings -----------------------
+
+    def test_pricing_rules_are_scoped_per_user(self):
+        """A user's own rules must not disturb the shared baseline."""
+        baseline = self.db.get_pricing_rules()
+        self.assertGreaterEqual(len(baseline), 4)
+        self.assertFalse(self.db.has_own_pricing_rules(7))
+
+        # A user with nothing of their own inherits the baseline.
+        self.assertEqual(self.db.get_pricing_rules(user_id=7), baseline)
+
+        self.db.set_pricing_rules(
+            [{"min_price": 0.0, "max_price": None,
+              "rule_type": "fixed", "rule_value": 9.99, "sort_order": 1}],
+            user_id=7,
+        )
+        self.assertTrue(self.db.has_own_pricing_rules(7))
+
+        own = self.db.get_pricing_rules(user_id=7)
+        self.assertEqual(len(own), 1)
+        self.assertEqual(own[0]["rule_value"], 9.99)
+
+        # Neither the baseline nor an unrelated user moved.
+        self.assertEqual(self.db.get_pricing_rules(), baseline)
+        self.assertEqual(self.db.get_pricing_rules(user_id=8), baseline)
+
+        # Prices follow the scope.
+        self.assertEqual(self.db.calculate_price(0.30, user_id=7)[0], 9.99)
+        self.assertEqual(self.db.calculate_price(0.30, user_id=8)[0], 2.49)
+        self.assertEqual(self.db.calculate_price(0.30)[0], 2.49)
+
+    def test_pricing_rules_reset_restores_inheritance(self):
+        """Reset drops a user's own set; the baseline rewrites shipped defaults."""
+        baseline = self.db.get_pricing_rules()
+        self.db.set_pricing_rules(
+            [{"min_price": 0.0, "max_price": None,
+              "rule_type": "fixed", "rule_value": 4.44, "sort_order": 1}],
+            user_id=7,
+        )
+        after = self.db.reset_default_pricing_rules(user_id=7)
+        self.assertFalse(self.db.has_own_pricing_rules(7))
+        self.assertEqual(after, baseline)
+
+        # On the shared scope there is nothing to inherit, so defaults are
+        # written back instead.
+        self.db.set_pricing_rules(
+            [{"min_price": 0.0, "max_price": None,
+              "rule_type": "fixed", "rule_value": 4.44, "sort_order": 1}]
+        )
+        restored = self.db.reset_default_pricing_rules()
+        self.assertEqual(len(restored), len(self.db.SHIPPED_PRICING_RULES))
+        self.assertEqual(self.db.calculate_price(0.30)[0], 2.49)
+
+    def test_listing_settings_merge_and_reset_per_user(self):
+        """Settings merge key by key, so one override does not hide the rest."""
+        self.db.set_listing_settings({"seller_postal_code": "94305"})
+        shared = self.db.get_listing_settings()
+
+        self.db.set_listing_settings({"seller_postal_code": "10001"}, user_id=7)
+
+        own = self.db.get_listing_settings(user_id=7)
+        self.assertEqual(own["seller_postal_code"], "10001")
+        self.assertEqual(self.db.get_listing_settings()["seller_postal_code"], "94305")
+        self.assertEqual(
+            self.db.get_listing_settings(user_id=8)["seller_postal_code"], "94305"
+        )
+
+        # Every other key is still inherited, and none went missing.
+        self.assertEqual(set(own), set(shared))
+        for key, value in shared.items():
+            if key != "seller_postal_code":
+                self.assertEqual(own[key], value, key)
+
+        self.assertEqual(self.db.get_own_listing_setting_keys(7), ["seller_postal_code"])
+        self.assertEqual(self.db.get_own_listing_setting_keys(8), [])
+
+        # Single-key reads honour the same precedence.
+        self.assertEqual(
+            self.db.get_listing_setting("seller_postal_code", user_id=7), "10001"
+        )
+        self.assertEqual(
+            self.db.get_listing_setting("seller_postal_code", user_id=8), "94305"
+        )
+
+        self.db.reset_listing_settings(user_id=7)
+        self.assertEqual(self.db.get_own_listing_setting_keys(7), [])
+        self.assertEqual(
+            self.db.get_listing_setting("seller_postal_code", user_id=7), "94305"
+        )
+
+    def test_batch_uses_the_uploaders_own_rules(self):
+        """Module A must price with the caller's rules, not the baseline."""
+        csv_text = (
+            '"Game","Set","Card Number","Name","Market Price","Condition",'
+            '"Language","Printing","Quantity","*ConditionID"' + chr(10)
+            + '"Pokemon","Chilling Reign","004/198","Ledyba","0.30","NM",'
+            '"English","Normal",3,"4000"' + chr(10)
+        )
+        # Catalogue once so the rows have manifest IDs to emit.
+        process_batch_csv(csv_text, self.db, source_name="seed.csv")
+
+        self.db.set_pricing_rules(
+            [{"min_price": 0.0, "max_price": None,
+              "rule_type": "fixed", "rule_value": 9.99, "sort_order": 1}],
+            user_id=7,
+        )
+
+        shared = process_batch_csv(
+            csv_text, self.db, source_name="a.csv", force=True, dry_run=True
+        )
+        mine = process_batch_csv(
+            csv_text, self.db, source_name="a.csv", force=True, dry_run=True,
+            user_id=7,
+        )
+        self.assertIn("2.49", shared["add_csv"])
+        self.assertIn("9.99", mine["add_csv"])
+        self.assertNotIn("9.99", shared["add_csv"])
+
+    def test_scoping_migration_preserves_an_unscoped_database(self):
+        """
+        A database written before scoping existed must migrate in place, with
+        its rows landing in the shared baseline rather than being discarded.
+
+        The fixture is built by taking a real database and stripping the
+        scoping back out, rather than by hand-writing an old schema: a
+        hand-written one drifts from what actually shipped, and would not
+        exercise the same migration path.
+        """
+        legacy = os.path.join(self.temp_dir.name, "legacy.db")
+        seeded = Database(legacy)
+        seeded.set_pricing_rules(
+            [{"min_price": 0.0, "max_price": None,
+              "rule_type": "fixed", "rule_value": 7.77, "sort_order": 1}]
+        )
+        seeded.set_listing_settings({"seller_postal_code": "02134"})
+
+        # Undo the scoping: drop user_id from both tables, restoring the old
+        # shape including listing_settings' single-column primary key.
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            PRAGMA journal_mode=DELETE;
+            DROP INDEX IF EXISTS idx_pricing_rules_user;
+
+            CREATE TABLE pr_old (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, min_price REAL NOT NULL,
+                max_price REAL, rule_type TEXT NOT NULL,
+                rule_value REAL NOT NULL, sort_order INTEGER DEFAULT 0
+            );
+            INSERT INTO pr_old
+                SELECT id, min_price, max_price, rule_type, rule_value, sort_order
+                FROM pricing_rules;
+            DROP TABLE pricing_rules;
+            ALTER TABLE pr_old RENAME TO pricing_rules;
+
+            CREATE TABLE ls_old (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO ls_old SELECT key, value FROM listing_settings;
+            DROP TABLE listing_settings;
+            ALTER TABLE ls_old RENAME TO listing_settings;
+            """
+        )
+        conn.commit()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pricing_rules)")}
+        conn.close()
+        self.assertNotIn("user_id", cols, "fixture should be unscoped")
+
+        opened = Database(legacy)
+
+        # The old configuration survived and is now the shared baseline.
+        self.assertEqual(
+            [r["rule_value"] for r in opened.get_pricing_rules()], [7.77]
+        )
+        self.assertEqual(opened.get_listing_setting("seller_postal_code"), "02134")
+        self.assertEqual(
+            opened.get_listing_setting("seller_postal_code", user_id=7), "02134"
+        )
+        self.assertEqual(opened.calculate_price(0.30, user_id=7)[0], 7.77)
+
+        with opened.get_connection() as c:
+            self.assertEqual(
+                [r[0] for r in c.execute(
+                    "SELECT DISTINCT user_id FROM pricing_rules")], [0]
+            )
+            self.assertEqual(
+                [r[0] for r in c.execute(
+                    "SELECT DISTINCT user_id FROM listing_settings")], [0]
+            )
+            pk = [r["name"] for r in
+                  c.execute("PRAGMA table_info(listing_settings)") if r["pk"]]
+        self.assertEqual(sorted(pk), ["key", "user_id"])
+
+        # Re-opening must not migrate a second time or lose anything.
+        again = Database(legacy)
+        self.assertEqual([r["rule_value"] for r in again.get_pricing_rules()], [7.77])
+
+        # And the migrated database still supports per-user overrides.
+        again.set_listing_settings({"seller_postal_code": "10001"}, user_id=7)
+        self.assertEqual(
+            again.get_listing_setting("seller_postal_code", user_id=7), "10001"
+        )
+        self.assertEqual(again.get_listing_setting("seller_postal_code"), "02134")
 
 if __name__ == "__main__":
     unittest.main()

@@ -251,10 +251,28 @@ async function loadPricingRules() {
         if (!res.ok) throw new Error(data.detail);
 
         cachedPricingRules = data.rules;
+        setScopeBadge("pricingScopeBadge", data.is_own);
         renderPricingRulesEditor();
         updateTestPricePreview();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400">Failed to load rules: ${err.message}</td></tr>`;
+    }
+}
+
+// Rules and settings are per-user, but an inherited set looks exactly like an
+// edited one. The badge is the only thing that distinguishes them, which
+// matters because resetting an inherited set does nothing visible.
+function setScopeBadge(elementId, isOwn) {
+    const badge = document.getElementById(elementId);
+    if (!badge) return;
+    if (isOwn) {
+        badge.innerText = "Yours";
+        badge.title = "You have saved your own; other users are unaffected by changes here.";
+        badge.className = "text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-brand-600/20 text-brand-400 border border-brand-500/40";
+    } else {
+        badge.innerText = "Shared defaults";
+        badge.title = "You have not customised these, so you are using the shared defaults. Saving creates your own copy.";
+        badge.className = "text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700";
     }
 }
 
@@ -349,24 +367,41 @@ async function savePricingRules() {
         if (!res.ok) throw new Error(data.detail);
 
         cachedPricingRules = data.rules;
+        setScopeBadge("pricingScopeBadge", data.is_own);
         closePricingModal();
-        logToTerminal("SUCCESS", "Updated tiered pricing rules successfully.");
+        logToTerminal("SUCCESS", "Saved your tiered pricing rules. Other users are unaffected.");
     } catch (err) {
         alert(err.message);
     }
 }
 
 async function resetDefaultPricingRules() {
-    if (!confirm("Reset pricing rules to system defaults?")) return;
+    if (!confirm("Discard your own pricing rules and go back to the shared defaults?")) return;
     try {
         const res = await fetch("/api/pricing-rules/reset", { method: "POST" });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail);
 
         cachedPricingRules = data.rules;
+        setScopeBadge("pricingScopeBadge", data.is_own);
         renderPricingRulesEditor();
         updateTestPricePreview();
-        logToTerminal("INFO", "Reset pricing rules to defaults.");
+        logToTerminal("INFO", "Your pricing rules were discarded; you are back on the shared defaults.");
+    } catch (err) {
+        alert(err.message);
+    }
+}
+
+async function resetListingSettings() {
+    if (!confirm("Discard your own listing settings and go back to the shared defaults?")) return;
+    try {
+        const res = await fetch("/api/listing-settings/reset", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail);
+
+        logToTerminal("INFO", "Your listing settings were discarded; you are back on the shared defaults.");
+        await loadListingSettings();
+        updateTitlePreview();
     } catch (err) {
         alert(err.message);
     }
@@ -428,6 +463,7 @@ async function loadListingSettings() {
         if (!res.ok) throw new Error(data.detail);
 
         const s = data.settings || {};
+        setScopeBadge("listingScopeBadge", (data.own_keys || []).length > 0);
         if (s.single_threshold) {
             document.getElementById("settingSingleThreshold").value = s.single_threshold;
         }
@@ -490,6 +526,7 @@ async function saveListingSettings(e) {
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail);
 
+        setScopeBadge("listingScopeBadge", (data.own_keys || []).length > 0);
         closeListingModal();
         if (!postalCode) {
             logToTerminal("ERROR", "No postal code set - eBay will reject Add files with error 10009 (missing Item.Location).");
@@ -502,14 +539,6 @@ async function saveListingSettings(e) {
     } catch (err) {
         alert(err.message);
     }
-}
-
-function resetListingSettings() {
-    document.getElementById("settingSingleThreshold").value = "5.00";
-    document.getElementById("settingTitleTemplate").value = "{set_name}: Pick Your Card - {condition} - Complete Your Set";
-    document.getElementById("settingGroupBySet").checked = true;
-    document.getElementById("settingDescriptorStyle").value = "label_id";
-    updateTitlePreview();
 }
 
 let titlePreviewTimer = null;
@@ -1368,6 +1397,52 @@ function openDatabaseModal() {
     document.getElementById("btnRestoreApply").disabled = true;
     document.getElementById("databaseModal").classList.remove("hidden");
     syncModalScrollLock();
+    fetchDatabaseFiles();
+}
+
+function formatBytes(bytes) {
+    const n = Number(bytes) || 0;
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// The list comes from the server rather than being hardcoded here, so adding a
+// database file in one place makes it downloadable without touching the UI.
+async function fetchDatabaseFiles() {
+    const target = document.getElementById("databaseFileList");
+    if (!target) return;
+
+    try {
+        const res = await fetch("/api/database/files");
+        if (!res.ok) throw new Error("Could not list the database files");
+        const data = await res.json();
+
+        target.innerHTML = (data.files || []).map(f => {
+            const facts = Object.entries(f.summary || {})
+                .map(([k, v]) => `${v} ${k.replace(/_/g, " ")}`)
+                .join(" &middot; ");
+            return `
+                <div class="flex items-start justify-between gap-3 p-2.5 rounded-lg bg-dark-800 border border-slate-700/70">
+                    <div class="min-w-0">
+                        <p class="font-semibold text-slate-200">${f.label}
+                            <span class="font-mono font-normal text-slate-500 ml-1">${f.filename}</span>
+                        </p>
+                        <p class="text-[11px] text-slate-400 mt-0.5">${f.description}</p>
+                        <p class="text-[10px] text-slate-500 mt-1 font-mono">${formatBytes(f.size_bytes)}${facts ? " &middot; " + facts : ""}</p>
+                    </div>
+                    <a href="/api/database/download/${encodeURIComponent(f.name)}" download
+                       class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-100 font-semibold text-[11px] transition-all">
+                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                        <span>.db</span>
+                    </a>
+                </div>`;
+        }).join("") || `<p class="text-[11px] text-slate-500">No database files found.</p>`;
+    } catch (err) {
+        target.innerHTML = `<p class="text-[11px] text-rose-300">${err.message}</p>`;
+    }
 }
 
 function closeDatabaseModal() {

@@ -684,16 +684,24 @@
             </div>
 
             <div class="space-y-4 text-xs">
-                <!-- Backup -->
-                <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-2">
-                    <p class="font-semibold text-slate-200">Backup</p>
-                    <p class="text-[11px] text-slate-400">Downloads the catalog, eBay links, catalogued quantities, pricing rules, listing settings and cover photos as a single <code class="font-mono">.db</code> file. Taken with a checkpoint, so it is never missing recent changes &mdash; unlike copying the file by hand. User accounts are in a separate database and are not included.</p>
-                    <a href="/api/inventory/database" download class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20 transition-all">
-                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                        </svg>
-                        <span>Download backup</span>
-                    </a>
+                <!-- Backup: every database file this deployment owns -->
+                <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-3">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <p class="font-semibold text-slate-200">Backup</p>
+                            <p class="text-[11px] text-slate-400 mt-1">Each file is taken with a checkpoint, so it is never missing recent changes &mdash; unlike copying it by hand while the app is running.</p>
+                        </div>
+                        <a href="/api/database/bundle" download class="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20 transition-all">
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            <span>Download all (.zip)</span>
+                        </a>
+                    </div>
+
+                    <div id="databaseFileList" class="space-y-2">
+                        <p class="text-[11px] text-slate-500">Loading database files&hellip;</p>
+                    </div>
                 </div>
 
                 <!-- Restore -->
@@ -826,10 +834,11 @@
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                             </svg>
                             Tiered Pricing Rules
+                            <span id="pricingScopeBadge" class="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">Yours</span>
                         </h3>
-                        <p class="text-xs text-slate-400 mt-1">Configure automated eBay listing prices based on TCGplayer Market Price ranges.</p>
+                        <p class="text-xs text-slate-400 mt-1">Configure automated eBay listing prices based on TCGplayer Market Price ranges. <span class="text-slate-500">These are your own rules &mdash; other users have their own.</span></p>
                     </div>
-                    <button onclick="resetDefaultPricingRules()" class="text-xs text-slate-400 hover:text-slate-200 underline">Reset Defaults</button>
+                    <button onclick="resetDefaultPricingRules()" class="text-xs text-slate-400 hover:text-slate-200 underline shrink-0">Reset Defaults</button>
                 </div>
             </div>
 
@@ -892,13 +901,18 @@
             </button>
 
             <div class="mb-5">
-                <h3 class="text-lg font-bold font-heading text-white flex items-center gap-2">
-                    <svg class="w-5 h-5 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                    </svg>
-                    Listing & Multi-Variation Grouping Rules
-                </h3>
-                <p class="text-xs text-slate-400 mt-1">Configure how cards are grouped into set-level variation drop-down listings vs standalone singles.</p>
+                <div class="flex items-start justify-between gap-3">
+                    <div>
+                        <h3 class="text-lg font-bold font-heading text-white flex items-center gap-2">
+                            <svg class="w-5 h-5 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                            </svg>
+                            Listing &amp; Multi-Variation Grouping Rules
+                            <span id="listingScopeBadge" class="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">Yours</span>
+                        </h3>
+                        <p class="text-xs text-slate-400 mt-1">Configure how cards are grouped into set-level variation drop-down listings vs standalone singles. <span class="text-slate-500">These are your own settings, including the business policy names and postal code for your eBay account.</span></p>
+                    </div>
+                </div>
             </div>
 
             <form id="listingRulesForm" onsubmit="saveListingSettings(event)" class="flex flex-col flex-1 min-h-0 text-xs">

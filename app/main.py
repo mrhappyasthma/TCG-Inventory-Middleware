@@ -5,6 +5,7 @@ import csv
 import mimetypes
 import shutil
 import tempfile
+import zipfile
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -350,6 +351,9 @@ async def process_batch_endpoint(
 
     Pass dry_run=true to rebuild the CSVs from current settings without writing
     anything to the catalogue or store mirror.
+
+    Prices and listing settings come from the signed-in user's own rules, so
+    two sellers processing the same export each get their own output.
     """
     content_bytes = await file.read()
     csv_text = decode_csv_bytes(content_bytes)
@@ -359,6 +363,7 @@ async def process_batch_endpoint(
         source_name=file.filename or "upload.csv",
         force=force,
         dry_run=dry_run,
+        user_id=user["id"],
     )
     return result
 
@@ -399,26 +404,50 @@ class PricePreviewRequest(BaseModel):
 
 @app.get("/api/pricing-rules")
 def get_pricing_rules_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """Fetch all active pricing rules."""
-    return {"rules": db.get_pricing_rules()}
+    """
+    The pricing rules that apply to the signed-in user.
+
+    Rules are per-user, so this returns the caller's own set if they have saved
+    one and the shared baseline otherwise. ``is_own`` lets the UI say which,
+    since an inherited set looks identical but resetting it does nothing.
+    """
+    return {
+        "rules": db.get_pricing_rules(user_id=user["id"]),
+        "is_own": db.has_own_pricing_rules(user["id"]),
+    }
 
 
 @app.post("/api/pricing-rules")
 def update_pricing_rules_endpoint(
     req: PricingRulesUpdateRequest,
-    admin: Dict[str, Any] = Depends(require_admin_user),
+    user: Dict[str, Any] = Depends(require_active_user),
 ):
-    """Update pricing rules (Admin only)."""
+    """
+    Save the signed-in user's own pricing rules.
+
+    No longer admin-only: the rules belong to the user, and saving them cannot
+    affect anyone else's prices. The write is scoped to the caller, so a user
+    editing theirs for the first time creates their own set rather than
+    changing the baseline others still inherit.
+    """
     rules_data = [r.model_dump() for r in req.rules]
-    db.set_pricing_rules(rules_data)
-    return {"success": True, "rules": db.get_pricing_rules()}
+    db.set_pricing_rules(rules_data, user_id=user["id"])
+    return {
+        "success": True,
+        "rules": db.get_pricing_rules(user_id=user["id"]),
+        "is_own": db.has_own_pricing_rules(user["id"]),
+    }
 
 
 @app.post("/api/pricing-rules/reset")
-def reset_pricing_rules_endpoint(admin: Dict[str, Any] = Depends(require_admin_user)):
-    """Reset pricing rules to system defaults (Admin only)."""
-    rules = db.reset_default_pricing_rules()
-    return {"success": True, "rules": rules}
+def reset_pricing_rules_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
+    """Discard the caller's own rules and inherit the shared defaults again."""
+    rules = db.reset_default_pricing_rules(user_id=user["id"])
+    return {
+        "success": True,
+        "rules": rules,
+        "is_own": db.has_own_pricing_rules(user["id"]),
+    }
 
 
 @app.post("/api/pricing-rules/preview")
@@ -427,7 +456,7 @@ def preview_pricing_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Test and preview what an eBay price would be for a given TCG price."""
-    calculated_price, rule = db.calculate_price(req.price)
+    calculated_price, rule = db.calculate_price(req.price, user_id=user["id"])
     return {
         "input_price": req.price,
         "calculated_price": calculated_price,
@@ -451,18 +480,48 @@ class TitlePreviewRequest(BaseModel):
 
 @app.get("/api/listing-settings")
 def get_listing_settings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """Fetch active listing and variation grouping settings."""
-    return {"settings": db.get_listing_settings()}
+    """
+    The listing settings that apply to the signed-in user.
+
+    These merge key by key: the shared baseline with the caller's own overrides
+    on top. ``own_keys`` names the ones the caller has actually set, so the UI
+    can distinguish an inherited value from a chosen one.
+    """
+    return {
+        "settings": db.get_listing_settings(user_id=user["id"]),
+        "own_keys": db.get_own_listing_setting_keys(user["id"]),
+    }
 
 
 @app.post("/api/listing-settings")
 def update_listing_settings_endpoint(
     req: ListingSettingsUpdateRequest,
-    admin: Dict[str, Any] = Depends(require_admin_user),
+    user: Dict[str, Any] = Depends(require_active_user),
 ):
-    """Update listing and variation grouping settings (Admin only)."""
-    db.set_listing_settings(req.settings)
-    return {"success": True, "settings": db.get_listing_settings()}
+    """
+    Save the signed-in user's own listing settings.
+
+    No longer admin-only, for the same reason as pricing rules: the title
+    template, business policy names and postal code describe the caller's own
+    eBay account, so they cannot sensibly be shared.
+    """
+    db.set_listing_settings(req.settings, user_id=user["id"])
+    return {
+        "success": True,
+        "settings": db.get_listing_settings(user_id=user["id"]),
+        "own_keys": db.get_own_listing_setting_keys(user["id"]),
+    }
+
+
+@app.post("/api/listing-settings/reset")
+def reset_listing_settings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
+    """Discard the caller's own settings and inherit the shared defaults again."""
+    settings = db.reset_listing_settings(user_id=user["id"])
+    return {
+        "success": True,
+        "settings": settings,
+        "own_keys": db.get_own_listing_setting_keys(user["id"]),
+    }
 
 
 @app.post("/api/listing-settings/preview-title")
@@ -691,6 +750,150 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
 # ---------------------------------------------------------
 # DATABASE BACKUP / RESTORE
 # ---------------------------------------------------------
+
+# Every SQLite file the deployment owns, so "download the database" can mean
+# all of it rather than just the inventory. Each entry knows how to take its
+# own consistent snapshot; a plain file copy is not safe while the app is
+# running, because both databases are in WAL mode.
+DATABASE_FILES = {
+    "inventory": {
+        "label": "Inventory",
+        "stem": "tcg-inventory",
+        "description": (
+            "Card catalogue, eBay links, catalogued quantities, per-user "
+            "pricing rules and listing settings, and cover photo overrides."
+        ),
+        "path": lambda: DATABASE_URL,
+        "export": lambda dest: db.export_snapshot(dest),
+        "summary": lambda: {
+            "cards": db.get_stats()["total_cards"],
+            "linked_to_ebay": db.get_stats()["active_listings"],
+        },
+    },
+    "users": {
+        "label": "Users",
+        "stem": "tcg-users",
+        "description": (
+            "Google accounts, roles and approval status. Contains no passwords "
+            "and no OAuth secrets -- sign-in is delegated to Google."
+        ),
+        "path": lambda: USER_DATABASE_URL,
+        "export": lambda dest: user_db.export_snapshot(dest),
+        "summary": lambda: {"accounts": user_db.count_users()},
+    },
+}
+
+
+@app.get("/api/database/files")
+def list_database_files(admin: Dict[str, Any] = Depends(require_admin_user)):
+    """
+    What is available to download, so the UI does not hardcode the list.
+
+    Admin only, matching the downloads themselves.
+    """
+    entries = []
+    for name, spec in DATABASE_FILES.items():
+        path = os.path.abspath(spec["path"]())
+        try:
+            summary = spec["summary"]()
+        except Exception:
+            # A summary is cosmetic; never let it block a backup.
+            summary = {}
+        entries.append(
+            {
+                "name": name,
+                "label": spec["label"],
+                "description": spec["description"],
+                "filename": os.path.basename(path),
+                "size_bytes": os.path.getsize(path) if os.path.exists(path) else 0,
+                "summary": summary,
+            }
+        )
+    return {"files": entries}
+
+
+@app.get("/api/database/download/{name}")
+def download_database_file(
+    name: str,
+    background: BackgroundTasks,
+    admin: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Download one database as a consistent snapshot. Admin only."""
+    spec = DATABASE_FILES.get(name)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"No such database: {name}")
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tmp_dir = tempfile.mkdtemp(prefix="tcg-snapshot-")
+    dest = os.path.join(tmp_dir, f"{spec['stem']}-{stamp}.db")
+
+    try:
+        spec["export"](dest)
+    except Exception as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500, detail=f"Could not create a snapshot: {exc}"
+        )
+
+    background.add_task(shutil.rmtree, tmp_dir, ignore_errors=True)
+    return FileResponse(
+        dest,
+        media_type="application/vnd.sqlite3",
+        filename=os.path.basename(dest),
+        background=background,
+    )
+
+
+@app.get("/api/database/bundle")
+def download_database_bundle(
+    background: BackgroundTasks,
+    admin: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Download every database in one zip. Admin only.
+
+    Each member is a VACUUM INTO snapshot rather than a copied file, so the
+    archive is internally consistent and restorable without sidecars. A short
+    README is included because a bare pair of .db files is not self-describing
+    six months later.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tmp_dir = tempfile.mkdtemp(prefix="tcg-bundle-")
+    archive = os.path.join(tmp_dir, f"tcg-databases-{stamp}.zip")
+    notes = [
+        f"TCG Inventory Middleware -- database backup taken {stamp}",
+        "",
+        "Each .db is a VACUUM INTO snapshot: complete on its own, with no",
+        "-wal or -shm sidecar needed.",
+        "",
+    ]
+
+    try:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for name, spec in DATABASE_FILES.items():
+                member = f"{spec['stem']}-{stamp}.db"
+                staged = os.path.join(tmp_dir, member)
+                spec["export"](staged)
+                bundle.write(staged, arcname=member)
+                os.remove(staged)
+                notes.append(f"{member}")
+                notes.append(f"    {spec['description']}")
+                notes.append("")
+            bundle.writestr("README.txt", chr(10).join(notes))
+    except Exception as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500, detail=f"Could not build the backup archive: {exc}"
+        )
+
+    background.add_task(shutil.rmtree, tmp_dir, ignore_errors=True)
+    return FileResponse(
+        archive,
+        media_type="application/zip",
+        filename=os.path.basename(archive),
+        background=background,
+    )
+
 
 @app.get("/api/inventory/database")
 def download_inventory_database(

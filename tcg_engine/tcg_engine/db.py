@@ -21,6 +21,14 @@ DEFAULT_SHIPPING_PROFILE = "Free Shipping Cards"
 DEFAULT_RETURN_PROFILE = "No Returns"
 DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
 
+# Pricing rules and listing settings are per-user, so every row in those two
+# tables carries the id of the user who owns it. Scope 0 is the shared baseline
+# that a user inherits until they save a change of their own; no real user can
+# ever have id 0, because SQLite AUTOINCREMENT starts at 1. A literal 0 is used
+# rather than NULL so the tables can carry a real composite primary key --
+# NULLs compare as distinct in SQLite, which would let duplicates through.
+SHARED_SCOPE = 0
+
 
 class Database:
     """
@@ -88,6 +96,7 @@ class Database:
                 """
                 CREATE TABLE IF NOT EXISTS pricing_rules (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 0,
                     min_price REAL NOT NULL,
                     max_price REAL,
                     rule_type TEXT NOT NULL,
@@ -99,8 +108,10 @@ class Database:
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS listing_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (user_id, key)
                 );
                 """
             )
@@ -173,8 +184,55 @@ class Database:
                 """
             )
             
+            # Per-user scoping migration for databases created before pricing
+            # rules and listing settings became per-user. Both tables gain a
+            # user_id defaulting to 0, so every row that already exists becomes
+            # part of the shared baseline -- which is what the operator had
+            # configured, and therefore the right thing for other users to
+            # inherit rather than raw shipped defaults.
+            cursor.execute("PRAGMA table_info(pricing_rules)")
+            if "user_id" not in {row["name"] for row in cursor.fetchall()}:
+                cursor.execute(
+                    "ALTER TABLE pricing_rules "
+                    "ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0"
+                )
+
+            # listing_settings needs its primary key widened from (key) to
+            # (user_id, key), and SQLite cannot alter a primary key in place, so
+            # the table is rebuilt. Guarded on the column being absent, which
+            # makes it run at most once.
+            cursor.execute("PRAGMA table_info(listing_settings)")
+            if "user_id" not in {row["name"] for row in cursor.fetchall()}:
+                cursor.execute(
+                    """
+                    CREATE TABLE listing_settings_scoped (
+                        user_id INTEGER NOT NULL DEFAULT 0,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        PRIMARY KEY (user_id, key)
+                    );
+                    """
+                )
+                cursor.execute(
+                    "INSERT INTO listing_settings_scoped (user_id, key, value) "
+                    "SELECT 0, key, value FROM listing_settings"
+                )
+                cursor.execute("DROP TABLE listing_settings")
+                cursor.execute(
+                    "ALTER TABLE listing_settings_scoped RENAME TO listing_settings"
+                )
+
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pricing_rules_user
+                ON pricing_rules(user_id, sort_order);
+                """
+            )
+
             # Seed default pricing rules if empty
-            cursor.execute("SELECT COUNT(*) AS count FROM pricing_rules")
+            cursor.execute(
+                    "SELECT COUNT(*) AS count FROM pricing_rules WHERE user_id = 0"
+                )
             if cursor.fetchone()["count"] == 0:
                 default_rules = [
                     (0.00, 0.25, "fixed", 1.99, 1),
@@ -184,14 +242,17 @@ class Database:
                 ]
                 cursor.executemany(
                     """
-                    INSERT INTO pricing_rules (min_price, max_price, rule_type, rule_value, sort_order)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO pricing_rules
+                        (user_id, min_price, max_price, rule_type, rule_value, sort_order)
+                    VALUES (0, ?, ?, ?, ?, ?)
                     """,
                     default_rules,
                 )
 
             # Seed default listing settings if empty
-            cursor.execute("SELECT COUNT(*) AS count FROM listing_settings")
+            cursor.execute(
+                    "SELECT COUNT(*) AS count FROM listing_settings WHERE user_id = 0"
+                )
             if cursor.fetchone()["count"] == 0:
                 default_settings = [
                     ("single_threshold", "5.00"),
@@ -211,8 +272,8 @@ class Database:
                 ]
                 cursor.executemany(
                     """
-                    INSERT INTO listing_settings (key, value)
-                    VALUES (?, ?)
+                    INSERT INTO listing_settings (user_id, key, value)
+                    VALUES (0, ?, ?)
                     """,
                     default_settings,
                 )
@@ -232,9 +293,9 @@ class Database:
             ):
                 cursor.execute(
                     """
-                    INSERT INTO listing_settings (key, value)
-                    VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET
+                    INSERT INTO listing_settings (user_id, key, value)
+                    VALUES (0, ?, ?)
+                    ON CONFLICT(user_id, key) DO UPDATE SET
                         value = excluded.value
                     WHERE listing_settings.value = ''
                       AND excluded.value != ''
@@ -1097,31 +1158,77 @@ class Database:
                 "total_stock": total_stock,
             }
 
-    def get_pricing_rules(self) -> List[Dict[str, Any]]:
-        """Get all configured pricing rules ordered by sort_order / min_price."""
+    SHIPPED_PRICING_RULES = [
+        {"min_price": 0.00, "max_price": 0.25, "rule_type": "fixed", "rule_value": 1.99, "sort_order": 1},
+        {"min_price": 0.25, "max_price": 0.50, "rule_type": "fixed", "rule_value": 2.49, "sort_order": 2},
+        {"min_price": 0.50, "max_price": 1.00, "rule_type": "fixed", "rule_value": 2.99, "sort_order": 3},
+        {"min_price": 1.00, "max_price": None, "rule_type": "markup_fixed", "rule_value": 3.00, "sort_order": 4},
+    ]
+
+    def has_own_pricing_rules(self, user_id: int = SHARED_SCOPE) -> bool:
+        """Whether this user has saved a rule set of their own."""
+        if int(user_id) == SHARED_SCOPE:
+            return True
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
+                "SELECT 1 FROM pricing_rules WHERE user_id = ? LIMIT 1",
+                (int(user_id),),
+            )
+            return cursor.fetchone() is not None
+
+    def get_pricing_rules(self, user_id: int = SHARED_SCOPE) -> List[Dict[str, Any]]:
+        """
+        The rules that apply to this user, ordered by sort_order / min_price.
+
+        A rule set is all-or-nothing: a user who has saved any rules gets
+        exactly those, and one who has not inherits the shared baseline.
+        Merging the two would be meaningless, because the rules partition a
+        price range and a half-inherited set could leave gaps or overlaps.
+        """
+        scope = int(user_id)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if scope != SHARED_SCOPE:
+                cursor.execute(
+                    "SELECT 1 FROM pricing_rules WHERE user_id = ? LIMIT 1", (scope,)
+                )
+                if cursor.fetchone() is None:
+                    scope = SHARED_SCOPE
+            cursor.execute(
                 """
-                SELECT id, min_price, max_price, rule_type, rule_value, sort_order
+                SELECT id, user_id, min_price, max_price, rule_type, rule_value, sort_order
                 FROM pricing_rules
+                WHERE user_id = ?
                 ORDER BY sort_order ASC, min_price ASC
-                """
+                """,
+                (scope,),
             )
             return [dict(row) for row in cursor.fetchall()]
 
-    def set_pricing_rules(self, rules: List[Dict[str, Any]]):
-        """Replace all pricing rules with new configuration."""
+    def set_pricing_rules(
+        self, rules: List[Dict[str, Any]], user_id: int = SHARED_SCOPE
+    ):
+        """
+        Replace this user's rule set, leaving every other scope untouched.
+
+        The delete is scoped, so a user saving their first rule set creates
+        their own copy rather than overwriting the shared baseline that
+        everyone else is still inheriting.
+        """
+        scope = int(user_id)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM pricing_rules")
+            cursor.execute("DELETE FROM pricing_rules WHERE user_id = ?", (scope,))
             for idx, r in enumerate(rules, start=1):
                 cursor.execute(
                     """
-                    INSERT INTO pricing_rules (min_price, max_price, rule_type, rule_value, sort_order)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO pricing_rules
+                        (user_id, min_price, max_price, rule_type, rule_value, sort_order)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        scope,
                         float(r.get("min_price", 0.0)),
                         float(r["max_price"]) if r.get("max_price") is not None and str(r.get("max_price")).strip() != "" else None,
                         str(r.get("rule_type", "fixed")),
@@ -1131,24 +1238,32 @@ class Database:
                 )
             conn.commit()
 
-    def reset_default_pricing_rules(self):
-        """Reset pricing rules to system defaults."""
-        default_rules = [
-            {"min_price": 0.00, "max_price": 0.25, "rule_type": "fixed", "rule_value": 1.99, "sort_order": 1},
-            {"min_price": 0.25, "max_price": 0.50, "rule_type": "fixed", "rule_value": 2.49, "sort_order": 2},
-            {"min_price": 0.50, "max_price": 1.00, "rule_type": "fixed", "rule_value": 2.99, "sort_order": 3},
-            {"min_price": 1.00, "max_price": None, "rule_type": "markup_fixed", "rule_value": 3.00, "sort_order": 4},
-        ]
-        self.set_pricing_rules(default_rules)
-        return self.get_pricing_rules()
-
-    def calculate_price(self, base_price: float) -> Tuple[float, Optional[Dict[str, Any]]]:
+    def reset_default_pricing_rules(self, user_id: int = SHARED_SCOPE):
         """
-        Calculate final eBay price based on active pricing rules.
+        Drop this scope's customisation and return the rules that now apply.
+
+        For a user this deletes their own rule set so they inherit the shared
+        baseline again. For the shared baseline itself there is nothing above
+        it to inherit, so it is rewritten from the shipped defaults.
+        """
+        scope = int(user_id)
+        if scope == SHARED_SCOPE:
+            self.set_pricing_rules(self.SHIPPED_PRICING_RULES, user_id=SHARED_SCOPE)
+        else:
+            with self.get_connection() as conn:
+                conn.execute("DELETE FROM pricing_rules WHERE user_id = ?", (scope,))
+                conn.commit()
+        return self.get_pricing_rules(user_id=scope)
+
+    def calculate_price(
+        self, base_price: float, user_id: int = SHARED_SCOPE
+    ) -> Tuple[float, Optional[Dict[str, Any]]]:
+        """
+        Calculate final eBay price using the rules that apply to this user.
         Returns: (calculated_price, matched_rule_dict)
         """
         price = float(base_price or 0.0)
-        rules = self.get_pricing_rules()
+        rules = self.get_pricing_rules(user_id=user_id)
 
         for rule in rules:
             min_p = rule["min_price"]
@@ -1179,34 +1294,109 @@ class Database:
             return round(price, 2), None
         return 1.99, None
 
-    def get_listing_settings(self) -> Dict[str, str]:
-        """Get key-value listing settings dictionary."""
+    def get_listing_settings(self, user_id: int = SHARED_SCOPE) -> Dict[str, str]:
+        """
+        The settings that apply to this user: the shared baseline with this
+        user's own overrides laid on top.
+
+        Unlike pricing rules, these merge key by key. A user who has only ever
+        changed their postal code should still pick up a new setting added by a
+        later migration, and should not have to re-enter every other field.
+        """
+        scope = int(user_id)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT key, value FROM listing_settings")
-            rows = cursor.fetchall()
-            return {row["key"]: row["value"] for row in rows}
+            cursor.execute(
+                "SELECT key, value FROM listing_settings WHERE user_id = ?",
+                (SHARED_SCOPE,),
+            )
+            merged = {row["key"]: row["value"] for row in cursor.fetchall()}
+            if scope != SHARED_SCOPE:
+                cursor.execute(
+                    "SELECT key, value FROM listing_settings WHERE user_id = ?",
+                    (scope,),
+                )
+                merged.update({row["key"]: row["value"] for row in cursor.fetchall()})
+            return merged
 
-    def set_listing_settings(self, settings: Dict[str, str]):
-        """Save listing settings."""
+    def get_own_listing_setting_keys(self, user_id: int = SHARED_SCOPE) -> List[str]:
+        """
+        The setting keys this user has overridden, as opposed to inherited.
+
+        Used by the UI to mark which fields are the user's own, so it is clear
+        what a reset would give back.
+        """
+        scope = int(user_id)
+        if scope == SHARED_SCOPE:
+            return []
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT key FROM listing_settings WHERE user_id = ? ORDER BY key",
+                (scope,),
+            )
+            return [row["key"] for row in cursor.fetchall()]
+
+    def set_listing_settings(
+        self, settings: Dict[str, str], user_id: int = SHARED_SCOPE
+    ):
+        """
+        Save settings into this user's scope only.
+
+        Writing an override even when the value equals the inherited one is
+        deliberate: it pins the value, so a later change to the shared baseline
+        does not silently move a field the user has already reviewed.
+        """
+        scope = int(user_id)
         with self.get_connection() as conn:
             cursor = conn.cursor()
             for k, v in settings.items():
                 cursor.execute(
                     """
-                    INSERT INTO listing_settings (key, value)
-                    VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    INSERT INTO listing_settings (user_id, key, value)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value
                     """,
-                    (str(k), str(v)),
+                    (scope, str(k), str(v)),
                 )
             conn.commit()
 
-    def get_listing_setting(self, key: str, default: str = "") -> str:
-        """Get a single listing setting by key."""
+    def reset_listing_settings(self, user_id: int = SHARED_SCOPE) -> Dict[str, str]:
+        """
+        Drop this user's overrides so they inherit the shared baseline again.
+
+        The shared baseline itself has nothing above it to inherit, so it is
+        left alone; there is no shipped-defaults rewrite here because init_db
+        re-seeds any key that is missing or blank on the next startup.
+        """
+        scope = int(user_id)
+        if scope != SHARED_SCOPE:
+            with self.get_connection() as conn:
+                conn.execute(
+                    "DELETE FROM listing_settings WHERE user_id = ?", (scope,)
+                )
+                conn.commit()
+        return self.get_listing_settings(user_id=scope)
+
+    def get_listing_setting(
+        self, key: str, default: str = "", user_id: int = SHARED_SCOPE
+    ) -> str:
+        """Get a single listing setting, preferring this user's override."""
+        scope = int(user_id)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT value FROM listing_settings WHERE key = ?", (key,))
+            if scope != SHARED_SCOPE:
+                cursor.execute(
+                    "SELECT value FROM listing_settings WHERE user_id = ? AND key = ?",
+                    (scope, key),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    return row["value"]
+            cursor.execute(
+                "SELECT value FROM listing_settings WHERE user_id = ? AND key = ?",
+                (SHARED_SCOPE, key),
+            )
             row = cursor.fetchone()
             return row["value"] if row else default
 
