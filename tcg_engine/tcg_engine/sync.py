@@ -139,7 +139,12 @@ def sync_active_listings_csv(
         effective_item_id = current_parent_item_id or (item_id.strip() if item_id else "UNKNOWN")
 
         # Perform atomic UPSERT into ebay_variations
-        db.upsert_variation(manifest_id, effective_item_id, quantity)
+        # eBay's own label is authoritative, and is the only place the
+        # bin/remark suffix can be learned reliably.
+        db.upsert_variation(
+            manifest_id, effective_item_id, quantity,
+            custom_label=raw_custom_label,
+        )
         synced_count += 1
         linked_item_ids.add(effective_item_id)
 

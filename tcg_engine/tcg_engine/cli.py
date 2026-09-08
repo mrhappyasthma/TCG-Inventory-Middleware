@@ -39,6 +39,7 @@ def handle_batch(args):
     result = process_batch_file(
         args.input_file, db, revise_path, add_path,
         force=args.force, dry_run=args.dry_run,
+        quantity_mode=args.quantity_mode,
     )
     for log in result["logs"]:
         print(f"[{log['level']}] {log['message']}")
@@ -202,7 +203,18 @@ def main():
     p_batch.add_argument(
         "--force",
         action="store_true",
-        help="Re-process a batch file that has already been applied (adds its quantities again)",
+        help="Re-process a file that has already been applied",
+    )
+    p_batch.add_argument(
+        "--quantity-mode",
+        choices=["set", "add"],
+        default="set",
+        help=(
+            "'set' (default): the file is a full inventory dump, so its "
+            "quantities replace what is stored and cards absent from it are "
+            "revised to 0. 'add': the file is a delta of newly scanned cards, "
+            "so its quantities are added to the running total."
+        ),
     )
     p_batch.set_defaults(func=handle_batch)
 

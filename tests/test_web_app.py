@@ -428,6 +428,60 @@ class TestWebApp(unittest.TestCase):
                        data={"confirm": "false"}).status_code, 403)
 
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+    # -- quantity mode -----------------------------------------------------
+
+    def test_18_batch_quantity_mode_is_validated_and_defaults_to_set(self):
+        """
+        The default must be the full-dump reading, and a bad value must be
+        refused rather than guessed at -- the wrong arithmetic silently
+        doubles live eBay stock on every upload.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        res = self.client.post(
+            "/api/process/batch",
+            files={"file": ("dump.csv", BATCH_CSV, "text/csv")},
+            data={"force": "true"},
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["quantity_mode"], "set")
+
+        bad = self.client.post(
+            "/api/process/batch",
+            files={"file": ("dump.csv", BATCH_CSV, "text/csv")},
+            data={"quantity_mode": "increment", "force": "true"},
+        )
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("quantity_mode", bad.json()["detail"])
+
+        ok = self.client.post(
+            "/api/process/batch",
+            files={"file": ("scan.csv", BATCH_CSV, "text/csv")},
+            data={"quantity_mode": "add", "force": "true"},
+        )
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(ok.json()["quantity_mode"], "add")
+
+    def test_19_reuploading_a_dump_does_not_inflate_quantities(self):
+        """The reported bug: a full dump added to itself on every upload."""
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        quantities = []
+        for n in range(3):
+            self.client.post(
+                "/api/process/batch",
+                files={"file": (f"dump{n}.csv", BATCH_CSV, "text/csv")},
+                data={"force": "true"},
+            )
+            rows = self.client.get("/api/inventory",
+                                   params={"limit": 200}).json()["items"]
+            match = [r for r in rows if "Deerling" in r["product_name"]]
+            self.assertTrue(match)
+            quantities.append(match[0]["quantity"])
+
+        self.assertEqual(len(set(quantities)), 1,
+                         f"quantity drifted across uploads: {quantities}")
+
 
 if __name__ == "__main__":
     unittest.main()

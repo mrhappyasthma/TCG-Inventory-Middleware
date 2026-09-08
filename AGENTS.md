@@ -55,7 +55,9 @@
 * **Variation options are sorted by card number**, numerically (4 before 16 before 133) with prefixes like `TG12` handled, and the parent's option list must stay in the same order as the child rows.
 * **eBay variation syntax**: within one attribute, values are separated by `;`; a `|` starts a *different* attribute. The parent row leaves `Relationship` **empty**; only child rows are marked `Variation`.
 * **Variation grouping key is (set, condition)**: eBay applies one ConditionID per listing, so a set holding both NM and LP cards must produce two listings.
-* **Batch quantities are additive**: Module A adds to the live store mirror, so batches are fingerprinted in `processed_batches` and a duplicate upload must be refused unless explicitly forced.
+* **Batch quantities default to *replace*, not add.** `process_batch_csv(quantity_mode=...)` takes `"set"` (a full inventory dump; the file's total replaces what is stored) or `"add"` (a scan delta). `"set"` is the default because SortSwift's inventory export is a full dump, and the additive reading added the whole inventory to itself on every upload -- a real overselling bug. Never change the default without saying so loudly. Batches are still fingerprinted in `processed_batches` so a duplicate upload is surfaced, though in `"set"` mode a repeat is harmless.
+* **In `"set"` mode, rows for one card sum before replacing.** A card in two bins is two rows with one identity, so build a per-file total keyed by `manifest_id` and emit exactly one Revise row per card. Two rows would carry `CustomLabel`s differing by bin, and only one exists on the listing.
+* **A Revise row's `CustomLabel` must be the label eBay knows**, read from `ebay_variations.custom_label`, which Module B fills in from eBay's Active Listings report. Do not rebuild it from a card's identity: the bin/remark suffix is not part of the identity and cannot be recovered. Leave `Price` blank on a zero-out row so the listed price is untouched.
 
 ---
 

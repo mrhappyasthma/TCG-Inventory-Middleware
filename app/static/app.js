@@ -814,6 +814,37 @@ async function handleOrdersUpload(file) {
     }
 }
 
+// Which arithmetic the uploaded file implies. Defaults to treating it as a
+// full inventory dump, because that is what SortSwift's inventory export is
+// and because the additive reading double-counts stock on every upload.
+function selectedQuantityMode() {
+    const picked = document.querySelector('input[name="batchQuantityMode"]:checked');
+    return picked ? picked.value : "set";
+}
+
+// "Force" means something different in each mode, so the button must not
+// promise one behaviour while doing the other.
+function syncBatchModeLabels() {
+    const isSet = selectedQuantityMode() === "set";
+    const label = document.getElementById("btnForceProcessBatchLabel");
+    if (label) {
+        label.innerText = isSet
+            ? "Force process (replaces quantities)"
+            : "Force process (adds quantities)";
+    }
+    const note = document.getElementById("batchModeNote");
+    if (note) {
+        note.innerText = isSet
+            ? "Cards live on eBay but missing from a full dump are revised down to 0."
+            : "Only use this for a file containing nothing you have already processed.";
+    }
+}
+
+document.querySelectorAll('input[name="batchQuantityMode"]').forEach(el => {
+    el.addEventListener("change", syncBatchModeLabels);
+});
+syncBatchModeLabels();
+
 // mode: "normal" | "force" | "dry-run"
 async function handleBatchUpload(file, mode = "normal") {
     if (mode === "normal") {
@@ -824,6 +855,7 @@ async function handleBatchUpload(file, mode = "normal") {
     formData.append("file", file);
     formData.append("force", mode === "force" ? "true" : "false");
     formData.append("dry_run", mode === "dry-run" ? "true" : "false");
+    formData.append("quantity_mode", selectedQuantityMode());
 
     const intent = mode === "dry-run"
         ? "rebuilding files only"
@@ -880,6 +912,9 @@ async function handleBatchUpload(file, mode = "normal") {
         if (data.add_count > 0) parts.push(`${data.add_count} to add`);
         if (data.revise_count > 0) parts.push(`${data.revise_count} to revise`);
         if (data.skipped_count > 0) parts.push(`${data.skipped_count} skipped`);
+        // Worth calling out separately: these are cards being pulled from
+        // sale, not routine revisions.
+        if (data.zeroed_count > 0) parts.push(`${data.zeroed_count} sold out → 0`);
         const suffix = data.dry_run ? " (inventory unchanged)" : "";
         document.getElementById("batchReadyText").innerText = parts.length
             ? `Files ready \u2014 ${parts.join(", ")}${suffix}`
@@ -889,6 +924,13 @@ async function handleBatchUpload(file, mode = "normal") {
             "SUCCESS",
             `[MODULE A] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}${suffix}. Click to download.`
         );
+
+        if (data.zeroed_count > 0) {
+            logToTerminal(
+                "WARN",
+                `[MODULE A] ${data.zeroed_count} card(s) live on eBay were absent from this dump and are revised to quantity 0. See the rows above for which.`
+            );
+        }
 
         // A download-only rebuild wrote nothing, so there is nothing to refresh.
         if (!data.dry_run) {

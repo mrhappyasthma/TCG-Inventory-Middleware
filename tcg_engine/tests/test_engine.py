@@ -501,17 +501,40 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
     # Catalogued quantity vs eBay's reported quantity
     # ------------------------------------------------------------------
 
-    def test_catalog_quantity_accumulates_across_batches(self):
+    def test_catalog_quantity_accumulates_in_add_mode(self):
+        """In add mode a second batch adds to the first, for scan deltas."""
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db,
+                          source_name="b1.csv", quantity_mode="add")
+        rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
+        self.assertEqual(rows["ID1001"]["quantity"], 1)
+
+        second = self.MIXED_CONDITION_BATCH.replace('"Bin-1"', '"Bin-9"')
+        process_batch_csv(second, self.db, source_name="b2.csv",
+                          quantity_mode="add")
+        rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
+        self.assertEqual(rows["ID1001"]["quantity"], 2)
+
+    def test_catalog_quantity_is_replaced_by_default(self):
+        """
+        The default treats the export as a full inventory dump, so uploading
+        it twice must not double the count. Additive semantics here were the
+        cause of a real overselling bug.
+        """
         process_batch_csv(self.MIXED_CONDITION_BATCH, self.db, source_name="b1.csv")
         rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
         self.assertEqual(rows["ID1001"]["quantity"], 1)
 
-        # A different batch adding the same card again accumulates rather than
-        # overwriting, matching the additive semantics of Module A.
         second = self.MIXED_CONDITION_BATCH.replace('"Bin-1"', '"Bin-9"')
         process_batch_csv(second, self.db, source_name="b2.csv")
         rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
-        self.assertEqual(rows["ID1001"]["quantity"], 2)
+        self.assertEqual(rows["ID1001"]["quantity"], 1,
+                         "a full dump replaces rather than accumulating")
+
+    def test_rejects_an_unknown_quantity_mode(self):
+        """A typo must fail loudly rather than silently picking a behaviour."""
+        with self.assertRaises(ValueError):
+            process_batch_csv(self.MIXED_CONDITION_BATCH, self.db,
+                              quantity_mode="increment")
 
     def test_catalog_quantity_is_independent_of_live_stock(self):
         process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
@@ -999,13 +1022,15 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             "the skip reason should explain why an ID cannot be minted",
         )
 
-    def test_dry_run_does_not_double_the_revise_quantity(self):
-        process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
+    def test_dry_run_does_not_double_the_revise_quantity_in_add_mode(self):
+        process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db,
+                          source_name="b.csv", quantity_mode="add")
         # Put a card live on eBay so the revise path is exercised.
         self.db.upsert_variation("ID1001", "998877665544", 3)
 
         res = process_batch_csv(
-            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv",
+            dry_run=True, quantity_mode="add",
         )
         revise = list(csv.DictReader(io.StringIO(res["revise_csv"])))
         self.assertTrue(revise)
@@ -1013,6 +1038,27 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         # rather than adding the batch quantity a second time.
         self.assertEqual(revise[0]["Quantity"], "3")
         self.assertEqual(self.db.get_variation("ID1001")["last_known_qty"], 3)
+
+    def test_dry_run_matches_a_real_run_in_set_mode(self):
+        """
+        With replace semantics there is no accumulation to double, so a
+        download-only run and a real run must produce the same file.
+        """
+        process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
+        self.db.upsert_variation("ID1001", "998877665544", 3)
+
+        preview = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv",
+            dry_run=True, force=True,
+        )
+        applied = process_batch_csv(
+            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", force=True,
+        )
+        self.assertEqual(preview["revise_csv"], applied["revise_csv"])
+        # The dump said 1, so the mirror is corrected down from eBay's 3.
+        revise = list(csv.DictReader(io.StringIO(applied["revise_csv"])))
+        by_label = {r["CustomLabel"]: r for r in revise}
+        self.assertIn("ID1001", str(by_label))
 
     # ------------------------------------------------------------------
     # Variation option names, ordering, and per-variation images
@@ -1995,6 +2041,143 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             again.get_listing_setting("seller_postal_code", user_id=7), "10001"
         )
         self.assertEqual(again.get_listing_setting("seller_postal_code"), "02134")
+    # -- full inventory dump semantics -------------------------------------
+
+    FULL_DUMP = (
+        '"Game","Set","Card Number","Name","Market Price","Condition",'
+        '"Language","Printing","Quantity","Remarks","*ConditionID"' + chr(10)
+        + '"Pokemon","Chilling Reign","004/198","Ledyba","0.30","NM",'
+          '"English","Normal",2,"Bin A-1","4000"' + chr(10)
+        + '"Pokemon","Chilling Reign","004/198","Ledyba","0.30","NM",'
+          '"English","Normal",1,"Bin B-7","4000"' + chr(10)
+        + '"Pokemon","Chilling Reign","006/198","Heracross","0.40","NM",'
+          '"English","Normal",2,"Bin A-2","4000"' + chr(10)
+    )
+
+    def _seed_live_dump(self):
+        """Catalogue the dump and put both cards live on eBay with labels."""
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="seed.csv")
+        ids = {r["product_name"]: r["manifest_id"]
+               for r in self.db.export_all_manifest()}
+        for name, mid in ids.items():
+            self.db.upsert_variation(
+                mid, "227511361186", 0, custom_label=f"{mid}-Bin_A-1"
+            )
+        return ids
+
+    def test_full_dump_sums_bins_but_replaces_across_uploads(self):
+        """
+        The same card in two bins is one card, so its rows sum -- but the
+        total replaces the stored value rather than adding to it. Uploading
+        the same dump repeatedly must be idempotent.
+        """
+        ids = self._seed_live_dump()
+
+        seen = []
+        for n in range(3):
+            res = process_batch_csv(
+                self.FULL_DUMP, self.db, source_name=f"d{n}.csv", force=True
+            )
+            revise = list(csv.DictReader(io.StringIO(res["revise_csv"])))
+            by_id = {r["ItemID"] + r["CustomLabel"]: r["Quantity"]
+                     for r in revise}
+            seen.append(sorted(by_id.values()))
+
+            # One row per card, not one per CSV row.
+            self.assertEqual(len(revise), 2, "one Revise row per card")
+
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(seen[1], seen[2], "uploads must be idempotent")
+
+        catalogued = {r["product_name"]: r["quantity"]
+                      for r in self.db.export_all_manifest()}
+        self.assertEqual(catalogued["Ledyba"], 3, "2 + 1 across two bins")
+        self.assertEqual(catalogued["Heracross"], 2)
+        self.assertEqual(
+            self.db.get_variation(ids["Ledyba"])["last_known_qty"], 3
+        )
+
+    def test_full_dump_revises_absent_cards_to_zero(self):
+        """A card missing from a full dump has sold out and must be pulled."""
+        ids = self._seed_live_dump()
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="d1.csv",
+                          force=True)
+
+        smaller = chr(10).join(
+            self.FULL_DUMP.splitlines()[:3]  # header + both Ledyba rows
+        ) + chr(10)
+        res = process_batch_csv(smaller, self.db, source_name="d2.csv")
+
+        self.assertEqual(res["zeroed_count"], 1)
+        revise = list(csv.DictReader(io.StringIO(res["revise_csv"])))
+        zeroed = [r for r in revise if r["Quantity"] == "0"]
+        self.assertEqual(len(zeroed), 1)
+
+        # The label must be the one eBay knows, not one rebuilt from this file.
+        self.assertEqual(zeroed[0]["CustomLabel"],
+                         f"{ids['Heracross']}-Bin_A-1")
+        # Blank price means "do not change the price"; this row is about stock.
+        self.assertEqual(zeroed[0]["Price"], "")
+
+        self.assertEqual(
+            self.db.get_variation(ids["Heracross"])["last_known_qty"], 0
+        )
+        catalogued = {r["product_name"]: r["quantity"]
+                      for r in self.db.export_all_manifest()}
+        self.assertEqual(catalogued["Heracross"], 0)
+        self.assertTrue(any(
+            "SOLD OUT" in lg["message"] for lg in res["logs"]
+        ), "the operator must be told which cards were pulled")
+
+    def test_absent_card_already_at_zero_is_not_re_zeroed(self):
+        """Avoid emitting a pointless Revise row on every later upload."""
+        self._seed_live_dump()
+        smaller = chr(10).join(self.FULL_DUMP.splitlines()[:3]) + chr(10)
+        process_batch_csv(smaller, self.db, source_name="d1.csv")
+        again = process_batch_csv(smaller, self.db, source_name="d2.csv",
+                                  force=True)
+        self.assertEqual(again["zeroed_count"], 0)
+
+    def test_add_mode_does_not_zero_absent_cards(self):
+        """
+        A scan delta says nothing about cards it omits, so add mode must
+        never pull a listing down.
+        """
+        ids = self._seed_live_dump()
+        smaller = chr(10).join(self.FULL_DUMP.splitlines()[:3]) + chr(10)
+        res = process_batch_csv(smaller, self.db, source_name="d1.csv",
+                                quantity_mode="add")
+        self.assertEqual(res["zeroed_count"], 0)
+        self.assertEqual(
+            self.db.get_variation(ids["Heracross"])["last_known_qty"], 0,
+            "seeded at 0 and left alone",
+        )
+        self.assertNotIn("SOLD OUT",
+                         chr(10).join(lg["message"] for lg in res["logs"]))
+
+    def test_sync_records_the_ebay_custom_label(self):
+        """
+        Module B is the only authoritative source of the bin suffix, since a
+        card's identity does not include it.
+        """
+        ids = self._seed_live_dump()
+        mid = ids["Ledyba"]
+        report = (
+            "Item number,Custom label,Available quantity,Title" + chr(10)
+            + f"227511361186,{mid}-Bin_ZZ-9,5,Chilling Reign: Pick Your Card"
+            + chr(10)
+        )
+        sync_active_listings_csv(report, self.db)
+        self.assertEqual(
+            self.db.get_variation(mid)["custom_label"], f"{mid}-Bin_ZZ-9"
+        )
+
+        # A caller that only knows the quantity must not erase it.
+        self.db.upsert_variation(mid, "227511361186", 4)
+        self.assertEqual(
+            self.db.get_variation(mid)["custom_label"], f"{mid}-Bin_ZZ-9"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

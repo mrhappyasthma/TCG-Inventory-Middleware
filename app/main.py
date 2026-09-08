@@ -62,6 +62,8 @@ from tcg_engine.orders import (
 from tcg_engine.batches import (
     process_batch_csv,
     build_cover_photo_revise_csv,
+    QUANTITY_MODE_SET,
+    QUANTITY_MODES,
 )
 from tcg_engine.sync import sync_active_listings_csv
 
@@ -340,6 +342,7 @@ async def process_batch_endpoint(
     file: UploadFile = File(...),
     force: bool = Form(False),
     dry_run: bool = Form(False),
+    quantity_mode: str = Form(QUANTITY_MODE_SET),
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
@@ -354,7 +357,21 @@ async def process_batch_endpoint(
 
     Prices and listing settings come from the signed-in user's own rules, so
     two sellers processing the same export each get their own output.
+
+    quantity_mode="set" (the default) treats the upload as a full inventory
+    dump and replaces quantities; "add" treats it as a delta of newly scanned
+    cards. The wrong one silently doubles live eBay stock on every upload, so
+    an unrecognised value is rejected rather than guessed at.
     """
+    if str(quantity_mode).strip().lower() not in QUANTITY_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"quantity_mode must be one of {', '.join(QUANTITY_MODES)}; "
+                f"got {quantity_mode!r}"
+            ),
+        )
+
     content_bytes = await file.read()
     csv_text = decode_csv_bytes(content_bytes)
     result = process_batch_csv(
@@ -364,6 +381,7 @@ async def process_batch_endpoint(
         force=force,
         dry_run=dry_run,
         user_id=user["id"],
+        quantity_mode=quantity_mode,
     )
     return result
 

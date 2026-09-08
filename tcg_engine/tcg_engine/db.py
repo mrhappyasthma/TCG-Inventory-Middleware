@@ -86,6 +86,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS ebay_variations (
                     manifest_id TEXT PRIMARY KEY,
                     ebay_parent_id TEXT NOT NULL,
+                    custom_label TEXT,
                     last_known_qty INTEGER DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (manifest_id) REFERENCES manifest(manifest_id) ON DELETE CASCADE
@@ -184,6 +185,17 @@ class Database:
                 """
             )
             
+            # The exact CustomLabel eBay knows for each variation. Needed to
+            # revise a listing for a card that is absent from a full inventory
+            # dump: the label we originally sent embeds the bin/remark, which
+            # is not part of a card's identity and so cannot be reconstructed
+            # reliably. Module B fills this in from eBay's own report.
+            cursor.execute("PRAGMA table_info(ebay_variations)")
+            if "custom_label" not in {row["name"] for row in cursor.fetchall()}:
+                cursor.execute(
+                    "ALTER TABLE ebay_variations ADD COLUMN custom_label TEXT"
+                )
+
             # Per-user scoping migration for databases created before pricing
             # rules and listing settings became per-user. Both tables gain a
             # user_id defaulting to 0, so every row that already exists becomes
@@ -676,7 +688,7 @@ class Database:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT manifest_id, ebay_parent_id, last_known_qty
+                SELECT manifest_id, ebay_parent_id, custom_label, last_known_qty
                 FROM ebay_variations
                 WHERE manifest_id = ?
                 """,
@@ -686,34 +698,70 @@ class Database:
             return dict(row) if row else None
 
     def upsert_variation(
-        self, manifest_id: str, ebay_parent_id: str, last_known_qty: int
+        self,
+        manifest_id: str,
+        ebay_parent_id: str,
+        last_known_qty: int,
+        custom_label: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Insert or update an ebay_variations row.
+
+        ``custom_label`` is the SKU eBay knows this variation by. Passing None
+        leaves any stored label alone rather than erasing it, because callers
+        that only know the quantity must not destroy a label learned from
+        eBay's own Active Listings report.
         """
         m_id = manifest_id.strip()
         p_id = str(ebay_parent_id).strip()
         qty = int(last_known_qty)
+        label = str(custom_label).strip() if custom_label else None
 
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO ebay_variations (manifest_id, ebay_parent_id, last_known_qty, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO ebay_variations
+                    (manifest_id, ebay_parent_id, custom_label, last_known_qty, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(manifest_id) DO UPDATE SET
                     ebay_parent_id = excluded.ebay_parent_id,
+                    custom_label = COALESCE(excluded.custom_label, ebay_variations.custom_label),
                     last_known_qty = excluded.last_known_qty,
                     updated_at = CURRENT_TIMESTAMP;
                 """,
-                (m_id, p_id, qty),
+                (m_id, p_id, label, qty),
             )
             conn.commit()
             return {
                 "manifest_id": m_id,
                 "ebay_parent_id": p_id,
+                "custom_label": label,
                 "last_known_qty": qty,
             }
+
+    def get_live_variations(self) -> List[Dict[str, Any]]:
+        """
+        Every card the store mirror believes is live on eBay.
+
+        Used to find cards that are absent from a full inventory dump, which
+        must be revised down to zero so a sold-out card is not left on sale.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT v.manifest_id, v.ebay_parent_id, v.custom_label,
+                       v.last_known_qty, m.product_name, m.set_name,
+                       m.condition, m.remarks
+                FROM ebay_variations v
+                JOIN manifest m ON m.manifest_id = v.manifest_id
+                WHERE v.ebay_parent_id IS NOT NULL
+                  AND TRIM(v.ebay_parent_id) != ''
+                ORDER BY v.manifest_id
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def delete_manifest(self, manifest_id: str) -> bool:
         """Delete a card from manifest and cascade delete variation."""

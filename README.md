@@ -387,11 +387,48 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ---
 
+## 🔢 What the quantities in your export mean
+
+SortSwift can export either a **full dump of everything you hold** or a **delta
+of just-scanned cards**, and the two need opposite arithmetic. Module A asks
+which you are uploading, right on the card:
+
+| Mode | Meaning | Use when |
+|---|---|---|
+| **A full inventory dump** (default) | The quantity in the file **becomes** the quantity on eBay. | Your export lists your whole on-hand stock. This is SortSwift's inventory export. |
+| **Only newly scanned cards** | The quantity in the file is **added** to what is already there. | The file contains nothing you have already processed. |
+
+Getting this wrong is not cosmetic. Treating a full dump as a delta adds your
+entire inventory on top of itself on **every** upload — 3 becomes 6, then 9 —
+which oversells on eBay. That is why the full-dump reading is the default and
+why an unrecognised `quantity_mode` is rejected rather than guessed at.
+
+### Full-dump mode in detail
+
+* **Rows for the same card still sum.** A card held in two bins appears on two
+  rows, and the bin is not part of a card's identity, so `Bin A-1 × 2` plus
+  `Bin B-7 × 1` is one card with a quantity of 3. That *total* then replaces
+  whatever was stored, which is what makes re-uploading idempotent.
+* **One Revise row per card.** Emitting one row per CSV row would produce two
+  rows for that card whose `CustomLabel`s differ by bin, and only one of those
+  labels exists on the listing.
+* **Cards absent from the dump are revised down to `0`.** A full dump that
+  omits a card means the card is gone; leaving it alone would keep selling
+  stock you no longer have. The row carries a **blank `Price`**, which tells
+  eBay to leave the price alone — the row is only about stock. Each one is
+  logged as `[SOLD OUT]` naming the card, and a card already at `0` is not
+  re-zeroed.
+* **The `CustomLabel` comes from eBay, not from the file.** A zero-out row has
+  no CSV row to derive a label from, and the bin suffix cannot be
+  reconstructed from a card's identity. Module B records the label from eBay's
+  own Active Listings report into `ebay_variations.custom_label`, and that is
+  what these rows use. **Run Module B at least once** so the labels are known.
+
+---
+
 ## 🔁 Duplicate Batch Protection
 
-Module A **adds** quantities to the live store mirror, because a SortSwift export represents newly scanned stock. Processing the same export twice would therefore double your eBay quantities.
-
-To prevent that, every processed batch is fingerprinted (SHA-256 of the file
+Every processed batch is fingerprinted (SHA-256 of the file
 contents) in the `processed_batches` table. Re-uploading a file that has already
 been applied is **refused before any database write happens** — the run returns
 early, so a conflicting batch is a true no-op rather than a partial apply.
@@ -402,8 +439,8 @@ conflict is outstanding.
 
 | Button | Effect | CLI |
 |---|---|---|
-| **Download only — no inventory change** | Rebuilds both CSVs from your **current settings** and writes nothing at all: no catalogue entries, no quantity accumulation, no store-mirror update, no fingerprint. | `--dry-run` |
-| **Force process (adds quantities)** | Applies the batch a second time. Quantities are added again. | `--force` |
+| **Download only — no inventory change** | Rebuilds both CSVs from your **current settings** and writes nothing at all: no catalogue entries, no quantity change, no store-mirror update, no fingerprint. In full-dump mode this produces a file identical to a real run, since there is no accumulation to double. | `--dry-run` |
+| **Force process** | Applies the file a second time. In full-dump mode quantities are *replaced*, so this is safe to repeat; in newly-scanned mode they are *added* again. The button label changes to match the selected mode. | `--force` |
 
 "Download only" is the common case: you already processed the batch, then
 changed a setting (a policy name, the postal code, the `C:Game` value) and need

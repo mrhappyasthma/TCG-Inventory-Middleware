@@ -154,6 +154,16 @@ VARIATION_ATTRIBUTE_NAME = "Card"
 # delimiter in that position and must not survive inside an option name.
 VARIATION_PICTURE_SEPARATOR = "="
 
+# How a batch's quantities relate to what is already on hand.
+#
+# SortSwift can export either a full dump of everything you hold or a delta of
+# just-scanned cards, and the two need opposite arithmetic. Getting it wrong is
+# not a cosmetic error: treating a full dump as a delta adds your whole
+# inventory on top of itself every time you upload, which oversells on eBay.
+QUANTITY_MODE_SET = "set"   # the file is the truth; replace what we hold
+QUANTITY_MODE_ADD = "add"   # the file is new stock; add to what we hold
+QUANTITY_MODES = (QUANTITY_MODE_SET, QUANTITY_MODE_ADD)
+
 DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
 
 # eBay's ConditionID for an ungraded card. Graded cards use IDs extending 2750
@@ -361,6 +371,7 @@ def _empty_batch_result(
         "revise_csv": ",".join(REVISE_HEADERS) + "\n",
         "add_csv": ",".join(add_headers or ADD_HEADERS) + "\n",
         "revise_count": 0,
+        "zeroed_count": 0,
         "add_count": 0,
         "new_catalog_count": 0,
         "skipped_count": 0,
@@ -379,6 +390,7 @@ def process_batch_csv(
     force: bool = False,
     dry_run: bool = False,
     user_id: int = SHARED_SCOPE,
+    quantity_mode: str = QUANTITY_MODE_SET,
 ) -> Dict[str, Any]:
     """
     Process fresh SortSwift inventory batch CSV.
@@ -395,6 +407,19 @@ def process_batch_csv(
     Revise quantities are additive, so processing the same export twice would
     double the live stock. Uploads are therefore fingerprinted and a repeat is
     refused unless ``force`` is set.
+
+    ``quantity_mode`` decides what the file's quantities mean:
+
+    * ``"set"`` (default) treats the export as a **full inventory dump**. The
+      quantity in the file becomes the quantity on eBay. Rows for the same card
+      still sum, because a card held in two bins appears twice and the bin is
+      not part of a card's identity -- but the total replaces whatever was
+      there before, so re-uploading is idempotent. Cards that are live on eBay
+      and absent from the file are revised down to zero, since a full dump
+      omitting a card means it is gone.
+    * ``"add"`` treats the export as a **delta of newly scanned cards** and
+      adds to the running total, which is only correct if the file contains
+      nothing you have already processed.
 
     ``user_id`` selects whose pricing rules and listing settings to apply.
     Both are per-user, so two sellers can process the same export and each get
@@ -423,6 +448,23 @@ def process_batch_csv(
 
     new_catalog_count = 0
     skipped_count = 0
+
+    mode = str(quantity_mode or QUANTITY_MODE_SET).strip().lower()
+    if mode not in QUANTITY_MODES:
+        raise ValueError(
+            f"quantity_mode must be one of {QUANTITY_MODES}, got {quantity_mode!r}"
+        )
+    replace_quantities = mode == QUANTITY_MODE_SET
+
+    # Total seen in *this file* per card, so several rows for one card (the
+    # same card in two bins) sum together before replacing the stored value.
+    file_totals: Dict[str, int] = {}
+
+    # In replace mode there must be exactly one Revise row per card, keyed by
+    # manifest id rather than appended per row: two rows for one card would
+    # otherwise emit two Revise rows whose CustomLabels differ by bin, and only
+    # one of those labels exists on the listing.
+    revise_by_manifest: Dict[str, Dict[str, Any]] = {}
 
     # Load configuration settings
     single_threshold = float(
@@ -778,9 +820,13 @@ def process_batch_csv(
             game = str(_find_column(row, ["Game", "*C:Game", "C:Game"]) or "").strip()
             row_specifics[GAME_ITEM_SPECIFIC] = game
 
-        # Accumulate our own catalogued stock count for this card.
+        # Our own catalogued stock count for this card.
+        file_totals[manifest_id] = file_totals.get(manifest_id, 0) + quantity
         if not dry_run:
-            db.increment_manifest_quantity(manifest_id, quantity)
+            if replace_quantities:
+                db.set_manifest_quantity(manifest_id, file_totals[manifest_id])
+            else:
+                db.increment_manifest_quantity(manifest_id, quantity)
 
         ebay_custom_label = f"{manifest_id}-{clean_remark}" if clean_remark else manifest_id
 
@@ -800,26 +846,47 @@ def process_batch_csv(
             ebay_item_id = str(variation["ebay_parent_id"]).strip()
             prev_qty = variation.get("last_known_qty", 0)
 
-            if dry_run:
+            # eBay knows this variation by whichever label it was listed under,
+            # which Module B records. Inventing a fresh label from this row's
+            # bin would address a variation that does not exist.
+            known_label = (variation.get("custom_label") or "").strip()
+            revise_label = known_label or ebay_custom_label
+
+            if replace_quantities:
+                new_consolidated_qty = file_totals[manifest_id]
+                qty_note = f"= {new_consolidated_qty}"
+            elif dry_run:
                 # The batch has already been applied, so the mirror already
                 # includes it; adding again would overstate the file.
                 new_consolidated_qty = prev_qty
+                qty_note = f"+{quantity} => Total {new_consolidated_qty}"
             else:
                 new_consolidated_qty = prev_qty + quantity
-                # Update live store mirror in DB
-                db.upsert_variation(manifest_id, ebay_item_id, new_consolidated_qty)
+                qty_note = f"+{quantity} => Total {new_consolidated_qty}"
 
-            revise_rows.append({
+            if not dry_run:
+                db.upsert_variation(
+                    manifest_id, ebay_item_id, new_consolidated_qty,
+                    custom_label=revise_label,
+                )
+
+            revise_entry = {
                 "Action": "Revise",
                 "ItemID": ebay_item_id,
-                "CustomLabel": ebay_custom_label,
+                "CustomLabel": revise_label,
                 "Quantity": new_consolidated_qty,
                 "Price": f"{effective_price:.2f}",
-            })
+            }
+            if replace_quantities:
+                # Later rows for the same card update the running total in
+                # place, keeping one row per card.
+                revise_by_manifest[manifest_id] = revise_entry
+            else:
+                revise_rows.append(revise_entry)
 
             logs.append({
                 "level": "SUCCESS",
-                "message": f"Row {row_idx}: [REVISE] #{ebay_item_id} [{ebay_custom_label}] {product_name} (+{quantity} => Total {new_consolidated_qty})",
+                "message": f"Row {row_idx}: [REVISE] #{ebay_item_id} [{revise_label}] {product_name} ({qty_note})",
             })
         else:
             # ADD Scenario: Stage for Single vs Variation listing
@@ -988,6 +1055,64 @@ def process_batch_csv(
             **s.get("item_specifics", {}),
         })
 
+    # -----------------------------------------------------------------
+    # REPLACE MODE: RECONCILE AGAINST THE FULL DUMP
+    # -----------------------------------------------------------------
+    zeroed_count = 0
+    if replace_quantities:
+        # One Revise row per card, carrying the file's total for that card.
+        revise_rows.extend(revise_by_manifest.values())
+
+        # A full dump lists everything on hand, so a card that is live on eBay
+        # and absent from the file has sold out. Left alone it would keep its
+        # old eBay quantity and carry on selling stock that is gone.
+        for live in db.get_live_variations():
+            live_id = live["manifest_id"]
+            if live_id in file_totals:
+                continue
+            if int(live.get("last_known_qty") or 0) == 0:
+                # Already at zero on eBay; nothing to say.
+                continue
+
+            item_id = str(live["ebay_parent_id"]).strip()
+            label = (live.get("custom_label") or "").strip() or live_id
+
+            revise_rows.append({
+                "Action": "Revise",
+                "ItemID": item_id,
+                "CustomLabel": label,
+                "Quantity": 0,
+                # Price is required by the Revise header. Leaving it blank
+                # tells eBay not to change the listed price, which is what we
+                # want: this row is only about stock.
+                "Price": "",
+            })
+            zeroed_count += 1
+
+            if not dry_run:
+                db.upsert_variation(live_id, item_id, 0, custom_label=label)
+                db.set_manifest_quantity(live_id, 0)
+
+            logs.append({
+                "level": "WARN",
+                "message": (
+                    f"[SOLD OUT] #{item_id} [{label}] "
+                    f"{live.get('product_name') or live_id} "
+                    f"({live.get('set_name') or '?'} | {live.get('condition') or '?'}) "
+                    f"is not in this dump, so its eBay quantity is set to 0 "
+                    f"(was {live.get('last_known_qty')})."
+                ),
+            })
+
+        if zeroed_count:
+            logs.append({
+                "level": "INFO",
+                "message": (
+                    f"{zeroed_count} card(s) live on eBay were absent from this "
+                    f"dump and are revised down to 0."
+                ),
+            })
+
     # Generate REVISE CSV
     revise_io = io.StringIO()
     rev_writer = csv.DictWriter(revise_io, fieldnames=REVISE_HEADERS, lineterminator="\n")
@@ -1006,7 +1131,7 @@ def process_batch_csv(
 
     logs.append({
         "level": "INFO",
-        "message": f"Batch routing finished: {len(revise_rows)} items to REVISE, {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
+        "message": f"Batch routing finished: {len(revise_rows)} items to REVISE ({zeroed_count} of them zeroed as sold out), {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
     })
 
     # Fingerprint only after the batch has actually been applied, so a failure
@@ -1022,6 +1147,8 @@ def process_batch_csv(
         "revise_csv": revise_csv,
         "add_csv": add_csv,
         "revise_count": len(revise_rows),
+        "zeroed_count": zeroed_count,
+        "quantity_mode": mode,
         "add_count": total_added_cards,
         "new_catalog_count": new_catalog_count,
         "skipped_count": skipped_count,
@@ -1039,6 +1166,7 @@ def process_batch_file(
     force: bool = False,
     dry_run: bool = False,
     user_id: int = SHARED_SCOPE,
+    quantity_mode: str = QUANTITY_MODE_SET,
 ) -> Dict[str, Any]:
     """Process a SortSwift batch CSV file from disk."""
     content = read_csv_text(input_path)
@@ -1049,6 +1177,7 @@ def process_batch_file(
         force=force,
         dry_run=dry_run,
         user_id=user_id,
+        quantity_mode=quantity_mode,
     )
     if revise_output_path and result["revise_count"] > 0:
         with open(revise_output_path, "w", encoding="utf-8", newline="") as f:
