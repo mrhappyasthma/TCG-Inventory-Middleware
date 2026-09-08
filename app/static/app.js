@@ -152,19 +152,21 @@ function updateAuthUI(data) {
 
         const roleBadge = document.getElementById("userRoleBadge");
         roleBadge.innerText = data.user.role.toUpperCase();
-        const btnRestore = document.getElementById("btnOpenRestoreModal");
+        const btnDatabase = document.getElementById("btnDatabasePanel");
         if (data.user.role === "admin") {
             btnAdminPanel.classList.remove("hidden");
             btnAdminPanel.classList.add("flex");
-            // Restoring replaces data shared by every user, so it is admin-only.
-            if (btnRestore) {
-                btnRestore.classList.remove("hidden");
-                btnRestore.classList.add("flex");
+            // Backup and restore both expose or replace shared data, so the
+            // whole panel is admin-only. The endpoints enforce this too; this
+            // only hides a control the user could not use anyway.
+            if (btnDatabase) {
+                btnDatabase.classList.remove("hidden");
+                btnDatabase.classList.add("flex");
             }
             roleBadge.className = "text-[10px] uppercase px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800";
         } else {
             btnAdminPanel.classList.add("hidden");
-            if (btnRestore) btnRestore.classList.add("hidden");
+            if (btnDatabase) btnDatabase.classList.add("hidden");
             roleBadge.className = "text-[10px] uppercase px-1.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800";
         }
     } else {
@@ -173,7 +175,7 @@ function updateAuthUI(data) {
         userProfileBadge.classList.remove("flex");
         btnLogout.classList.add("hidden");
         btnAdminPanel.classList.add("hidden");
-        document.getElementById("btnOpenRestoreModal")?.classList.add("hidden");
+        document.getElementById("btnDatabasePanel")?.classList.add("hidden");
 
         if (data.is_pending) {
             pendingBanner.classList.remove("hidden");
@@ -1356,20 +1358,20 @@ function noteConsoleActivity(level) {
 // pressed against an unchecked file.
 let restoreValidatedFile = null;
 
-document.getElementById("btnOpenRestoreModal")?.addEventListener("click", openRestoreModal);
+document.getElementById("btnDatabasePanel")?.addEventListener("click", openDatabaseModal);
 
-function openRestoreModal() {
+function openDatabaseModal() {
     restoreValidatedFile = null;
     document.getElementById("restoreFileInput").value = "";
     document.getElementById("restoreSummary").classList.add("hidden");
     document.getElementById("restoreError").classList.add("hidden");
     document.getElementById("btnRestoreApply").disabled = true;
-    document.getElementById("restoreModal").classList.remove("hidden");
+    document.getElementById("databaseModal").classList.remove("hidden");
     syncModalScrollLock();
 }
 
-function closeRestoreModal() {
-    document.getElementById("restoreModal").classList.add("hidden");
+function closeDatabaseModal() {
+    document.getElementById("databaseModal").classList.add("hidden");
     syncModalScrollLock();
     restoreValidatedFile = null;
 }
@@ -1444,7 +1446,7 @@ async function applyRestore() {
 
     try {
         const data = await postRestore(restoreValidatedFile, true);
-        closeRestoreModal();
+        closeDatabaseModal();
         logToTerminal("SUCCESS",
             `Inventory database replaced from "${data.filename}".`);
         if (data.backup_path) {

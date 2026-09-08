@@ -59,7 +59,7 @@
 
 ---
 
-* **The inventory is shared, not per-user.** There is no owner column on a card, so reading it is safe to expose broadly while anything that *replaces* it is admin-only: a restore overwrites what every user sees.
+* **The inventory is shared, not per-user.** There is no owner column on a card, so both backup and restore are administrative and live behind the admin-only Database panel. Enforce it on the endpoint, not just by hiding the control.
 * **Both databases run in WAL mode.** Never copy a `.db` file directly to snapshot it -- recent commits may still be in a `-wal` sidecar. Use `VACUUM INTO`, which checkpoints into a single self-contained file.
 
 ---

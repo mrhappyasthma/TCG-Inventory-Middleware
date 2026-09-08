@@ -804,11 +804,15 @@ an error indicator.
 
 The inventory database holds more than the CSV export can carry: the catalog,
 eBay links, catalogued quantities, pricing rules, listing settings and cover
-photo overrides. Two controls in the inventory toolbar move the whole thing.
+photo overrides.
 
-### Backup — any signed-in user
+Both live behind the **Database** button in the top navigation, which appears
+for administrators only. The endpoints enforce that too — hiding the button is
+not the control.
 
-**Backup** downloads `tcg-inventory-<timestamp>.db`.
+### Backup
+
+**Download backup** produces `tcg-inventory-<timestamp>.db`.
 
 Taken server-side with `VACUUM INTO`, which checkpoints the write-ahead log into
 the file. This matters: both databases run in **WAL mode**, so copying a `.db`
@@ -816,17 +820,13 @@ by hand can capture a database whose most recent commits are still sitting in a
 `-wal` sidecar. The download can never be stale that way, and needs no sidecar
 files alongside it.
 
-It is open to any approved user because **the catalog is shared, not
-per-user** — there is no owner column on a card. Everything in the file is
-already visible in the dashboard or the CSV export, and it contains no
-credentials: accounts live in a separate `users.db` and the session secret is a
-separate file.
+User accounts are **not** included — they live in a separate `users.db`, and the
+session secret is a separate file again.
 
-### Restore — admin only
+### Restore
 
-**Restore** replaces the inventory database from a backup file. Admin-only for
-the same reason download is not: a restore replaces the data **every** user
-sees, so it is not a personal action.
+**Restore** replaces the inventory database from a backup file. It replaces the
+data **every** user sees, so it is not a personal action.
 
 The flow is deliberately two-step:
 

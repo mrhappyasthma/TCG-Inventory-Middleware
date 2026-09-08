@@ -102,6 +102,8 @@ app = FastAPI(
 # Mount static assets. Register woff2 explicitly: the vendored fonts would
 # otherwise be served as application/octet-stream on some platforms.
 mimetypes.add_type("font/woff2", ".woff2")
+mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("image/x-icon", ".ico")
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):
@@ -693,15 +695,15 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
 @app.get("/api/inventory/database")
 def download_inventory_database(
     background: BackgroundTasks,
-    user: Dict[str, Any] = Depends(require_active_user),
+    admin: Dict[str, Any] = Depends(require_admin_user),
 ):
     """
-    Download a consistent snapshot of the inventory database.
+    Download a consistent snapshot of the inventory database. Admin only.
 
-    Open to any approved user: the catalog is shared rather than per-user, and
-    everything in this file is already visible in the dashboard or the CSV
-    export. It holds no credentials -- accounts live in a separate database and
-    the session secret is a separate file.
+    Both halves of backup/restore are administrative: the file is the whole
+    shared catalog plus every listing setting, which is more than an ordinary
+    user needs in order to work. The endpoint is restricted rather than merely
+    hidden, so the permission does not depend on the UI.
 
     Taken with VACUUM INTO so the write-ahead log is checkpointed into the file.
     A hand-copied .db can otherwise be missing its most recent commits.
@@ -739,8 +741,7 @@ async def import_inventory_database(
     Replace the inventory database with an uploaded snapshot. Admin only.
 
     Restricted to admins because the catalog is shared: a restore replaces
-    everyone's data, not just the uploader's. Download is deliberately open to
-    any user; this is not.
+    everyone's data, not just the uploader's.
 
     Without confirm=true the upload is only validated and summarised, so an
     operator can see what a restore would bring in before committing to it. The
