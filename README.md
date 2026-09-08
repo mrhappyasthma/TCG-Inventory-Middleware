@@ -398,7 +398,7 @@ reading one while another works.
 │          ◠ (spinning)       │
 │      Processing batch…      │
 │      1,412 rows · 0:07      │
-│         ▓▓▓�e░░░░░░          │
+│         ▓▓▓▓░░░░░░          │
 │    Leave this tab open.     │
 └─────────────────────────────┘
 ```
