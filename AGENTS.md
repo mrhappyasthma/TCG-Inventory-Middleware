@@ -59,6 +59,11 @@
 
 ---
 
+* **The inventory is shared, not per-user.** There is no owner column on a card, so reading it is safe to expose broadly while anything that *replaces* it is admin-only: a restore overwrites what every user sees.
+* **Both databases run in WAL mode.** Never copy a `.db` file directly to snapshot it -- recent commits may still be in a `-wal` sidecar. Use `VACUUM INTO`, which checkpoints into a single self-contained file.
+
+---
+
 ## 4. 🔐 Authentication Constraints
 
 * **Google Sign-In is the only mechanism.** Do not reintroduce local password login, a registration form, or an auth-disabled development mode, even as a testing convenience. Tests stub `verify_google_id_token` instead.

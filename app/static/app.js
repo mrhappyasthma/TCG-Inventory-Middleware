@@ -152,12 +152,19 @@ function updateAuthUI(data) {
 
         const roleBadge = document.getElementById("userRoleBadge");
         roleBadge.innerText = data.user.role.toUpperCase();
+        const btnRestore = document.getElementById("btnOpenRestoreModal");
         if (data.user.role === "admin") {
             btnAdminPanel.classList.remove("hidden");
             btnAdminPanel.classList.add("flex");
+            // Restoring replaces data shared by every user, so it is admin-only.
+            if (btnRestore) {
+                btnRestore.classList.remove("hidden");
+                btnRestore.classList.add("flex");
+            }
             roleBadge.className = "text-[10px] uppercase px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800";
         } else {
             btnAdminPanel.classList.add("hidden");
+            if (btnRestore) btnRestore.classList.add("hidden");
             roleBadge.className = "text-[10px] uppercase px-1.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800";
         }
     } else {
@@ -166,6 +173,7 @@ function updateAuthUI(data) {
         userProfileBadge.classList.remove("flex");
         btnLogout.classList.add("hidden");
         btnAdminPanel.classList.add("hidden");
+        document.getElementById("btnOpenRestoreModal")?.classList.add("hidden");
 
         if (data.is_pending) {
             pendingBanner.classList.remove("hidden");
@@ -1338,6 +1346,117 @@ function noteConsoleActivity(level) {
         + (consoleUnreadHasError
             ? "bg-rose-900 text-rose-100"
             : "bg-slate-700 text-slate-200");
+}
+
+// -------------------------------------------------------------------
+// DATABASE RESTORE
+// -------------------------------------------------------------------
+
+// Set only once a file has passed validation, so "Replace database" cannot be
+// pressed against an unchecked file.
+let restoreValidatedFile = null;
+
+document.getElementById("btnOpenRestoreModal")?.addEventListener("click", openRestoreModal);
+
+function openRestoreModal() {
+    restoreValidatedFile = null;
+    document.getElementById("restoreFileInput").value = "";
+    document.getElementById("restoreSummary").classList.add("hidden");
+    document.getElementById("restoreError").classList.add("hidden");
+    document.getElementById("btnRestoreApply").disabled = true;
+    document.getElementById("restoreModal").classList.remove("hidden");
+    syncModalScrollLock();
+}
+
+function closeRestoreModal() {
+    document.getElementById("restoreModal").classList.add("hidden");
+    syncModalScrollLock();
+    restoreValidatedFile = null;
+}
+
+document.getElementById("restoreFileInput")?.addEventListener("change", () => {
+    // A new file invalidates any previous check.
+    restoreValidatedFile = null;
+    document.getElementById("btnRestoreApply").disabled = true;
+    document.getElementById("restoreSummary").classList.add("hidden");
+    document.getElementById("restoreError").classList.add("hidden");
+});
+
+function showRestoreError(message) {
+    const box = document.getElementById("restoreError");
+    box.innerText = message;
+    box.classList.remove("hidden");
+    document.getElementById("restoreSummary").classList.add("hidden");
+    document.getElementById("btnRestoreApply").disabled = true;
+    restoreValidatedFile = null;
+}
+
+async function postRestore(file, confirm) {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("confirm", confirm ? "true" : "false");
+    const res = await fetch("/api/inventory/database", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "The file was rejected");
+    return data;
+}
+
+async function checkRestoreFile() {
+    const input = document.getElementById("restoreFileInput");
+    const file = input.files && input.files[0];
+    if (!file) {
+        showRestoreError("Choose a backup file first.");
+        return;
+    }
+
+    try {
+        const data = await postRestore(file, false);
+        const inc = data.incoming || {};
+        const cur = data.current || {};
+        const row = (label, incoming, current) =>
+            `<div class="flex items-center justify-between">
+                <span class="text-slate-400">${label}</span>
+                <span class="font-mono text-slate-200">${current} &rarr; <strong>${incoming}</strong></span>
+             </div>`;
+
+        document.getElementById("restoreSummary").innerHTML =
+            `<p class="text-[11px] text-slate-300 font-semibold mb-1">Current &rarr; after restore</p>`
+            + row("Catalog cards", inc.manifest ?? 0, cur.manifest ?? 0)
+            + row("Linked eBay cards", inc.ebay_variations ?? 0, cur.ebay_variations ?? 0)
+            + `<div class="flex items-center justify-between"><span class="text-slate-400">Pricing rules</span><span class="font-mono text-slate-200">${inc.pricing_rules ?? 0}</span></div>`
+            + `<div class="flex items-center justify-between"><span class="text-slate-400">Listing settings</span><span class="font-mono text-slate-200">${inc.listing_settings ?? 0}</span></div>`;
+        document.getElementById("restoreSummary").classList.remove("hidden");
+        document.getElementById("restoreError").classList.add("hidden");
+
+        restoreValidatedFile = file;
+        document.getElementById("btnRestoreApply").disabled = false;
+        logToTerminal("INFO", `Backup file "${file.name}" validated. Nothing has been replaced yet.`);
+    } catch (err) {
+        showRestoreError(err.message);
+    }
+}
+
+async function applyRestore() {
+    if (!restoreValidatedFile) return;
+    if (!confirm("Replace the inventory database for all users? Your current database will be copied aside first.")) {
+        return;
+    }
+
+    try {
+        const data = await postRestore(restoreValidatedFile, true);
+        closeRestoreModal();
+        logToTerminal("SUCCESS",
+            `Inventory database replaced from "${data.filename}".`);
+        if (data.backup_path) {
+            logToTerminal("INFO", `Previous database kept at ${data.backup_path}`);
+        }
+        fetchStats();
+        fetchSetFilter();
+        fetchInventory();
+        fetchEbayListings();
+    } catch (err) {
+        showRestoreError(err.message);
+    }
 }
 
 // -------------------------------------------------------------------

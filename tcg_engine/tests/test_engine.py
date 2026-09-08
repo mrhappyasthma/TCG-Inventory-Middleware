@@ -1706,6 +1706,94 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertIn("ItemID", header)
         self.assertNotIn("Item Number", header)
 
+    # ------------------------------------------------------------------
+    # Database snapshot export / inspect / restore
+    # ------------------------------------------------------------------
+
+    def test_snapshot_export_is_self_contained(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        dest = os.path.join(self.temp_dir.name, "snap.db")
+        self.db.export_snapshot(dest)
+
+        # VACUUM INTO checkpoints the WAL, so no sidecar is needed to read it.
+        self.assertTrue(os.path.exists(dest))
+        self.assertFalse(os.path.exists(dest + "-wal"))
+
+        conn = sqlite3.connect(dest)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM manifest").fetchone()[0], 3)
+        conn.close()
+
+    def test_inspect_rejects_files_that_are_not_our_database(self):
+        # Not SQLite at all.
+        junk = os.path.join(self.temp_dir.name, "junk.txt")
+        with open(junk, "wb") as f:
+            f.write(b"not a database")
+        bad = Database.inspect_snapshot(junk)
+        self.assertFalse(bad["ok"])
+        self.assertIn("not a SQLite", bad["error"])
+
+        # Valid SQLite, wrong schema.
+        foreign = os.path.join(self.temp_dir.name, "foreign.db")
+        c = sqlite3.connect(foreign)
+        c.execute("CREATE TABLE unrelated (x INTEGER)")
+        c.commit(); c.close()
+        wrong = Database.inspect_snapshot(foreign)
+        self.assertFalse(wrong["ok"])
+        self.assertIn("missing", wrong["error"])
+
+        # A real snapshot passes and is summarised.
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        good_path = os.path.join(self.temp_dir.name, "good.db")
+        self.db.export_snapshot(good_path)
+        good = Database.inspect_snapshot(good_path)
+        self.assertTrue(good["ok"])
+        self.assertEqual(good["counts"]["manifest"], 3)
+
+    def test_restore_replaces_data_and_keeps_a_backup(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        snapshot = os.path.join(self.temp_dir.name, "snap.db")
+        self.db.export_snapshot(snapshot)
+
+        self.db.purge_inventory()
+        self.assertEqual(self.db.get_stats()["total_cards"], 0)
+
+        result = self.db.replace_with_snapshot(snapshot)
+        self.assertEqual(self.db.get_stats()["total_cards"], 3)
+        # Reversible: the emptied database was copied aside first.
+        self.assertTrue(result["backup_path"])
+        self.assertTrue(os.path.exists(result["backup_path"]))
+        restored = Database.inspect_snapshot(result["backup_path"])
+        self.assertTrue(restored["ok"])
+        self.assertEqual(restored["counts"]["manifest"], 0)
+
+    def test_restore_refuses_a_bad_snapshot_without_touching_data(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        before = self.db.get_stats()["total_cards"]
+
+        junk = os.path.join(self.temp_dir.name, "junk.db")
+        with open(junk, "wb") as f:
+            f.write(b"still not a database")
+
+        with self.assertRaises(ValueError):
+            self.db.replace_with_snapshot(junk)
+        self.assertEqual(self.db.get_stats()["total_cards"], before)
+
+    def test_restore_runs_migrations_on_the_incoming_file(self):
+        """A backup from an older build must still open afterwards."""
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        snapshot = os.path.join(self.temp_dir.name, "old.db")
+        self.db.export_snapshot(snapshot)
+
+        # Simulate an older schema: drop a table a later migration adds.
+        c = sqlite3.connect(snapshot)
+        c.execute("DROP TABLE IF EXISTS ebay_listing_overrides")
+        c.commit(); c.close()
+
+        self.db.replace_with_snapshot(snapshot)
+        # init_db ran, so the table is back and the feature still works.
+        self.db.set_listing_cover_image("123", "https://cdn/x.jpg")
+        self.assertEqual(self.db.get_listing_cover_image("123"), "https://cdn/x.jpg")
+
 
 if __name__ == "__main__":
     unittest.main()

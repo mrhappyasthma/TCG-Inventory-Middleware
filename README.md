@@ -800,6 +800,62 @@ an error indicator.
 
 ---
 
+## 💾 Backup and restore
+
+The inventory database holds more than the CSV export can carry: the catalog,
+eBay links, catalogued quantities, pricing rules, listing settings and cover
+photo overrides. Two controls in the inventory toolbar move the whole thing.
+
+### Backup — any signed-in user
+
+**Backup** downloads `tcg-inventory-<timestamp>.db`.
+
+Taken server-side with `VACUUM INTO`, which checkpoints the write-ahead log into
+the file. This matters: both databases run in **WAL mode**, so copying a `.db`
+by hand can capture a database whose most recent commits are still sitting in a
+`-wal` sidecar. The download can never be stale that way, and needs no sidecar
+files alongside it.
+
+It is open to any approved user because **the catalog is shared, not
+per-user** — there is no owner column on a card. Everything in the file is
+already visible in the dashboard or the CSV export, and it contains no
+credentials: accounts live in a separate `users.db` and the session secret is a
+separate file.
+
+### Restore — admin only
+
+**Restore** replaces the inventory database from a backup file. Admin-only for
+the same reason download is not: a restore replaces the data **every** user
+sees, so it is not a personal action.
+
+The flow is deliberately two-step:
+
+1. **Check file** validates and summarises it — *"Catalog cards 0 → 35"* — and
+   applies nothing.
+2. **Replace database** is only enabled once a file has passed that check, and
+   asks for confirmation.
+
+Safety behaviour:
+
+* A file that is not SQLite, fails `PRAGMA integrity_check`, or lacks the
+  expected tables is **rejected outright**, leaving the current data untouched.
+* Your current database is copied aside as
+  `data/inventory-backup-<timestamp>.db` before anything is overwritten, so a
+  restore is reversible.
+* Stale `-wal`/`-shm` sidecars from the old database are removed first —
+  applied to a different file they would corrupt it.
+* The replacement is an atomic `os.replace` within the same directory, so the
+  database is never left half-written.
+* Migrations run against the restored file, so a backup from an older build
+  still opens.
+
+**User accounts are never touched.** `users.db` is deliberately out of scope:
+importing one whose Google `sub` did not match your account would remove your
+own admin access with no way back through the UI. It is also self-healing —
+delete it and the next Google sign-in becomes admin.
+
+---
+
 ## 🛡️ Persistent Storage on NAS
 
 All master catalog cards, live eBay item links, and user accounts are saved under the mounted data volume:

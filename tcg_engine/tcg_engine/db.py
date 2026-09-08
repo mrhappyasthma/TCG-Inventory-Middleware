@@ -1,6 +1,8 @@
 import os
 import re
+import shutil
 import sqlite3
+from datetime import datetime
 from contextlib import contextmanager
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -734,6 +736,133 @@ class Database:
         if not clauses:
             return "", []
         return " WHERE " + " AND ".join(clauses) + " ", params
+
+    # Tables an inventory database must contain to be recognisable. Anything
+    # added by a later migration is deliberately excluded, so a backup taken
+    # from an older build still restores.
+    REQUIRED_TABLES = ("manifest", "ebay_variations", "pricing_rules", "listing_settings")
+
+    SQLITE_MAGIC = b"SQLite format 3" + bytes([0])
+
+    def export_snapshot(self, dest_path: str) -> str:
+        """
+        Write a consistent single-file copy of this database.
+
+        VACUUM INTO fully checkpoints the write-ahead log, so the result needs
+        no -wal/-shm sidecars and is safe to take while the app is serving.
+        Copying the .db file directly can capture a stale database whose recent
+        commits are still only in the WAL.
+        """
+        dest = os.path.abspath(dest_path)
+        parent = os.path.dirname(dest)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+        if os.path.exists(dest):
+            os.remove(dest)
+        with self.get_connection() as conn:
+            conn.execute("VACUUM INTO ?", (dest,))
+        return dest
+
+    @classmethod
+    def inspect_snapshot(cls, path: str) -> Dict[str, Any]:
+        """
+        Check that a file really is one of our inventory databases, and
+        summarise it, without touching the live database.
+
+        Returns {"ok": bool, "error": str|None, "counts": {...}}. Used to show
+        an operator what a restore would bring in before it is applied, and to
+        refuse an unrelated or damaged file outright.
+        """
+        result: Dict[str, Any] = {"ok": False, "error": None, "counts": {}}
+
+        try:
+            with open(path, "rb") as f:
+                header = f.read(16)
+        except OSError as exc:
+            result["error"] = f"Could not read the file: {exc}"
+            return result
+
+        if header != cls.SQLITE_MAGIC:
+            result["error"] = "That is not a SQLite database file."
+            return result
+
+        conn = None
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % path.replace(os.sep, "/"), uri=True)
+            conn.row_factory = sqlite3.Row
+
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                result["error"] = f"The database failed its integrity check: {integrity}"
+                return result
+
+            present = {
+                r["name"]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            missing = [t for t in cls.REQUIRED_TABLES if t not in present]
+            if missing:
+                result["error"] = (
+                    "This does not look like an inventory database; it is missing: "
+                    + ", ".join(missing)
+                )
+                return result
+
+            for table in cls.REQUIRED_TABLES + ("processed_batches", "ebay_listing_overrides"):
+                if table in present:
+                    result["counts"][table] = conn.execute(
+                        "SELECT COUNT(*) FROM %s" % table
+                    ).fetchone()[0]
+
+            result["ok"] = True
+            return result
+        except sqlite3.DatabaseError as exc:
+            result["error"] = f"The file could not be opened as a database: {exc}"
+            return result
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def replace_with_snapshot(self, source_path: str) -> Dict[str, Any]:
+        """
+        Replace this database with a validated snapshot, backing up first.
+
+        The current database is copied aside before anything is overwritten, so
+        a restore is reversible. Stale -wal/-shm sidecars belonging to the old
+        database are removed: left in place they would be applied to the new
+        file and corrupt it.
+        """
+        check = self.inspect_snapshot(source_path)
+        if not check["ok"]:
+            raise ValueError(check["error"] or "The snapshot is not usable.")
+
+        target = os.path.abspath(self.db_path)
+        directory = os.path.dirname(target) or "."
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = os.path.join(directory, f"inventory-backup-{stamp}.db")
+
+        backed_up = None
+        if os.path.exists(target):
+            self.export_snapshot(backup)
+            backed_up = backup
+
+        staged = os.path.join(directory, f".import-{stamp}.db")
+        shutil.copyfile(source_path, staged)
+
+        for sidecar in (target + "-wal", target + "-shm"):
+            if os.path.exists(sidecar):
+                os.remove(sidecar)
+
+        # Same directory, so this is atomic: the database is never half-written.
+        os.replace(staged, target)
+
+        # Bring the restored file up to the current schema.
+        self.init_db()
+
+        return {
+            "backup_path": backed_up,
+            "counts": check["counts"],
+        }
 
     def get_ebay_listings(self) -> List[Dict[str, Any]]:
         """

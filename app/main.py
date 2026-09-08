@@ -3,6 +3,9 @@ import sys
 import io
 import csv
 import mimetypes
+import shutil
+import tempfile
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 # Ensure project root is in sys.path when running as direct script
@@ -28,6 +31,7 @@ if os.path.isfile(_env_path):
 
 from fastapi import (
     FastAPI,
+    BackgroundTasks,
     UploadFile,
     File,
     Form,
@@ -37,7 +41,13 @@ from fastapi import (
     status,
     Depends,
 )
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    StreamingResponse,
+    JSONResponse,
+    RedirectResponse,
+    FileResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -674,6 +684,113 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=master_catalog_export.csv"},
     )
+
+
+# ---------------------------------------------------------
+# DATABASE BACKUP / RESTORE
+# ---------------------------------------------------------
+
+@app.get("/api/inventory/database")
+def download_inventory_database(
+    background: BackgroundTasks,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Download a consistent snapshot of the inventory database.
+
+    Open to any approved user: the catalog is shared rather than per-user, and
+    everything in this file is already visible in the dashboard or the CSV
+    export. It holds no credentials -- accounts live in a separate database and
+    the session secret is a separate file.
+
+    Taken with VACUUM INTO so the write-ahead log is checkpointed into the file.
+    A hand-copied .db can otherwise be missing its most recent commits.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tmp_dir = tempfile.mkdtemp(prefix="tcg-snapshot-")
+    dest = os.path.join(tmp_dir, f"tcg-inventory-{stamp}.db")
+
+    try:
+        db.export_snapshot(dest)
+    except Exception as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500, detail=f"Could not create a snapshot: {exc}"
+        )
+
+    # Remove the temp copy once the response has been sent.
+    background.add_task(shutil.rmtree, tmp_dir, ignore_errors=True)
+
+    return FileResponse(
+        dest,
+        media_type="application/vnd.sqlite3",
+        filename=os.path.basename(dest),
+        background=background,
+    )
+
+
+@app.post("/api/inventory/database")
+async def import_inventory_database(
+    file: UploadFile = File(...),
+    confirm: bool = Form(False),
+    admin: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Replace the inventory database with an uploaded snapshot. Admin only.
+
+    Restricted to admins because the catalog is shared: a restore replaces
+    everyone's data, not just the uploader's. Download is deliberately open to
+    any user; this is not.
+
+    Without confirm=true the upload is only validated and summarised, so an
+    operator can see what a restore would bring in before committing to it. The
+    current database is copied aside first either way, so a restore is
+    reversible.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="tcg-import-")
+    staged = os.path.join(tmp_dir, "upload.db")
+    try:
+        with open(staged, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+
+        check = db.inspect_snapshot(staged)
+        if not check["ok"]:
+            raise HTTPException(status_code=400, detail=check["error"])
+
+        current = db.get_stats()
+
+        if not confirm:
+            return {
+                "applied": False,
+                "filename": file.filename,
+                "incoming": check["counts"],
+                "current": {
+                    "manifest": current["total_cards"],
+                    "ebay_variations": current["active_listings"],
+                },
+                "message": (
+                    "Validated but not applied. Re-send with confirm=true to "
+                    "replace the current inventory database."
+                ),
+            }
+
+        result = db.replace_with_snapshot(staged)
+        return {
+            "applied": True,
+            "filename": file.filename,
+            "incoming": result["counts"],
+            "backup_path": result["backup_path"],
+            "message": "Inventory database replaced. A backup of the previous one was kept.",
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Import failed: {exc}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------
