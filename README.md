@@ -387,6 +387,37 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ---
 
+## ⏳ While a module is working
+
+Each module card covers itself with its own overlay while it runs, rather than
+there being one global spinner: the three are independent, and you may well be
+reading one while another works.
+
+```
+┌─────────────────────────────┐
+│          ◠ (spinning)       │
+│      Processing batch…      │
+│      1,412 rows · 0:07      │
+│         ▓▓▓�e░░░░░░          │
+│    Leave this tab open.     │
+└─────────────────────────────┘
+```
+
+The bar is **indeterminate on purpose**. The server reports no progress, so a
+percentage would be invented. The two figures shown are real: the row count is
+read from the file in the browser before the upload starts, and the elapsed
+clock is what tells you a slow run on the NAS is alive rather than wedged.
+
+The overlay also blocks the dropzone and file input for that module. That is
+not cosmetic — a second drop into Module A mid-run would process the same dump
+twice. The other two modules stay usable.
+
+It is cleared in a `finally`, so it releases on success, on error, and on
+Module A's early return down the duplicate-file path. A stuck overlay would
+lock the card with no way back.
+
+---
+
 ## ⚡ Throughput
 
 Module A holds **one database connection open** for the whole run rather than

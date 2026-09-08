@@ -787,6 +787,9 @@ async function handleOrdersUpload(file) {
     formData.append("file", file);
 
     logToTerminal("INFO", `[MODULE C] Uploading ${file.name} for eBay Orders processing...`);
+    const orderRows = await countCsvRows(file);
+    setModuleBusy("Orders", "Processing orders\u2026",
+                  orderRows === null ? file.name : `${orderRows.toLocaleString()} rows`);
 
     try {
         const res = await fetch("/api/process/orders", {
@@ -811,6 +814,8 @@ async function handleOrdersUpload(file) {
         logToTerminal("SUCCESS", `[MODULE C] sortswift_orders_import.csv is ready (${data.converted_count} items). Click to download.`);
     } catch (err) {
         logToTerminal("ERROR", `[MODULE C] ${err.message}`);
+    } finally {
+        clearModuleBusy("Orders");
     }
 }
 
@@ -845,6 +850,74 @@ document.querySelectorAll('input[name="batchQuantityMode"]').forEach(el => {
 });
 syncBatchModeLabels();
 
+// -------------------------------------------------------------------
+// PER-MODULE BUSY STATE
+// -------------------------------------------------------------------
+//
+// Each module gets its own indicator rather than one global spinner, because
+// the three are independent and you may well be reading one while another
+// runs. The bar is deliberately indeterminate: the server reports no progress,
+// so a percentage would be invented. What it does show is real -- the row count
+// read from the file, and an elapsed clock, which is what tells you a slow run
+// on the NAS is alive rather than wedged.
+
+const moduleBusyTimers = {};
+
+// Row count straight from the file, so the message says something concrete
+// before the server has even been reached. Counts non-blank lines and drops the
+// header; a trailing newline must not become a phantom row.
+async function countCsvRows(file) {
+    try {
+        const text = await file.text();
+        const lines = text.split(/\r?\n/).filter(line => line.trim() !== "");
+        return Math.max(0, lines.length - 1);
+    } catch (err) {
+        return null;
+    }
+}
+
+function setModuleBusy(key, title, detail) {
+    const overlay = document.getElementById(`busy${key}`);
+    if (!overlay) return;
+
+    document.getElementById(`busy${key}Title`).innerText = title;
+
+    const started = Date.now();
+    const detailEl = document.getElementById(`busy${key}Detail`);
+    const paint = () => {
+        const secs = Math.floor((Date.now() - started) / 1000);
+        const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+        detailEl.innerText = detail ? `${detail} \u00b7 ${clock}` : clock;
+    };
+    paint();
+
+    clearInterval(moduleBusyTimers[key]);
+    moduleBusyTimers[key] = setInterval(paint, 1000);
+
+    overlay.classList.remove("hidden");
+    setModuleInputsDisabled(key, true);
+}
+
+function clearModuleBusy(key) {
+    clearInterval(moduleBusyTimers[key]);
+    delete moduleBusyTimers[key];
+    document.getElementById(`busy${key}`)?.classList.add("hidden");
+    setModuleInputsDisabled(key, false);
+}
+
+// Locking the input is not cosmetic: a second drop into Module A mid-run would
+// process the same dump twice.
+function setModuleInputsDisabled(key, disabled) {
+    const input = document.getElementById(`fileInput${key}`);
+    if (input) input.disabled = disabled;
+
+    const zone = document.getElementById(`dropzone${key}`);
+    if (zone) {
+        zone.classList.toggle("pointer-events-none", disabled);
+        zone.classList.toggle("opacity-50", disabled);
+    }
+}
+
 // mode: "normal" | "force" | "dry-run"
 async function handleBatchUpload(file, mode = "normal") {
     if (mode === "normal") {
@@ -861,6 +934,12 @@ async function handleBatchUpload(file, mode = "normal") {
         ? "rebuilding files only"
         : mode === "force" ? "force processing" : "routing";
     logToTerminal("INFO", `[MODULE A] Uploading ${file.name} (${intent})...`);
+    const batchRows = await countCsvRows(file);
+    setModuleBusy(
+        "Batch",
+        mode === "dry-run" ? "Rebuilding CSVs\u2026" : "Processing batch\u2026",
+        batchRows === null ? file.name : `${batchRows.toLocaleString()} rows`
+    );
 
     try {
         const res = await fetch("/api/process/batch", {
@@ -940,6 +1019,8 @@ async function handleBatchUpload(file, mode = "normal") {
         }
     } catch (err) {
         logToTerminal("ERROR", `[MODULE A] ${err.message}`);
+    } finally {
+        clearModuleBusy("Batch");
     }
 }
 
@@ -948,6 +1029,9 @@ async function handleSyncUpload(file) {
     formData.append("file", file);
 
     logToTerminal("INFO", `[MODULE B] Uploading ${file.name} for eBay Store State synchronization...`);
+    const syncRows = await countCsvRows(file);
+    setModuleBusy("Sync", "Syncing store mirror\u2026",
+                  syncRows === null ? file.name : `${syncRows.toLocaleString()} rows`);
 
     try {
         const res = await fetch("/api/process/sync", {
@@ -975,6 +1059,8 @@ async function handleSyncUpload(file) {
         fetchInventory();
     } catch (err) {
         logToTerminal("ERROR", `[MODULE B] ${err.message}`);
+    } finally {
+        clearModuleBusy("Sync");
     }
 }
 
