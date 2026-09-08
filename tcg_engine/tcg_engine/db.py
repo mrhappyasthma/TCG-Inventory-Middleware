@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 from datetime import datetime
 from contextlib import contextmanager
 from typing import Optional, Dict, Any, List, Tuple
@@ -30,6 +31,50 @@ DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
 SHARED_SCOPE = 0
 
 
+def apply_pricing_rules(
+    rules: List[Dict[str, Any]], base_price: float
+) -> Tuple[float, Optional[Dict[str, Any]]]:
+    """
+    Match a base price against an already-loaded rule set.
+
+    Split out from Database.calculate_price so a caller pricing thousands of
+    cards can read the rules once instead of once per card. Pure, so the
+    pricing behaviour is testable without a database.
+
+    Returns (calculated_price, matched_rule_or_None).
+    """
+    price = float(base_price or 0.0)
+
+    for rule in rules:
+        min_p = rule["min_price"]
+        max_p = rule["max_price"]
+
+        # Check if price falls into this rule's range
+        is_match = False
+        if max_p is not None:
+            if min_p <= price < max_p:
+                is_match = True
+        else:
+            if price >= min_p:
+                is_match = True
+
+        if is_match:
+            r_type = rule["rule_type"]
+            r_val = rule["rule_value"]
+
+            if r_type == "fixed":
+                return round(r_val, 2), rule
+            elif r_type == "markup_fixed":
+                return round(price + r_val, 2), rule
+            elif r_type == "markup_percent":
+                return round(price * (1.0 + r_val / 100.0), 2), rule
+
+    # Fallback if no rule matched
+    if price > 0:
+        return round(price, 2), None
+    return 1.99, None
+
+
 class Database:
     """
     SQLite Database manager for TCG inventory.
@@ -38,22 +83,69 @@ class Database:
 
     def __init__(self, db_path: str = "data/inventory.db"):
         self.db_path = db_path
+        # A connection held open for the duration of a session(), kept
+        # per-thread because this object is a process-wide singleton in the web
+        # app and a sqlite3 connection may not be used from another thread.
+        self._local = threading.local()
         # Ensure parent directory exists
         parent_dir = os.path.dirname(os.path.abspath(db_path))
         if parent_dir and not os.path.exists(parent_dir):
             os.makedirs(parent_dir, exist_ok=True)
         self.init_db()
 
-    @contextmanager
-    def get_connection(self):
+    def _new_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
+
+    @contextmanager
+    def get_connection(self):
+        """
+        A connection for one operation, or the session's if one is open.
+
+        Inside a session() the connection is borrowed and deliberately not
+        closed, which is what makes bulk work fast: opening and closing a
+        connection per operation costs around ten milliseconds -- the cold
+        commit plus a close-time WAL checkpoint -- so a few thousand card rows
+        spend minutes on connection setup alone.
+        """
+        existing = getattr(self._local, "conn", None)
+        if existing is not None:
+            yield existing
+            return
+
+        conn = self._new_connection()
         try:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def session(self):
+        """
+        Hold one connection open across many operations.
+
+        Commit semantics are unchanged: every method still commits its own
+        work, so a failure part-way through leaves exactly the state it would
+        have left without a session. This removes only the repeated connect
+        and close. Re-entrant, so nesting is harmless.
+        """
+        if getattr(self._local, "conn", None) is not None:
+            yield self
+            return
+
+        conn = self._new_connection()
+        self._local.conn = conn
+        try:
+            yield self
+        finally:
+            self._local.conn = None
+            try:
+                conn.commit()
+            finally:
+                conn.close()
 
     def init_db(self):
         """Initialize SQLite tables and indexes."""
@@ -1187,23 +1279,53 @@ class Database:
             return row["total"] if row else 0
 
     def get_stats(self) -> Dict[str, Any]:
-        """Aggregate catalog and inventory statistics."""
+        """
+        Aggregate catalog and inventory statistics.
+
+        Two different units are reported and must not be confused, which is
+        why they are named rather than both called a "count":
+
+        * **cards** -- distinct catalogue rows, i.e. kinds of card. A card is
+          identified by name + set + condition + printing, so the same card in
+          two conditions is two.
+        * **copies** -- how many physical cards that adds up to.
+
+        ``total_cards`` / ``active_listings`` count cards; ``total_on_hand`` /
+        ``total_stock`` sum copies.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) AS total_cards FROM manifest")
-            total_cards = cursor.fetchone()["total_cards"]
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS total_cards,
+                       COALESCE(SUM(quantity), 0) AS total_on_hand
+                FROM manifest
+                """
+            )
+            row = cursor.fetchone()
+            total_cards = row["total_cards"]
+            total_on_hand = row["total_on_hand"]
 
-            cursor.execute("SELECT COUNT(*) AS active_listings FROM ebay_variations WHERE ebay_parent_id != ''")
-            active_listings = cursor.fetchone()["active_listings"]
-
-            cursor.execute("SELECT SUM(last_known_qty) AS total_stock FROM ebay_variations")
-            total_stock_row = cursor.fetchone()["total_stock"]
-            total_stock = total_stock_row if total_stock_row is not None else 0
+            # Both eBay figures use the same filter, so the count of cards and
+            # the sum of their copies always describe the same set of rows.
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS active_listings,
+                       COALESCE(SUM(last_known_qty), 0) AS total_stock
+                FROM ebay_variations
+                WHERE ebay_parent_id IS NOT NULL
+                  AND TRIM(ebay_parent_id) != ''
+                """
+            )
+            row = cursor.fetchone()
 
             return {
+                # cards (kinds)
                 "total_cards": total_cards,
-                "active_listings": active_listings,
-                "total_stock": total_stock,
+                "active_listings": row["active_listings"],
+                # copies (units)
+                "total_on_hand": total_on_hand,
+                "total_stock": row["total_stock"],
             }
 
     SHIPPED_PRICING_RULES = [
@@ -1309,38 +1431,14 @@ class Database:
         """
         Calculate final eBay price using the rules that apply to this user.
         Returns: (calculated_price, matched_rule_dict)
+
+        Reads the rules on every call. Code pricing many cards in a row should
+        load them once and call apply_pricing_rules directly, rather than
+        re-reading an unchanging table for every card.
         """
-        price = float(base_price or 0.0)
-        rules = self.get_pricing_rules(user_id=user_id)
-
-        for rule in rules:
-            min_p = rule["min_price"]
-            max_p = rule["max_price"]
-
-            # Check if price falls into this rule's range
-            is_match = False
-            if max_p is not None:
-                if min_p <= price < max_p:
-                    is_match = True
-            else:
-                if price >= min_p:
-                    is_match = True
-
-            if is_match:
-                r_type = rule["rule_type"]
-                r_val = rule["rule_value"]
-
-                if r_type == "fixed":
-                    return round(r_val, 2), rule
-                elif r_type == "markup_fixed":
-                    return round(price + r_val, 2), rule
-                elif r_type == "markup_percent":
-                    return round(price * (1.0 + r_val / 100.0), 2), rule
-
-        # Fallback if no rule matched
-        if price > 0:
-            return round(price, 2), None
-        return 1.99, None
+        return apply_pricing_rules(
+            self.get_pricing_rules(user_id=user_id), base_price
+        )
 
     def get_listing_settings(self, user_id: int = SHARED_SCOPE) -> Dict[str, str]:
         """

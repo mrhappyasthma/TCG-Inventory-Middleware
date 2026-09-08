@@ -5,7 +5,7 @@ import os
 import re
 from typing import Dict, Any, List, Optional
 from .csvtools import find_column as _find_column, read_csv_text, strip_bom
-from .db import Database, SHARED_SCOPE
+from .db import Database, SHARED_SCOPE, apply_pricing_rules
 
 
 # eBay File Exchange / Seller Hub Headers
@@ -456,6 +456,10 @@ def process_batch_csv(
         )
     replace_quantities = mode == QUANTITY_MODE_SET
 
+    # The rules cannot change while a batch runs, so read them once instead of
+    # once per card.
+    pricing_rules = db.get_pricing_rules(user_id=user_id)
+
     # Total seen in *this file* per card, so several rows for one card (the
     # same card in two bins) sum together before replacing the stored value.
     file_totals: Dict[str, int] = {}
@@ -673,8 +677,8 @@ def process_batch_csv(
         if ebay_price_val > 0:
             effective_price = ebay_price_val
         else:
-            effective_price, _ = db.calculate_price(
-                raw_base_price, user_id=user_id
+            effective_price, _ = apply_pricing_rules(
+                pricing_rules, raw_base_price
             )
 
         if not product_name or not set_name:
@@ -1170,15 +1174,17 @@ def process_batch_file(
 ) -> Dict[str, Any]:
     """Process a SortSwift batch CSV file from disk."""
     content = read_csv_text(input_path)
-    result = process_batch_csv(
-        content,
-        db,
-        source_name=os.path.basename(input_path),
-        force=force,
-        dry_run=dry_run,
-        user_id=user_id,
-        quantity_mode=quantity_mode,
-    )
+    # One connection for the whole run; see Database.session.
+    with db.session():
+        result = process_batch_csv(
+            content,
+            db,
+            source_name=os.path.basename(input_path),
+            force=force,
+            dry_run=dry_run,
+            user_id=user_id,
+            quantity_mode=quantity_mode,
+        )
     if revise_output_path and result["revise_count"] > 0:
         with open(revise_output_path, "w", encoding="utf-8", newline="") as f:
             f.write(result["revise_csv"])

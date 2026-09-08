@@ -387,6 +387,37 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ---
 
+## ⚡ Throughput
+
+Module A holds **one database connection open** for the whole run rather than
+opening and closing several per card, and the pricing rules are read once
+instead of once per card. Opening a connection, committing, and closing it
+costs around ten milliseconds — the cold commit plus a close-time WAL
+checkpoint — which a few thousand card rows turn into minutes of pure
+connection setup.
+
+Measured locally, same input, same commit-per-operation semantics:
+
+| Rows | Before | After | Connections opened |
+|---|---|---|---|
+| 400 | 10.3 s | 1.7 s | 1615 → 1 |
+| 1000 | 26.2 s | 4.5 s | 4015 → 1 |
+| 2000 | 54.0 s | 9.0 s | 8015 → 1 |
+
+`Database.session()` is a performance change only: every method still commits
+its own work, so a failure part-way through leaves the same state it would
+without a session. The held connection is **thread-local**, because the web app
+shares one `Database` across requests and a SQLite connection may not be used
+from another thread.
+
+All three pipelines also run in a worker thread via `run_in_threadpool`. Doing
+that synchronous work inline blocked uvicorn's event loop, so a large upload
+froze the **whole dashboard**, not just its own request — which is what made a
+slow batch look like a hang. A NAS is considerably slower than a dev machine,
+so both changes matter more there.
+
+---
+
 ## 🔢 What the quantities in your export mean
 
 SortSwift can export either a **full dump of everything you hold** or a **delta
@@ -840,6 +871,27 @@ are sortable, so you can bring the largest discrepancies to the top.
 Note that the two counts are *expected* to differ right after a batch and to
 converge after an Active Listings sync. The column is a reconciliation aid, not
 an error indicator.
+
+### Cards vs copies
+
+The dashboard reports two different units, and mixing them up is the main
+source of confusion. A **card** is a kind of card; a **copy** is a physical
+card. A card is identified by name + set + condition + printing, so the same
+card in two conditions is two cards.
+
+| Where | Label | Means | Unit |
+|---|---|---|---|
+| Ribbon | **Unique Cards** | Distinct rows in your catalog | cards |
+| Ribbon | **Copies On Hand** | Total you physically hold, summed from your dump | copies |
+| Ribbon | **Cards on eBay** | Distinct cards linked to a live listing. Many share one variation listing, so this is *not* a count of eBay listings | cards |
+| Ribbon | **Copies on eBay** | Total eBay reports as available | copies |
+| Table | **On Hand** | Copies of *this* card you hold | copies |
+| Table | **On eBay** | Copies of *this* card eBay reports available | copies |
+
+`On Hand` comes from your SortSwift dump; `On eBay` comes from eBay's Active
+Listings report. They are two independent measurements of the same thing, which
+is the point: they should agree, and where they don't you have stock to push or
+a sync to run.
 
 ---
 

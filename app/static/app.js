@@ -1092,6 +1092,7 @@ async function fetchStats() {
         if (res.ok) {
             const data = await res.json();
             document.getElementById("statTotalCards").innerText = data.total_cards.toLocaleString();
+            document.getElementById("statTotalOnHand").innerText = (data.total_on_hand ?? 0).toLocaleString();
             document.getElementById("statActiveListings").innerText = data.active_listings.toLocaleString();
             document.getElementById("statTotalStock").innerText = data.total_stock.toLocaleString();
         }

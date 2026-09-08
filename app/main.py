@@ -50,6 +50,7 @@ from fastapi.responses import (
     FileResponse,
 )
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from tcg_engine.csvtools import decode_csv_bytes
@@ -333,8 +334,12 @@ async def process_orders_endpoint(
     """
     content_bytes = await file.read()
     csv_text = decode_csv_bytes(content_bytes)
-    result = process_orders_csv(csv_text, db)
-    return result
+
+    def run():
+        with db.session():
+            return process_orders_csv(csv_text, db)
+
+    return await run_in_threadpool(run)
 
 
 @app.post("/api/process/batch")
@@ -374,16 +379,25 @@ async def process_batch_endpoint(
 
     content_bytes = await file.read()
     csv_text = decode_csv_bytes(content_bytes)
-    result = process_batch_csv(
-        csv_text,
-        db,
-        source_name=file.filename or "upload.csv",
-        force=force,
-        dry_run=dry_run,
-        user_id=user["id"],
-        quantity_mode=quantity_mode,
-    )
-    return result
+
+    # A few thousand card rows is seconds of synchronous SQLite work. Run it in
+    # a worker thread: doing it inline blocks uvicorn's event loop, which makes
+    # the whole dashboard unresponsive rather than just this request. The
+    # session holds one connection open for the run instead of opening and
+    # closing several per card.
+    def run():
+        with db.session():
+            return process_batch_csv(
+                csv_text,
+                db,
+                source_name=file.filename or "upload.csv",
+                force=force,
+                dry_run=dry_run,
+                user_id=user["id"],
+                quantity_mode=quantity_mode,
+            )
+
+    return await run_in_threadpool(run)
 
 
 @app.post("/api/process/sync")
@@ -396,8 +410,12 @@ async def process_sync_endpoint(
     """
     content_bytes = await file.read()
     csv_text = decode_csv_bytes(content_bytes)
-    result = sync_active_listings_csv(csv_text, db)
-    return result
+
+    def run():
+        with db.session():
+            return sync_active_listings_csv(csv_text, db)
+
+    return await run_in_threadpool(run)
 
 
 # ---------------------------------------------------------

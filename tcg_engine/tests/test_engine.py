@@ -4,7 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from tcg_engine.db import Database
+from tcg_engine.db import Database, apply_pricing_rules
 from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import process_batch_csv
 from tcg_engine.sync import sync_active_listings_csv
@@ -2178,6 +2178,121 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             self.db.get_variation(mid)["custom_label"], f"{mid}-Bin_ZZ-9"
         )
 
+    # -- stats: cards vs copies --------------------------------------------
+
+    def test_stats_separates_cards_from_copies(self):
+        """
+        Four figures in two different units. Confusing a count of cards with
+        a sum of copies is exactly what made the dashboard unreadable.
+        """
+        # Ledyba x3 across two bins, Heracross x2 -> 2 cards, 5 copies.
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="s.csv")
+        stats = self.db.get_stats()
+        self.assertEqual(stats["total_cards"], 2, "kinds of card")
+        self.assertEqual(stats["total_on_hand"], 5, "physical copies")
+
+        # Nothing linked to eBay yet.
+        self.assertEqual(stats["active_listings"], 0)
+        self.assertEqual(stats["total_stock"], 0)
+
+        ids = {r["product_name"]: r["manifest_id"]
+               for r in self.db.export_all_manifest()}
+        self.db.upsert_variation(ids["Ledyba"], "227511361186", 3)
+        self.db.upsert_variation(ids["Heracross"], "227511361186", 1)
+
+        stats = self.db.get_stats()
+        self.assertEqual(stats["active_listings"], 2, "cards linked to eBay")
+        self.assertEqual(stats["total_stock"], 4, "copies eBay reports")
+        # On hand is unchanged by what eBay says; the two are independent.
+        self.assertEqual(stats["total_on_hand"], 5)
+
+    def test_stats_ignores_unlinked_rows_in_both_ebay_figures(self):
+        """
+        The count and the sum must describe the same rows, or the ribbon shows
+        copies belonging to cards it is not counting.
+        """
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="s.csv")
+        ids = {r["product_name"]: r["manifest_id"]
+               for r in self.db.export_all_manifest()}
+        self.db.upsert_variation(ids["Ledyba"], "227511361186", 3)
+
+        # A row whose listing link was cleared still carries a quantity.
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO ebay_variations "
+                "(manifest_id, ebay_parent_id, last_known_qty) VALUES (?, '', ?)",
+                (ids["Heracross"], 99),
+            )
+            conn.commit()
+
+        stats = self.db.get_stats()
+        self.assertEqual(stats["active_listings"], 1)
+        self.assertEqual(stats["total_stock"], 3,
+                         "the unlinked row's 99 copies must not be counted")
+
+    def test_stats_on_an_empty_catalog_are_zero_not_none(self):
+        """SUM over no rows is NULL in SQLite and would render as blank."""
+        stats = self.db.get_stats()
+        self.assertEqual(stats["total_cards"], 0)
+        self.assertEqual(stats["total_on_hand"], 0)
+        self.assertEqual(stats["active_listings"], 0)
+        self.assertEqual(stats["total_stock"], 0)
+
+    # -- session-scoped connections ----------------------------------------
+
+    def test_session_reuses_one_connection_without_changing_results(self):
+        """
+        The session is a performance change only: it must not alter what a
+        batch produces, and it must leave the data committed.
+        """
+        import sqlite3 as _sqlite3
+        real = _sqlite3.connect
+        count = {"n": 0}
+
+        def counting(*a, **kw):
+            count["n"] += 1
+            return real(*a, **kw)
+
+        without = process_batch_csv(self.FULL_DUMP, self.db, source_name="a.csv")
+
+        fresh = Database(os.path.join(self.temp_dir.name, "session.db"))
+        _sqlite3.connect = counting
+        try:
+            with fresh.session():
+                withsess = process_batch_csv(self.FULL_DUMP, fresh,
+                                             source_name="a.csv")
+        finally:
+            _sqlite3.connect = real
+
+        self.assertEqual(without["add_csv"], withsess["add_csv"])
+        self.assertEqual(without["revise_csv"], withsess["revise_csv"])
+        self.assertEqual(count["n"], 1, "one connection for the whole run")
+
+        # Reopening proves the work was committed, not lost on close.
+        reopened = Database(fresh.db_path)
+        self.assertEqual(reopened.get_stats()["total_on_hand"], 5)
+
+    def test_session_is_reentrant(self):
+        """Nesting must not close the outer connection early."""
+        with self.db.session():
+            with self.db.session():
+                self.db.set_listing_settings({"category_id": "1"})
+            # Still usable after the inner block exits.
+            self.assertEqual(self.db.get_listing_setting("category_id"), "1")
+        self.assertEqual(self.db.get_listing_setting("category_id"), "1")
+
+    def test_apply_pricing_rules_is_pure(self):
+        """
+        Pricing behaviour must be testable without a database, since the batch
+        path now matches against an already-loaded rule set.
+        """
+        rules = self.db.get_pricing_rules()
+        for base in (0.10, 0.30, 0.75, 4.50, 0.0):
+            self.assertEqual(
+                apply_pricing_rules(rules, base),
+                self.db.calculate_price(base),
+                f"base={base}",
+            )
 
 if __name__ == "__main__":
     unittest.main()
