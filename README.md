@@ -807,8 +807,9 @@ eBay links, catalogued quantities, pricing rules, listing settings and cover
 photo overrides.
 
 Both live behind the **Database** button in the top navigation, which appears
-for administrators only. The endpoints enforce that too — hiding the button is
-not the control.
+for administrators only and carries an `ADMIN` badge. The endpoints enforce that
+too — hiding the button is not the control, and a non-admin request returns
+`403` whether or not the button was ever on screen.
 
 ### Backup
 
