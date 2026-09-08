@@ -194,6 +194,12 @@
 
                     <!-- Action / Download Buttons for Card 1 -->
                     <div id="resultBoxOrders" class="hidden mt-4 pt-3 border-t border-slate-800/80 space-y-2">
+                        <div class="flex items-center gap-1.5 text-[11px] text-accent-emerald">
+                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                            </svg>
+                            <span id="ordersReadyText">File ready</span>
+                        </div>
                         <button id="btnDownloadOrders" class="w-full text-xs font-semibold py-2.5 px-3 rounded-xl bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white shadow-md shadow-brand-500/20 flex items-center justify-center gap-2 transition-all">
                             <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -229,7 +235,34 @@
                     </div>
 
                     <!-- Action / Download Buttons for Card 2 -->
+                    <!-- Duplicate batch warning: shown instead of processing -->
+                    <div id="batchDuplicateWarning" class="hidden mt-4 pt-3 border-t border-slate-800/80 space-y-2.5">
+                        <div class="p-3 rounded-xl bg-amber-950/50 border border-amber-800/60 text-amber-200 space-y-1.5">
+                            <div class="flex items-start gap-2">
+                                <svg class="w-4 h-4 mt-0.5 shrink-0 text-amber-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                                </svg>
+                                <div>
+                                    <p class="text-[11px] font-bold text-amber-100">Already processed &mdash; nothing was changed</p>
+                                    <p id="batchDuplicateText" class="text-[11px] text-amber-300/90 mt-0.5"></p>
+                                </div>
+                            </div>
+                        </div>
+                        <button id="btnForceProcessBatch" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-amber-800 hover:bg-amber-700 text-amber-50 border border-amber-700 flex items-center justify-center gap-1.5 transition-all">
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                            <span>Force process anyway (adds quantities again)</span>
+                        </button>
+                    </div>
+
                     <div id="resultBoxBatch" class="hidden mt-4 pt-3 border-t border-slate-800/80 space-y-2">
+                        <div class="flex items-center gap-1.5 text-[11px] text-accent-emerald">
+                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                            </svg>
+                            <span id="batchReadyText">Files ready</span>
+                        </div>
                         <button id="btnDownloadRevise" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition-all">
                             <svg class="w-4 h-4 text-accent-amber" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />

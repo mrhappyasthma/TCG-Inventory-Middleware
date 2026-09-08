@@ -6,6 +6,8 @@ const pageSize = 20;
 let currentSearch = "";
 let currentSortBy = "manifest_id";
 let currentSortDir = "ASC";
+// Held so the "Force process anyway" button can resubmit the same upload.
+let pendingBatchFile = null;
 let storedGeneratedCSVs = {
     orders: null,
     revise: null,
@@ -639,6 +641,13 @@ function setupDropzones() {
         }
     });
 
+    document.getElementById("btnForceProcessBatch").addEventListener("click", () => {
+        if (!pendingBatchFile) return;
+        document.getElementById("batchDuplicateWarning").classList.add("hidden");
+        logToTerminal("WARN", `[MODULE B] Force processing ${pendingBatchFile.name} - quantities will be added again.`);
+        handleBatchUpload(pendingBatchFile, true);
+    });
+
     document.getElementById("btnDownloadAdd").addEventListener("click", () => {
         if (storedGeneratedCSVs.add) {
             triggerBrowserDownload(storedGeneratedCSVs.add, "ebay_new_additions.csv");
@@ -701,16 +710,22 @@ async function handleOrdersUpload(file) {
 
         storedGeneratedCSVs.orders = data.csv_content;
         document.getElementById("resultBoxOrders").classList.remove("hidden");
+        document.getElementById("ordersReadyText").innerText =
+            `sortswift_orders_import.csv ready (${data.converted_count} items)`;
 
-        // Automatically trigger browser download of SortSwift CSV
-        triggerBrowserDownload(data.csv_content, "sortswift_orders_import.csv");
-        logToTerminal("SUCCESS", `[MODULE A] Automatically triggered download for sortswift_orders_import.csv (${data.converted_count} items)`);
+        // The file is built and held in memory; downloading is an explicit
+        // click so an unwanted file is never dropped into Downloads.
+        logToTerminal("SUCCESS", `[MODULE A] sortswift_orders_import.csv is ready (${data.converted_count} items). Click to download.`);
     } catch (err) {
         logToTerminal("ERROR", `[MODULE A] ${err.message}`);
     }
 }
 
 async function handleBatchUpload(file, force = false) {
+    if (!force) {
+        document.getElementById("batchDuplicateWarning").classList.add("hidden");
+        document.getElementById("resultBoxBatch").classList.add("hidden");
+    }
     const formData = new FormData();
     formData.append("file", file);
     formData.append("force", force ? "true" : "false");
@@ -731,21 +746,22 @@ async function handleBatchUpload(file, force = false) {
         }
 
         // Batch quantities are additive, so the server refuses a file it has
-        // already applied. Let the operator override deliberately.
+        // already applied and writes nothing. Surface that inline with an
+        // explicit override rather than a blocking confirm() dialog.
         if (data.duplicate) {
-            const proceed = confirm(
-                `"${file.name}" has already been processed.\n\n` +
-                `Processing it again will ADD its quantities to your live eBay ` +
-                `stock a second time, which is almost never what you want.\n\n` +
-                `Process it anyway?`
-            );
-            if (proceed) {
-                logToTerminal("WARN", `[MODULE B] Forcing re-processing of ${file.name}...`);
-                return handleBatchUpload(file, true);
-            }
-            logToTerminal("INFO", `[MODULE B] Skipped duplicate batch ${file.name}.`);
+            pendingBatchFile = file;
+            const detail = (data.logs || []).find(l => l.level === "WARN");
+            document.getElementById("batchDuplicateText").innerText = detail
+                ? detail.message
+                : `"${file.name}" has already been processed. Nothing was added to your live inventory.`;
+            document.getElementById("batchDuplicateWarning").classList.remove("hidden");
+            document.getElementById("resultBoxBatch").classList.add("hidden");
             return;
         }
+
+        // A clean run: hide any stale duplicate warning.
+        pendingBatchFile = null;
+        document.getElementById("batchDuplicateWarning").classList.add("hidden");
 
         storedGeneratedCSVs.revise = data.revise_csv;
         storedGeneratedCSVs.add = data.add_csv;
@@ -759,15 +775,18 @@ async function handleBatchUpload(file, force = false) {
         btnRev.style.display = data.revise_count > 0 ? "flex" : "none";
         btnAdd.style.display = data.add_count > 0 ? "flex" : "none";
 
-        // Auto trigger downloads
-        if (data.revise_count > 0) {
-            triggerBrowserDownload(data.revise_csv, "ebay_inventory_updates.csv");
-        }
-        if (data.add_count > 0) {
-            setTimeout(() => {
-                triggerBrowserDownload(data.add_csv, "ebay_new_additions.csv");
-            }, 300);
-        }
+        const parts = [];
+        if (data.add_count > 0) parts.push(`${data.add_count} to add`);
+        if (data.revise_count > 0) parts.push(`${data.revise_count} to revise`);
+        if (data.skipped_count > 0) parts.push(`${data.skipped_count} skipped`);
+        document.getElementById("batchReadyText").innerText = parts.length
+            ? `Files ready \u2014 ${parts.join(", ")}`
+            : "Processed, but nothing to upload";
+
+        logToTerminal(
+            "SUCCESS",
+            `[MODULE B] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}. Click to download.`
+        );
 
         // Refresh live table and stats
         fetchStats();

@@ -317,7 +317,22 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 Module B **adds** quantities to the live store mirror, because a SortSwift export represents newly scanned stock. Processing the same export twice would therefore double your eBay quantities.
 
-To prevent that, every processed batch is fingerprinted (SHA-256 of the file contents) in the `processed_batches` table. Re-uploading a file that has already been applied is **refused**, and the dashboard asks whether you really want to proceed. Confirming re-sends the upload with `force=true`; the CLI equivalent is `--force`.
+To prevent that, every processed batch is fingerprinted (SHA-256 of the file
+contents) in the `processed_batches` table. Re-uploading a file that has already
+been applied is **refused before any database write happens** — the run returns
+early, so a conflicting batch is a true no-op rather than a partial apply.
+
+The dashboard then shows an inline warning naming when the file was last
+processed, alongside an explicit **"Force process anyway"** button. Nothing is
+auto-processed while a conflict is outstanding; you have to click through.
+The CLI equivalent is `--force`.
+
+### Generated files are never auto-downloaded
+
+Processing builds the output CSVs and holds them in the page, showing a *ready*
+indicator with the row counts. Downloading is always an explicit click, so a run
+you were only inspecting does not drop files into your Downloads folder. Use the
+download buttons on each module card.
 
 ---
 
@@ -448,7 +463,7 @@ visible at a glance:
 
 | Column | Meaning | Written by |
 |---|---|---|
-| **Quantity** | Total stock **you** have catalogued for that card, accumulated across every SortSwift batch you have processed. | Module B |
+| **Quantity** | Total stock **you** have catalogued for that card, read from the `Quantity` column of your SortSwift export and accumulated across every batch you have processed. | Module B |
 | **Live Stock** | The quantity **eBay** last reported for it. | Module C (Active Listings sync) |
 
 When the two disagree the pair is highlighted amber, with a tooltip naming both

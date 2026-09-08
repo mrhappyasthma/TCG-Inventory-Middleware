@@ -771,6 +771,38 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         # Untouched keys still hold their defaults.
         self.assertEqual(settings["return_profile_name"], "No Returns")
 
+    def test_refused_duplicate_is_a_true_noop(self):
+        """A conflicting batch must not touch live inventory at all."""
+        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db, source_name="b.csv")
+
+        def snapshot():
+            return (
+                [tuple(r.items()) for r in self.db.export_all_manifest()],
+                self.db.get_stats(),
+            )
+
+        before = snapshot()
+        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db, source_name="b.csv")
+        self.assertTrue(res["duplicate"])
+        self.assertEqual(snapshot(), before, "a refused duplicate mutated state")
+
+    def test_quantity_comes_from_the_csv_quantity_column(self):
+        hdr = (
+            '"Set","Name","Market Price","Condition","Printing","Quantity",'
+            '"Remarks","SKU Id","*ConditionID"'
+        )
+        rows = [
+            '"Chilling Reign","Deerling","0.17","NM","Normal",3,"C-1",111,"4000"',
+            '"Chilling Reign","Snover","0.17","NM","Normal",7,"C-2",112,"4000"',
+        ]
+        process_batch_csv(chr(10).join([hdr] + rows) + chr(10), self.db)
+
+        quantities = {
+            r["product_name"]: r["quantity"] for r in self.db.export_all_manifest()
+        }
+        self.assertEqual(quantities["Deerling"], 3)
+        self.assertEqual(quantities["Snover"], 7)
+
 
 if __name__ == "__main__":
     unittest.main()
