@@ -2,6 +2,7 @@ import csv
 import io
 import re
 from typing import Dict, Any, List, Optional, Tuple
+from .csvtools import find_column as _find_column, read_csv_text, strip_bom
 from .db import Database
 
 # SortSwift / TCGplayer Import & Deduction Template Headers
@@ -18,16 +19,6 @@ SORTSWIFT_HEADERS = [
 ]
 
 
-def _find_column(row: Dict[str, str], candidate_names: List[str]) -> Optional[str]:
-    """Find a column in a row dict matching candidate names (case-insensitive and trimmed)."""
-    normalized_row = {
-        k.strip().lower(): v for k, v in row.items() if k is not None
-    }
-    for candidate in candidate_names:
-        cand_clean = candidate.strip().lower()
-        if cand_clean in normalized_row:
-            return normalized_row[cand_clean]
-    return None
 
 
 def _find_header_line(text_lines: List[str]) -> int:
@@ -52,6 +43,7 @@ def process_orders_csv(
     
     Uses manifest_id lookup to retrieve exact card attributes and SortSwift 'skuId' / 'productId'.
     """
+    csv_text = strip_bom(csv_text)
     logs: List[Dict[str, str]] = []
     output_rows: List[Dict[str, Any]] = []
     converted_count = 0
@@ -196,8 +188,7 @@ def process_orders_file(
     input_path: str, db: Database, output_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """Process an eBay orders CSV file from disk."""
-    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
+    content = read_csv_text(input_path)
     result = process_orders_csv(content, db)
     if output_path:
         with open(output_path, "w", encoding="utf-8", newline="") as f:

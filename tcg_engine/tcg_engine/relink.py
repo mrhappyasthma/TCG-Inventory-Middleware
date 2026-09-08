@@ -22,6 +22,7 @@ import io
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .csvtools import find_column as _find_column, read_csv_text, strip_bom
 from .db import Database
 
 # "Card=Ledyba (004/198)" -> attribute "Card", value "Ledyba (004/198)"
@@ -31,15 +32,6 @@ _VARIATION_VALUE = re.compile(r"^[^=]+=(.*)$", re.DOTALL)
 _OPTION_NAME = re.compile(r"^(?P<name>.*?)\s*\((?P<number>[^()]+)\)\s*$")
 
 _MANIFEST_ID = re.compile(r"(ID\d+)", re.IGNORECASE)
-
-
-def _find_column(row: Dict[str, str], candidates: List[str]) -> Optional[str]:
-    normalized = {k.strip().lower(): v for k, v in row.items() if k is not None}
-    for candidate in candidates:
-        key = candidate.strip().lower()
-        if key in normalized:
-            return normalized[key]
-    return None
 
 
 def parse_option_name(value: str) -> Tuple[str, str]:
@@ -63,6 +55,7 @@ def relink_from_active_listings(csv_text: str, db: Database) -> Dict[str, Any]:
     Returns counts plus a log. Nothing is renamed unless a single unambiguous
     catalog card matches the listing's card identity.
     """
+    csv_text = strip_bom(csv_text)
     logs: List[Dict[str, str]] = []
     renamed = 0
     already_ok = 0
@@ -195,5 +188,4 @@ def relink_from_active_listings(csv_text: str, db: Database) -> Dict[str, Any]:
 
 def relink_from_file(input_path: str, db: Database) -> Dict[str, Any]:
     """Relink from an Active Listings report on disk."""
-    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
-        return relink_from_active_listings(f.read(), db)
+    return relink_from_active_listings(read_csv_text(input_path), db)

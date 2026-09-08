@@ -4,6 +4,7 @@ import io
 import os
 import re
 from typing import Dict, Any, List, Optional
+from .csvtools import find_column as _find_column, read_csv_text, strip_bom
 from .db import Database
 
 
@@ -306,16 +307,6 @@ def generate_variation_title(
     return render(template.replace("Near Mint", "NM"), trimmed_set)[:80]
 
 
-def _find_column(row: Dict[str, str], candidate_names: List[str]) -> Optional[str]:
-    """Find a column in a row dict matching candidate names (case-insensitive and trimmed)."""
-    normalized_row = {
-        k.strip().lower(): v for k, v in row.items() if k is not None
-    }
-    for candidate in candidate_names:
-        cand_clean = candidate.strip().lower()
-        if cand_clean in normalized_row:
-            return normalized_row[cand_clean]
-    return None
 
 
 def _parse_price(val: Optional[str]) -> float:
@@ -381,6 +372,7 @@ def process_batch_csv(
     stored file. Cards it cannot already find in the catalogue are skipped,
     since minting a manifest ID would itself be a write.
     """
+    csv_text = strip_bom(csv_text)
     logs: List[Dict[str, str]] = []
     revise_rows: List[Dict[str, Any]] = []
 
@@ -992,8 +984,7 @@ def process_batch_file(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Process a SortSwift batch CSV file from disk."""
-    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
+    content = read_csv_text(input_path)
     result = process_batch_csv(
         content,
         db,

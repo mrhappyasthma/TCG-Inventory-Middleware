@@ -1362,6 +1362,65 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(moved["ebay_parent_id"], "227511361186")
         self.assertEqual(moved["last_known_qty"], 7)
 
+    # ------------------------------------------------------------------
+    # UTF-8 BOM tolerance (eBay reports ship with one)
+    # ------------------------------------------------------------------
+
+    BOM = chr(0xFEFF)
+
+    def test_bom_does_not_break_the_first_column(self):
+        """
+        A BOM turns the first header into '﻿Item number', which matched
+        nothing and made Module C record every eBay item number as "UNKNOWN"
+        while otherwise appearing to succeed. Item number is the first column of
+        an Active Listings report, so it was always the casualty.
+        """
+        self._seed_live_catalog()
+        res = sync_active_listings_csv(self.BOM + self.ACTIVE_LISTINGS_REPORT, self.db)
+
+        self.assertEqual(res["synced_count"], 2)
+        item_ids = {
+            r["ebay_parent_id"] for r in self.db.get_inventory(limit=50)
+            if r["ebay_parent_id"]
+        }
+        self.assertEqual(item_ids, {"227511361186"})
+        self.assertNotIn("UNKNOWN", item_ids)
+
+    def test_bom_is_tolerated_by_every_module(self):
+        # Module B
+        db_b = Database(self.db_path + ".b")
+        plain = process_batch_csv(self.NUMBERED_BATCH, db_b)
+        db_b2 = Database(self.db_path + ".b2")
+        with_bom = process_batch_csv(self.BOM + self.NUMBERED_BATCH, db_b2)
+        self.assertEqual(plain["add_count"], with_bom["add_count"])
+        self.assertEqual(with_bom["skipped_count"], 0)
+
+        # Module A
+        self._seed_live_catalog()
+        orders = (
+            "Sales Record Number,Order Number,Item Title,Custom Label,Quantity" + chr(10)
+            + "901,ORD-901,Ledyba,ID1050-C-1,2" + chr(10)
+        )
+        res = process_orders_csv(self.BOM + orders, self.db)
+        self.assertEqual(res["converted_count"], 2)
+        self.assertEqual(res["skipped_count"], 0)
+
+    def test_find_column_tolerates_bom_asterisk_and_case(self):
+        from tcg_engine.csvtools import find_column
+
+        row = {
+            self.BOM + "Item number": "227511361186",
+            "*ConditionID": "4000",
+            "  Custom label (SKU)  ": "ID1050-C-1",
+        }
+        self.assertEqual(find_column(row, ["Item number"]), "227511361186")
+        # eBay's leading asterisk marks a required field; it is not part of the
+        # name, so either spelling must resolve.
+        self.assertEqual(find_column(row, ["ConditionID"]), "4000")
+        self.assertEqual(find_column(row, ["*ConditionID"]), "4000")
+        self.assertEqual(find_column(row, ["custom label (sku)"]), "ID1050-C-1")
+        self.assertIsNone(find_column(row, ["Nope"]))
+
 
 if __name__ == "__main__":
     unittest.main()

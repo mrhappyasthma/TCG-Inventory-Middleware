@@ -41,6 +41,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from tcg_engine.csvtools import decode_csv_bytes
 from tcg_engine.db import Database
 from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import process_batch_csv
@@ -297,7 +298,7 @@ async def process_orders_endpoint(
     Module A: Process raw eBay orders CSV & convert to SortSwift Orders Import CSV.
     """
     content_bytes = await file.read()
-    csv_text = content_bytes.decode("utf-8", errors="replace")
+    csv_text = decode_csv_bytes(content_bytes)
     result = process_orders_csv(csv_text, db)
     return result
 
@@ -320,7 +321,7 @@ async def process_batch_endpoint(
     anything to the catalogue or store mirror.
     """
     content_bytes = await file.read()
-    csv_text = content_bytes.decode("utf-8", errors="replace")
+    csv_text = decode_csv_bytes(content_bytes)
     result = process_batch_csv(
         csv_text,
         db,
@@ -340,7 +341,7 @@ async def process_sync_endpoint(
     Module C: Ingest eBay Active Listings report CSV & sync live store mirror state.
     """
     content_bytes = await file.read()
-    csv_text = content_bytes.decode("utf-8", errors="replace")
+    csv_text = decode_csv_bytes(content_bytes)
     result = sync_active_listings_csv(csv_text, db)
     return result
 

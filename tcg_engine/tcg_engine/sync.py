@@ -2,19 +2,10 @@ import csv
 import io
 import re
 from typing import Dict, Any, List, Optional
+from .csvtools import find_column as _find_column, read_csv_text, strip_bom
 from .db import Database
 
 
-def _find_column(row: Dict[str, str], candidate_names: List[str]) -> Optional[str]:
-    """Find a column in a row dict matching candidate names (case-insensitive and trimmed)."""
-    normalized_row = {
-        k.strip().lower(): v for k, v in row.items() if k is not None
-    }
-    for candidate in candidate_names:
-        cand_clean = candidate.strip().lower()
-        if cand_clean in normalized_row:
-            return normalized_row[cand_clean]
-    return None
 
 
 def sync_active_listings_csv(
@@ -26,6 +17,7 @@ def sync_active_listings_csv(
     Filters out parent container rows and unmapped items.
     UPSERTs Item Number and live Quantity for matching manifest IDs.
     """
+    csv_text = strip_bom(csv_text)
     logs: List[Dict[str, str]] = []
     synced_count = 0
     skipped_parent_count = 0
@@ -187,6 +179,5 @@ def sync_active_listings_file(
     input_path: str, db: Database
 ) -> Dict[str, Any]:
     """Sync eBay active listings from a file on disk."""
-    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
+    content = read_csv_text(input_path)
     return sync_active_listings_csv(content, db)
