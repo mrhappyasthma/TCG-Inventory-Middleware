@@ -48,7 +48,10 @@ from tcg_engine.orders import (
     build_deduction_csv,
     deduction_row,
 )
-from tcg_engine.batches import process_batch_csv
+from tcg_engine.batches import (
+    process_batch_csv,
+    build_cover_photo_revise_csv,
+)
 from tcg_engine.sync import sync_active_listings_csv
 
 try:
@@ -107,6 +110,10 @@ class StatusUpdateRequest(BaseModel):
 
 class RoleUpdateRequest(BaseModel):
     role: str
+
+
+class CoverImageRequest(BaseModel):
+    cover_image_url: str
 
 
 class QuantityUpdateRequest(BaseModel):
@@ -511,6 +518,43 @@ def get_ebay_listings_endpoint(user: Dict[str, Any] = Depends(require_active_use
     eBay item number to show the store the way eBay presents it.
     """
     return {"listings": db.get_ebay_listings()}
+
+
+@app.post("/api/ebay-listings/{item_id}/cover")
+def set_listing_cover(
+    item_id: str,
+    req: CoverImageRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Record a listing's cover photo and return a Revise file that applies it.
+
+    Saving locally is not enough on its own: the listing lives on eBay, so the
+    change only takes effect once the returned CSV is uploaded there.
+    """
+    url = (req.cover_image_url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="A cover photo URL is required.")
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="The cover photo must be a full http:// or https:// URL that eBay can fetch.",
+        )
+
+    known = {l["ebay_parent_id"] for l in db.get_ebay_listings()}
+    if item_id not in known:
+        raise HTTPException(
+            status_code=404,
+            detail="No linked listing with that eBay item number.",
+        )
+
+    saved = db.set_listing_cover_image(item_id, url)
+    return {
+        "success": True,
+        "ebay_parent_id": item_id,
+        "cover_image_url": saved,
+        "csv_content": build_cover_photo_revise_csv(item_id, saved),
+    }
 
 
 @app.get("/api/inventory/sets")

@@ -104,6 +104,15 @@ class Database:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS ebay_listing_overrides (
+                    ebay_parent_id TEXT PRIMARY KEY,
+                    cover_image_url TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS processed_batches (
                     sha256 TEXT PRIMARY KEY,
                     source_name TEXT,
@@ -750,15 +759,55 @@ class Database:
                     MIN(m.set_name)                        AS set_name,
                     COUNT(DISTINCT m.condition)            AS condition_count,
                     MIN(m.condition)                       AS condition,
-                    MAX(v.updated_at)                      AS last_synced
+                    MAX(v.updated_at)                      AS last_synced,
+                    COALESCE(o.cover_image_url, '')        AS cover_image_url
                 FROM ebay_variations v
                 JOIN manifest m ON m.manifest_id = v.manifest_id
+                LEFT JOIN ebay_listing_overrides o
+                       ON o.ebay_parent_id = v.ebay_parent_id
                 WHERE COALESCE(v.ebay_parent_id, '') != ''
-                GROUP BY v.ebay_parent_id
+                GROUP BY v.ebay_parent_id, o.cover_image_url
                 ORDER BY MAX(v.updated_at) DESC, v.ebay_parent_id ASC
                 """
             )
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_listing_cover_image(self, ebay_parent_id: str) -> str:
+        """Return the cover image recorded for a listing, or an empty string."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(cover_image_url, '') AS url "
+                "FROM ebay_listing_overrides WHERE ebay_parent_id = ?",
+                (str(ebay_parent_id).strip(),),
+            )
+            row = cursor.fetchone()
+            return row["url"] if row else ""
+
+    def set_listing_cover_image(self, ebay_parent_id: str, cover_image_url: str) -> str:
+        """
+        Record the cover image for one eBay listing.
+
+        Stored per listing rather than in listing_settings, because that setting
+        is the default for listings not yet created, whereas this is an override
+        for a specific live listing.
+        """
+        item_id = str(ebay_parent_id).strip()
+        url = str(cover_image_url or "").strip()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO ebay_listing_overrides (ebay_parent_id, cover_image_url, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(ebay_parent_id) DO UPDATE SET
+                    cover_image_url = excluded.cover_image_url,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (item_id, url),
+            )
+            conn.commit()
+        return url
 
     def get_distinct_set_names(self) -> List[Dict[str, Any]]:
         """

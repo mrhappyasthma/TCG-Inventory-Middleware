@@ -457,11 +457,12 @@
                                     <th class="py-3 px-4 text-center">Cards</th>
                                     <th class="py-3 px-4 text-center" title="Total quantity catalogued across this listing's cards.">Catalog Qty</th>
                                     <th class="py-3 px-4 text-center" title="Total quantity eBay last reported for this listing.">Live Qty</th>
+                                    <th class="py-3 px-4">Cover Photo</th>
                                     <th class="py-3 px-4">Last Synced</th>
                                 </tr>
                             </thead>
                             <tbody id="ebayListingsTableBody" class="divide-y divide-slate-800/60 text-slate-300">
-                                <tr><td colspan="7" class="py-8 text-center text-slate-500">Loading listings...</td></tr>
+                                <tr><td colspan="8" class="py-8 text-center text-slate-500">Loading listings...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -641,6 +642,46 @@
                     <button type="submit" class="w-full py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20 transition-all">
                         Save to Catalog
                     </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- COVER PHOTO MODAL -->
+    <div id="coverModal" data-modal class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
+        <div class="w-full max-w-lg bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
+            <button onclick="closeCoverModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+
+            <div class="mb-4">
+                <h3 class="text-lg font-bold font-heading text-white">Change Cover Photo</h3>
+                <p class="text-xs text-slate-400 mt-1" id="coverModalListing">&nbsp;</p>
+            </div>
+
+            <form id="coverForm" onsubmit="saveCoverPhoto(event)" class="space-y-4 text-xs">
+                <div>
+                    <label class="block text-slate-300 mb-1">Cover photo URL</label>
+                    <input type="url" id="coverUrlInput" required placeholder="https://..." class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                    <p class="text-[10px] text-slate-500 mt-1">Must be a full URL eBay can fetch. eBay ignores a URL identical to one already on the listing, so use a different image.</p>
+                </div>
+
+                <div id="coverPreviewWrap" class="hidden">
+                    <p class="text-[11px] text-slate-400 mb-1.5">Preview</p>
+                    <img id="coverPreview" alt="Cover preview" class="max-h-40 rounded-lg border border-slate-700 bg-dark-900">
+                    <p id="coverPreviewError" class="hidden text-[11px] text-amber-300 mt-1.5">That URL did not load in the browser. eBay may not be able to fetch it either.</p>
+                </div>
+
+                <div class="p-3 rounded-xl bg-amber-950/40 border border-amber-800/60 text-[11px] text-amber-200">
+                    <p class="font-semibold text-amber-100 mb-1">This replaces the listing&rsquo;s whole picture set</p>
+                    <p>eBay does not merge pictures on a revision &mdash; the uploaded set replaces what is there. Saving here records the change and downloads a Revise CSV; the listing only updates once you upload that file to eBay.</p>
+                </div>
+
+                <div class="flex items-center justify-end gap-2 pt-2 border-t border-slate-700">
+                    <button type="button" onclick="closeCoverModal()" class="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">Cancel</button>
+                    <button type="submit" class="px-4 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20">Save &amp; Download Revise CSV</button>
                 </div>
             </form>
         </div>

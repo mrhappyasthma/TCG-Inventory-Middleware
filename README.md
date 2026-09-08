@@ -581,7 +581,7 @@ syntax, the blank parent `Relationship`, the `CD:40001` column, the category or
 the bare `Action` header. Those were the parts most at risk of being wrong.
 * **Output 1 (`ebay_inventory_updates.csv`)** — Revise:
   ```
-  Action,Item Number,Custom Label,Quantity,Price
+  Action,ItemID,CustomLabel,Quantity,Price
   ```
 * **Output 2 (`ebay_new_additions.csv`)** — Add:
   ```
@@ -693,6 +693,39 @@ The view is empty until a Module B sync has linked something, and refreshes
 automatically after each sync. A listing spanning several sets or conditions is
 usually a sign the grouping went wrong, which is why it is flagged rather than
 hidden.
+
+#### Changing a listing's cover photo
+
+The **Cover Photo** column shows the recorded cover image per listing and opens
+a dialog to change it. The URL is previewed in the browser first, which is a
+cheap check: if it will not render there, eBay is unlikely to fetch it either.
+
+Saving records the value **and downloads a Revise file**:
+
+```csv
+Action,ItemID,PicURL
+Revise,227511361186,https://cdn.example.com/new-cover.jpg
+```
+
+Upload that to Seller Hub → Reports → Upload to apply it. Saving alone changes
+nothing on eBay — the listing lives there, not here.
+
+* ⚠️ **A revision replaces the listing's entire picture set.** eBay does not
+  merge pictures; the uploaded set replaces what is present.
+* eBay **ignores a URL identical to one already on the listing**, so re-sending
+  the same address is a no-op. Use a different image.
+* Do not mix eBay-hosted and self-hosted images on one listing; eBay rejects
+  the combination.
+* This is stored **per listing**, separately from the global **Cover photo URL**
+  in Listing Rules — that one is the default applied to *new* listings Module A
+  generates, whereas this overrides one specific live listing. A re-sync does not
+  disturb it.
+
+> **Note on the `ItemID` column**: a File Exchange *upload* identifies an
+> existing listing with `ItemID`. `Item Number` is what the Active Listings
+> *report* calls the same value, and is not a valid upload column — the batch
+> Revise file previously used it, which would have left every row without an
+> identifier.
 
 ---
 

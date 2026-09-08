@@ -103,7 +103,10 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 
         # Verify Revise CSV has updated quantity (2 previous + 3 new = 5)
         revise_lines = res["revise_csv"].strip().splitlines()
-        self.assertEqual(revise_lines[0], "Action,Item Number,Custom Label,Quantity,Price")
+        # A File Exchange upload identifies an existing listing by "ItemID";
+        # "Item Number" is the Active Listings report's name for it and is not
+        # a valid upload column.
+        self.assertEqual(revise_lines[0], "Action,ItemID,CustomLabel,Quantity,Price")
         self.assertTrue(any("Revise" in line and "123456789099" in line and "ID1001" in line and "5" in line for line in revise_lines))
 
         # Verify Add CSV has new card with generated ID1002
@@ -1619,6 +1622,89 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         # positive, which would silently re-add stock.
         self.assertEqual(deduction_row(card, -2, "X")["Quantity"], -2)
         self.assertEqual(deduction_row(card, 0, "X")["Quantity"], 0)
+
+    # ------------------------------------------------------------------
+    # Per-listing cover photo
+    # ------------------------------------------------------------------
+
+    def _linked_listing(self):
+        process_batch_csv(self.TWO_SET_BATCH, self.db)
+        by_name = {c["product_name"]: c["manifest_id"]
+                   for c in self.db.export_all_manifest()}
+        self.db.upsert_variation(by_name["Ledyba"], "227511361186", 1)
+        self.db.upsert_variation(by_name["Heracross"], "227511361186", 1)
+        return "227511361186"
+
+    def test_cover_image_defaults_to_empty_and_round_trips(self):
+        item = self._linked_listing()
+        self.assertEqual(self.db.get_listing_cover_image(item), "")
+        self.assertEqual(
+            self.db.get_ebay_listings()[0]["cover_image_url"], ""
+        )
+
+        self.db.set_listing_cover_image(item, "https://cdn/cover.jpg")
+        self.assertEqual(self.db.get_listing_cover_image(item), "https://cdn/cover.jpg")
+        self.assertEqual(
+            self.db.get_ebay_listings()[0]["cover_image_url"], "https://cdn/cover.jpg"
+        )
+
+    def test_cover_image_is_per_listing_not_global(self):
+        item = self._linked_listing()
+        by_name = {c["product_name"]: c["manifest_id"]
+                   for c in self.db.export_all_manifest()}
+        self.db.upsert_variation(by_name["Deerling"], "999888777", 1)
+
+        self.db.set_listing_cover_image(item, "https://cdn/one.jpg")
+        covers = {l["ebay_parent_id"]: l["cover_image_url"]
+                  for l in self.db.get_ebay_listings()}
+        self.assertEqual(covers[item], "https://cdn/one.jpg")
+        # The other listing is untouched.
+        self.assertEqual(covers["999888777"], "")
+
+    def test_cover_image_survives_a_resync(self):
+        item = self._linked_listing()
+        self.db.set_listing_cover_image(item, "https://cdn/cover.jpg")
+
+        # A sync rewrites ebay_variations; the override lives elsewhere and
+        # must not be collateral damage.
+        report = (
+            "Item number,Title,Variation details,Custom label (SKU),Available quantity"
+            + chr(10)
+            + '"227511361186",Pick,Card=Ledyba (004/198),'
+            + [c["manifest_id"] for c in self.db.export_all_manifest()
+               if c["product_name"] == "Ledyba"][0] + ',"9"' + chr(10)
+        )
+        sync_active_listings_csv(report, self.db)
+        self.assertEqual(self.db.get_listing_cover_image(item), "https://cdn/cover.jpg")
+
+    def test_cover_revise_csv_uses_the_upload_column_names(self):
+        from tcg_engine.batches import build_cover_photo_revise_csv
+
+        text = build_cover_photo_revise_csv("227511361186", "https://cdn/cover.jpg")
+        lines = text.strip().splitlines()
+        # ItemID, not "Item Number": the latter is the Active Listings report's
+        # name for it and is not a File Exchange upload column.
+        self.assertEqual(lines[0], "Action,ItemID,PicURL")
+
+        row = list(csv.DictReader(io.StringIO(text)))[0]
+        self.assertEqual(row["Action"], "Revise")
+        self.assertEqual(row["ItemID"], "227511361186")
+        self.assertEqual(row["PicURL"], "https://cdn/cover.jpg")
+        self.assertEqual(len(lines), 2, "one listing, one row")
+
+    def test_revise_output_uses_itemid_not_item_number(self):
+        """The batch Revise file is an upload, so it must use ItemID."""
+        self.db.insert_manifest("ID1001", "Gengar", "Fossil", "NM", "Holofoil")
+        self.db.upsert_variation("ID1001", "123456789099", 2)
+
+        batch = (
+            "Product Name,Set Name,Condition,Printing,Quantity,ConditionID" + chr(10)
+            + "Gengar,Fossil,NM,Holofoil,3,4000" + chr(10)
+        )
+        res = process_batch_csv(batch, self.db)
+        header = res["revise_csv"].splitlines()[0].split(",")
+        self.assertIn("ItemID", header)
+        self.assertNotIn("Item Number", header)
 
 
 if __name__ == "__main__":

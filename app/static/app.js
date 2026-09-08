@@ -1341,8 +1341,92 @@ function noteConsoleActivity(level) {
 }
 
 // -------------------------------------------------------------------
+// COVER PHOTO
+// -------------------------------------------------------------------
+
+let coverEditItemId = null;
+
+function openCoverModal(itemId) {
+    const listing = lastEbayListings.find(l => l.ebay_parent_id === itemId);
+    coverEditItemId = itemId;
+
+    document.getElementById("coverModalListing").innerText = listing
+        ? `eBay #${itemId} - ${listing.set_name || "?"}, ${listing.card_count} card(s)`
+        : `eBay #${itemId}`;
+    document.getElementById("coverUrlInput").value =
+        listing ? (listing.cover_image_url || "") : "";
+    updateCoverPreview();
+
+    document.getElementById("coverModal").classList.remove("hidden");
+    syncModalScrollLock();
+    document.getElementById("coverUrlInput").focus();
+}
+
+function closeCoverModal() {
+    document.getElementById("coverModal").classList.add("hidden");
+    syncModalScrollLock();
+    coverEditItemId = null;
+}
+
+// Loading the URL in the browser is a cheap sanity check: if it will not render
+// here, eBay is unlikely to be able to fetch it either.
+function updateCoverPreview() {
+    const url = document.getElementById("coverUrlInput").value.trim();
+    const wrap = document.getElementById("coverPreviewWrap");
+    const img = document.getElementById("coverPreview");
+    const err = document.getElementById("coverPreviewError");
+
+    if (!/^https?:\/\//i.test(url)) {
+        wrap.classList.add("hidden");
+        return;
+    }
+    err.classList.add("hidden");
+    img.style.display = "";
+    img.onerror = () => {
+        img.style.display = "none";
+        err.classList.remove("hidden");
+    };
+    img.src = url;
+    wrap.classList.remove("hidden");
+}
+
+document.getElementById("coverUrlInput")?.addEventListener("input", updateCoverPreview);
+
+async function saveCoverPhoto(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!coverEditItemId) return;
+
+    const url = document.getElementById("coverUrlInput").value.trim();
+    try {
+        const res = await fetch(`/api/ebay-listings/${encodeURIComponent(coverEditItemId)}/cover`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cover_image_url: url })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to save the cover photo");
+
+        const id = coverEditItemId;
+        closeCoverModal();
+
+        triggerBrowserDownload(data.csv_content, `ebay_cover_photo_${id}.csv`);
+        logToTerminal("SUCCESS", `Cover photo recorded for eBay #${id}.`);
+        logToTerminal("INFO",
+            `Upload ebay_cover_photo_${id}.csv to Seller Hub to apply it. `
+            + "eBay replaces the listing's whole picture set on revision.");
+
+        fetchEbayListings();
+    } catch (err) {
+        alert(err.message);
+    }
+}
+
+// -------------------------------------------------------------------
 // EBAY LISTINGS VIEW
 // -------------------------------------------------------------------
+
+// The cover photo dialog needs the listing it was opened from.
+let lastEbayListings = [];
 
 async function fetchEbayListings() {
     const tbody = document.getElementById("ebayListingsTableBody");
@@ -1355,10 +1439,11 @@ async function fetchEbayListings() {
         if (!res.ok) throw new Error(data.detail || "Failed to load listings");
 
         const listings = data.listings || [];
+        lastEbayListings = listings;
         if (!listings.length) {
             tbody.innerHTML = `
                 <tr>
-                    <td colspan="7" class="py-8 text-center text-slate-500">
+                    <td colspan="8" class="py-8 text-center text-slate-500">
                         No linked eBay listings yet. Upload an Active Listings report
                         to Module B to link your catalog to live listings.
                     </td>
@@ -1399,6 +1484,16 @@ async function fetchEbayListings() {
                     <td class="py-3 px-4 text-center" title="${escapeHtml(driftTitle)}">
                         <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${liveBadge}">${l.live_quantity}</span>
                     </td>
+                    <td class="py-3 px-4">
+                        <button onclick="openCoverModal('${escapeHtml(l.ebay_parent_id)}')" class="flex items-center gap-2 text-left group/cover" title="${l.cover_image_url ? escapeHtml(l.cover_image_url) : "No cover photo recorded. Click to set one."}">
+                            ${l.cover_image_url
+                                ? `<img src="${escapeHtml(l.cover_image_url)}" alt="" class="w-8 h-8 rounded object-cover border border-slate-700 bg-dark-900" onerror="this.style.display='none'">`
+                                : `<span class="w-8 h-8 rounded border border-dashed border-slate-700 flex items-center justify-center text-slate-600 text-[10px]">?</span>`}
+                            <span class="text-[11px] ${l.cover_image_url ? "text-slate-400" : "text-slate-600 italic"} group-hover/cover:text-accent-cyan underline decoration-dotted">
+                                ${l.cover_image_url ? "Change" : "Set cover"}
+                            </span>
+                        </button>
+                    </td>
                     <td class="py-3 px-4 text-slate-500 text-[11px] font-mono">${escapeHtml(l.last_synced || "-")}</td>
                 </tr>`;
         }).join("");
@@ -1410,7 +1505,7 @@ async function fetchEbayListings() {
                 `${listings.length} listing(s), ${cards} linked card(s), ${live} unit(s) live on eBay`;
         }
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="7" class="py-6 text-center text-rose-400">Failed to load listings: ${escapeHtml(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-rose-400">Failed to load listings: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
 
