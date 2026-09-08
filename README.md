@@ -26,6 +26,27 @@ graph TD
 
 ---
 
+### Dashboard order vs module letters
+
+The dashboard presents the three modules in **workflow order**, left to right:
+
+| Step on the dashboard | Module |
+|---|---|
+| 1. Process SortSwift Batch | **B** |
+| 2. Sync Active eBay Inventory | **C** |
+| 3. Process eBay Orders | **A** |
+
+That order follows the dependency chain: a batch has to be catalogued and listed
+before eBay has anything to sync back, and the sync has to have linked the item
+numbers before an order can be traced to a card.
+
+The **module letters do not renumber** with the display order. They are stable
+identifiers used by the CLI subcommands, the terminal log prefixes
+(`[MODULE B] ...`) and the section headings in this document, so renaming them
+would break more than it clarified.
+
+---
+
 ## 🔐 Authentication: Google Sign-In Only
 
 This application authenticates **exclusively through Google Sign-In**. There is no local username/password login and no development bypass, so there is exactly one way to become an authenticated user.
