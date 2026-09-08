@@ -1,11 +1,11 @@
-version: '3.8'
-
 services:
   tcg-middleware:
     build: .
     container_name: tcg-ebay-middleware
     ports:
-      # Change HOST_PORT in your .env or Synology Container Manager if 8080 is taken
+      # Change HOST_PORT in your .env or Synology Container Manager if 8080 is taken.
+      # Reach the dashboard through the DSM reverse proxy over HTTPS, not this
+      # port directly: Google Sign-In cannot authorize a raw IP or plain HTTP origin.
       - "${HOST_PORT:-8080}:8080"
     volumes:
       # Maps persistent data directory on Synology NAS (adjust path if needed)
@@ -13,7 +13,10 @@ services:
     environment:
       - DATABASE_URL=/data/inventory.db
       - USER_DATABASE_URL=/data/users.db
-      - AUTH_METHOD=${AUTH_METHOD:-local}
-      - JWT_SECRET=${JWT_SECRET:-change-this-to-a-secure-random-string}
-      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - SESSION_SECRET_FILE=/data/.session_secret
+      # Required. The container will not start without it.
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:?GOOGLE_CLIENT_ID must be set in .env}
+      # Optional: if blank, a random secret is generated and persisted to /data.
+      - JWT_SECRET=${JWT_SECRET:-}
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
     restart: unless-stopped
