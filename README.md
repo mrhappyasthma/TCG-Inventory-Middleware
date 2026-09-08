@@ -295,6 +295,25 @@ Configure how the middleware splits and titles listings via the **"Listing Rules
   * Default Title: `{set_name}: Pick Your Card - {condition} - Complete Your Set`
   * `{condition}` is substituted **verbatim** from your export, so the title always matches the cards it describes.
   * **Automatic Fallback**: if the title exceeds eBay's 80-character limit, the **set name** is trimmed. The condition is never abbreviated or altered, because the title makes a factual claim about the cards.
+* **Dropdown option labels** (`variation_option_template`, default
+  `{name} ({card_number})`): each card appears as e.g. `Crushing Gloves (133/198)`.
+  The number keeps reprints distinguishable, and options are **always sorted by
+  card number** so the dropdown reads in collector order rather than upload
+  order. Sorting is numeric, not alphabetical — `4/198` comes before `16/198`
+  before `133/198` — and handles prefixed numbering such as `TG12/TG30`. A card
+  with no number falls back to just its name and sorts last.
+* **One image per variation**: each child row's `PicURL` is written as
+  `<option name>=<url>`, e.g.
+  `Crushing Gloves (133/198)=https://cdn/gloves.jpg`. This prefix is required —
+  eBay ignores a bare URL on a variation row, which is why only the listing's
+  main photo used to appear. A card with no image gets an empty cell rather than
+  a dangling separator. Note eBay permits per-variation photos on **one**
+  variation attribute only; `Card` is our only one, so this is fine. Multiple
+  images for a single variation would require eBay Picture Services, and eBay
+  will not mix its own hosted images with self-hosted ones.
+* **Cover photo** (`cover_image_url`, optional): sets the listing's main image.
+  Leave it blank to use the first card in the set. Variations keep their own
+  images either way.
 * **Parent & Child Row Generation** in `ebay_new_additions.csv`:
   * **Parent Row**: `Relationship` is left **empty**, `RelationshipDetails = Card=Name1;Name2;...`, category `183454` (CCG Individual Cards), title, description and cover image.
   * **Child Rows**: `Relationship = Variation`, `RelationshipDetails = Card=Name1`, price, quantity, `ConditionID`, `CustomLabel` (`ID1001-Bin_A-12`) and image.

@@ -1002,6 +1002,98 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(revise[0]["Quantity"], "3")
         self.assertEqual(self.db.get_variation("ID1001")["last_known_qty"], 3)
 
+    # ------------------------------------------------------------------
+    # Variation option names, ordering, and per-variation images
+    # ------------------------------------------------------------------
+
+    NUMBERED_BATCH = """"Game","Set","Card Number","Name","Rarity","Market Price","Condition","Language","Printing","Quantity","Remarks","SKU Id","CDN Image","*ConditionID"
+"Pokemon","Chilling Reign","133/198","Crushing Gloves","Common","0.17","NM","English","Normal",1,"C-1",111,"https://cdn/gloves.jpg","4000"
+"Pokemon","Chilling Reign","4/198","Heracross","Common","0.17","NM","English","Normal",1,"C-1",112,"https://cdn/heracross.jpg","4000"
+"Pokemon","Chilling Reign","16/198","Deerling","Common","0.17","NM","English","Normal",1,"C-1",113,"","4000"
+"""
+
+    def _parent(self, res):
+        return next(
+            r for r in csv.DictReader(io.StringIO(res["add_csv"])) if r["Title"]
+        )
+
+    def _children(self, res):
+        return [
+            r for r in csv.DictReader(io.StringIO(res["add_csv"]))
+            if r["Relationship"] == "Variation"
+        ]
+
+    def test_option_names_include_the_card_number(self):
+        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
+        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
+        self.assertIn("Crushing Gloves (133/198)", options)
+
+    def test_options_are_sorted_numerically_by_card_number(self):
+        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
+        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
+        # 4 before 16 before 133 -- a string sort would give 133, 16, 4.
+        self.assertEqual(
+            options,
+            ["Heracross (4/198)", "Deerling (16/198)", "Crushing Gloves (133/198)"],
+        )
+        # Child rows must follow the same order as the parent's option list.
+        child_options = [
+            c["RelationshipDetails"].split("=", 1)[1] for c in self._children(res)
+        ]
+        self.assertEqual(child_options, options)
+
+    def test_cards_without_a_number_sort_last_and_drop_the_brackets(self):
+        batch = self.NUMBERED_BATCH.replace('"16/198","Deerling"', '"","Deerling"')
+        res = process_batch_csv(batch, self.db)
+        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
+        self.assertEqual(options[-1], "Deerling", "no empty brackets, sorted last")
+
+    def test_each_variation_image_is_prefixed_with_its_option_name(self):
+        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
+        pics = {
+            c["RelationshipDetails"].split("=", 1)[1]: c["PicURL"]
+            for c in self._children(res)
+        }
+        # eBay ignores a bare URL on a child row; it must name the option.
+        self.assertEqual(
+            pics["Crushing Gloves (133/198)"],
+            "Crushing Gloves (133/198)=https://cdn/gloves.jpg",
+        )
+        self.assertEqual(
+            pics["Heracross (4/198)"], "Heracross (4/198)=https://cdn/heracross.jpg"
+        )
+        # A card with no image gets an empty cell, not a dangling separator.
+        self.assertEqual(pics["Deerling (16/198)"], "")
+
+    def test_cover_photo_setting_overrides_the_parent_image(self):
+        self.db.set_listing_settings({"cover_image_url": "https://cdn/cover.jpg"})
+        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
+        self.assertEqual(self._parent(res)["PicURL"], "https://cdn/cover.jpg")
+        # Variations keep their own images regardless.
+        pics = [c["PicURL"] for c in self._children(res) if c["PicURL"]]
+        self.assertTrue(any("gloves.jpg" in p for p in pics))
+
+    def test_parent_falls_back_to_the_first_cards_image(self):
+        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
+        # First in sorted order is Heracross (4/198).
+        self.assertEqual(self._parent(res)["PicURL"], "https://cdn/heracross.jpg")
+
+    def test_option_template_is_configurable(self):
+        self.db.set_listing_settings(
+            {"variation_option_template": "{card_number} {name}"}
+        )
+        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
+        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
+        self.assertEqual(options[0], "4/198 Heracross")
+
+    def test_equals_sign_is_stripped_from_option_names(self):
+        from tcg_engine.batches import build_variation_option_name
+
+        # "=" separates the option from its URL in PicURL, so it must not
+        # survive inside an option name.
+        built = build_variation_option_name("Weird=Card", "1/10")
+        self.assertNotIn("=", built)
+
 
 if __name__ == "__main__":
     unittest.main()

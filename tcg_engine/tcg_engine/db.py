@@ -12,6 +12,9 @@ DEFAULT_SELLER_POSTAL_CODE = "94305"
 # eBay requires the "Game" item specific on card listings. Used only when the
 # uploaded export does not supply one.
 DEFAULT_GAME = "Pokémon TCG"
+# Dropdown label for each card in a variation listing. The card number keeps
+# reprints distinguishable and gives the list a natural order.
+DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
 DEFAULT_SHIPPING_PROFILE = "Free Shipping Cards"
 DEFAULT_RETURN_PROFILE = "No Returns"
 DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
@@ -192,6 +195,8 @@ class Database:
                     ("return_profile_name", DEFAULT_RETURN_PROFILE),
                     ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
                     ("default_game", DEFAULT_GAME),
+                    ("variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE),
+                    ("cover_image_url", ""),
                 ]
                 cursor.executemany(
                     """
@@ -201,7 +206,6 @@ class Database:
                     default_settings,
                 )
 
-            # Backfill settings keys added after the initial seed.
             # Backfill settings keys added after the initial seed. A key that
             # already exists but is blank is also filled, so a database created
             # before these defaults existed picks them up. A value the user has
@@ -213,6 +217,7 @@ class Database:
                 ("return_profile_name", DEFAULT_RETURN_PROFILE),
                 ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
                 ("default_game", DEFAULT_GAME),
+                ("variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE),
             ):
                 cursor.execute(
                     """

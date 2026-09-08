@@ -118,6 +118,12 @@ VARIATION_VALUE_SEPARATOR = ";"
 VARIATION_ATTRIBUTE_SEPARATOR = "|"
 VARIATION_ATTRIBUTE_NAME = "Card"
 
+# Per-variation images are declared as "<option value>=<url>", so "=" is a
+# delimiter in that position and must not survive inside an option name.
+VARIATION_PICTURE_SEPARATOR = "="
+
+DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
+
 # eBay's ConditionID for an ungraded card. Graded cards use IDs extending 2750
 # and need a different descriptor, which this engine does not yet emit.
 UNGRADED_CONDITION_ID = "4000"
@@ -217,9 +223,51 @@ def _sanitize_variation_value(value: str) -> str:
     splitting one card into several bogus options.
     """
     cleaned = str(value or "").strip()
-    for sep in (VARIATION_VALUE_SEPARATOR, VARIATION_ATTRIBUTE_SEPARATOR):
+    for sep in (
+        VARIATION_VALUE_SEPARATOR,
+        VARIATION_ATTRIBUTE_SEPARATOR,
+        VARIATION_PICTURE_SEPARATOR,
+    ):
         cleaned = cleaned.replace(sep, "/")
     return cleaned
+
+
+def build_variation_option_name(
+    product_name: str,
+    card_number: str = "",
+    template: str = DEFAULT_VARIATION_OPTION_TEMPLATE,
+) -> str:
+    """
+    Build the dropdown label for one card, e.g. "Crushing Gloves (121/198)".
+
+    The card number makes otherwise-identical reprints distinguishable and
+    gives the list a natural order. When a card has no number the template
+    collapses to just the name rather than leaving empty brackets.
+    """
+    name = str(product_name or "").strip()
+    number = str(card_number or "").strip()
+    if not number:
+        return _sanitize_variation_value(name)
+    rendered = template.replace("{name}", name).replace("{card_number}", number)
+    return _sanitize_variation_value(rendered)
+
+
+def variation_sort_key(card: Dict[str, Any]):
+    """
+    Order a variation group by card number so the eBay dropdown reads in
+    collector order rather than upload order.
+
+    Card numbers are not plain integers -- "121/198", "TG12/TG30", "SV107" --
+    so the leading integer is used, with any non-numeric prefix as a secondary
+    key. Cards with no usable number sort last, alphabetically, instead of
+    being scattered through the list.
+    """
+    raw = str(card.get("card_number") or "").strip()
+    match = re.search(r"(\d+)", raw)
+    if not match:
+        return (1, "", 0, str(card.get("product_name") or "").lower())
+    prefix = raw[: match.start()].upper()
+    return (0, prefix, int(match.group(1)), str(card.get("product_name") or "").lower())
 
 
 def generate_variation_title(
@@ -355,6 +403,10 @@ def process_batch_csv(
     descriptor_style = db.get_listing_setting("condition_descriptor_style", "label_id")
     postal_code = str(db.get_listing_setting("seller_postal_code", "")).strip()
     default_game = str(db.get_listing_setting("default_game", "")).strip()
+    option_template = db.get_listing_setting(
+        "variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE
+    )
+    cover_image_url = str(db.get_listing_setting("cover_image_url", "")).strip()
 
     # Only emit policy columns that are actually configured; a blank policy
     # name is worse than an absent column.
@@ -739,6 +791,9 @@ def process_batch_csv(
                 "cdn_back_image": cdn_back_image or "",
                 "stock_image": stock_image or "",
                 "card_number": card_number or "",
+                "option_name": build_variation_option_name(
+                    product_name, card_number or "", option_template
+                ),
             }
 
             if not group_by_set:
@@ -771,16 +826,23 @@ def process_batch_csv(
         if not cards:
             continue
 
+        # Order the dropdown by card number. The parent's option list and the
+        # child rows must agree, so sort once and use it for both.
+        cards = sorted(cards, key=variation_sort_key)
+
         # Generate Parent Container Row
         parent_title = generate_variation_title(
             set_title, condition=group_condition, template=title_template
         )
-        cover_image = next((c["cdn_image"] for c in cards if c["cdn_image"]), "")
+        # An explicit cover image wins; otherwise fall back to the first card's.
+        cover_image = cover_image_url or next(
+            (c["cdn_image"] for c in cards if c["cdn_image"]), ""
+        )
 
         # Declare the option list on the parent. eBay separates values within
         # one attribute by semicolons; a pipe would be read as the start of a
         # second attribute and rejected.
-        option_names = [_sanitize_variation_value(c["product_name"]) for c in cards]
+        option_names = [c["option_name"] for c in cards]
         parent_rel_details = (
             f"{VARIATION_ATTRIBUTE_NAME}="
             + VARIATION_VALUE_SEPARATOR.join(option_names)
@@ -820,15 +882,21 @@ def process_batch_csv(
                 "Title": "",
                 "Relationship": "Variation",
                 "RelationshipDetails": (
-                    f"{VARIATION_ATTRIBUTE_NAME}="
-                    f"{_sanitize_variation_value(c['product_name'])}"
+                    f"{VARIATION_ATTRIBUTE_NAME}={c['option_name']}"
                 ),
                 "Description": "",
                 "ConditionID": c["condition_id"],
                 "StartPrice": f"{c['price']:.2f}",
                 "Quantity": c["quantity"],
                 "CustomLabel": c["custom_label"],
-                "PicURL": c["cdn_image"],
+                # A per-variation image must name the option it belongs to:
+                # "<option value>=<url>". A bare URL here is ignored by eBay,
+                # which is why only the parent's picture used to appear.
+                "PicURL": (
+                    f"{c['option_name']}{VARIATION_PICTURE_SEPARATOR}{c['cdn_image']}"
+                    if c["cdn_image"]
+                    else ""
+                ),
                 "Format": "FixedPrice",
                 "Duration": "GTC",
                 "Price": f"{c['price']:.2f}",
@@ -846,7 +914,7 @@ def process_batch_csv(
 
         # Single listings: include front, back, and stock images (pipe-delimited)
         single_pic_parts = [url for url in [
-            s["cdn_image"],
+            cover_image_url or s["cdn_image"],
             s.get("cdn_back_image", ""),
             s.get("stock_image", ""),
         ] if url]
