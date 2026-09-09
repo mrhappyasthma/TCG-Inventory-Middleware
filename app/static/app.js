@@ -135,47 +135,42 @@ function showGoogleUnavailable() {
 
 function updateAuthUI(data) {
     const btnOpenLogin = document.getElementById("btnOpenLoginModal");
-    const userProfileBadge = document.getElementById("userProfileBadge");
-    const btnLogout = document.getElementById("btnLogout");
-    const btnAdminPanel = document.getElementById("btnAdminPanel");
+    const btnAccountMenu = document.getElementById("btnAccountMenu");
     const pendingBanner = document.getElementById("pendingApprovalBanner");
 
     if (data.is_authenticated && data.user) {
         btnOpenLogin.classList.add("hidden");
-        userProfileBadge.classList.remove("hidden");
-        userProfileBadge.classList.add("flex");
-        btnLogout.classList.remove("hidden");
+        btnAccountMenu.classList.remove("hidden");
+        btnAccountMenu.classList.add("flex");
         pendingBanner.classList.add("hidden");
 
         document.getElementById("userNameText").innerText = data.user.username;
         document.getElementById("userAvatarText").innerText = data.user.username[0].toUpperCase();
+        document.getElementById("accountMenuName").innerText = data.user.username;
+        document.getElementById("accountMenuEmail").innerText = data.user.email || "";
 
         const roleBadge = document.getElementById("userRoleBadge");
         roleBadge.innerText = data.user.role.toUpperCase();
-        const btnDatabase = document.getElementById("btnDatabasePanel");
+
+        // One group rather than two buttons: the divider and the whole admin
+        // section should disappear together for an ordinary user, leaving a
+        // menu that holds only Sign out.
+        const adminGroup = document.getElementById("accountMenuAdminGroup");
         if (data.user.role === "admin") {
-            btnAdminPanel.classList.remove("hidden");
-            btnAdminPanel.classList.add("flex");
-            // Backup and restore both expose or replace shared data, so the
-            // whole panel is admin-only. The endpoints enforce this too; this
-            // only hides a control the user could not use anyway.
-            if (btnDatabase) {
-                btnDatabase.classList.remove("hidden");
-                btnDatabase.classList.add("flex");
-            }
+            adminGroup.classList.remove("hidden");
             roleBadge.className = "text-[10px] uppercase px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800";
         } else {
-            btnAdminPanel.classList.add("hidden");
-            if (btnDatabase) btnDatabase.classList.add("hidden");
+            // Both entries expose or replace shared data. The endpoints
+            // enforce that too; this only hides controls that would 403.
+            adminGroup.classList.add("hidden");
             roleBadge.className = "text-[10px] uppercase px-1.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800";
         }
     } else {
         btnOpenLogin.classList.remove("hidden");
-        userProfileBadge.classList.add("hidden");
-        userProfileBadge.classList.remove("flex");
-        btnLogout.classList.add("hidden");
-        btnAdminPanel.classList.add("hidden");
-        document.getElementById("btnDatabasePanel")?.classList.add("hidden");
+        btnAccountMenu.classList.add("hidden");
+        btnAccountMenu.classList.remove("flex");
+        document.getElementById("accountMenuAdminGroup").classList.add("hidden");
+        closeAccountMenu();
 
         if (data.is_pending) {
             pendingBanner.classList.remove("hidden");
@@ -218,6 +213,53 @@ async function handleGoogleCallback(response) {
         errorBox.classList.remove("hidden");
     }
 }
+
+// -------------------------------------------------------------------
+// ACCOUNT MENU
+// -------------------------------------------------------------------
+
+function accountMenuIsOpen() {
+    const menu = document.getElementById("accountMenu");
+    return menu && !menu.classList.contains("hidden");
+}
+
+function openAccountMenu() {
+    const menu = document.getElementById("accountMenu");
+    if (!menu) return;
+    menu.classList.remove("hidden");
+    document.getElementById("btnAccountMenu")?.setAttribute("aria-expanded", "true");
+    document.getElementById("accountMenuChevron")?.classList.add("rotate-180");
+}
+
+function closeAccountMenu() {
+    const menu = document.getElementById("accountMenu");
+    if (!menu) return;
+    menu.classList.add("hidden");
+    document.getElementById("btnAccountMenu")?.setAttribute("aria-expanded", "false");
+    document.getElementById("accountMenuChevron")?.classList.remove("rotate-180");
+}
+
+document.getElementById("btnAccountMenu")?.addEventListener("click", (e) => {
+    // Stop this from immediately reaching the close-on-outside-click handler.
+    e.stopPropagation();
+    if (accountMenuIsOpen()) closeAccountMenu(); else openAccountMenu();
+});
+
+// Any choice in the menu leads somewhere else, so the menu always closes. This
+// runs on the container, so it covers every entry including ones added later.
+document.getElementById("accountMenu")?.addEventListener("click", closeAccountMenu);
+
+document.addEventListener("click", (e) => {
+    if (!accountMenuIsOpen()) return;
+    if (e.target.closest("#accountMenu") || e.target.closest("#btnAccountMenu")) return;
+    closeAccountMenu();
+});
+
+// Escape closes the menu. Handled separately from the modal handler, which
+// bails out when no modal is open and would otherwise leave this stuck.
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && accountMenuIsOpen()) closeAccountMenu();
+});
 
 document.getElementById("btnLogout").addEventListener("click", async () => {
     await fetch("/api/auth/logout", { method: "POST" });

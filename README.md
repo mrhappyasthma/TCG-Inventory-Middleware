@@ -49,7 +49,7 @@ This application authenticates **exclusively through Google Sign-In**. There is 
 
 * **First User Auto-Admin**: The very first Google account to sign in is automatically granted the `admin` role and `active` status.
 * **Admin Approval Required**: Every subsequent account lands in `pending` status and cannot process inventory until an admin approves it.
-* **Admin Control Panel**: Sign in as the admin and click **"Users & Approvals"** in the top navigation bar to approve pending accounts, deactivate users, or promote users to admin.
+* **Admin Control Panel**: Sign in as the admin, click your name in the top-right, and choose **"Users & Approvals"** to approve pending accounts, deactivate users, or promote users to admin. The account menu also holds **Database** for admins, and **Sign out** for everyone.
 * **Stable Identity**: Accounts are keyed on the Google `sub` claim, not the email address, so a user changing their Google email keeps the same local account and approval state.
 * **`GOOGLE_CLIENT_ID` is required.** The app refuses to start without it rather than booting into a state where nobody can sign in.
 
@@ -950,12 +950,21 @@ source of confusion. A **card** is a kind of card; a **copy** is a physical
 card. A card is identified by name + set + condition + printing, so the same
 card in two conditions is two cards.
 
+The header groups them by unit, with yours above eBay's, so the comparison
+that matters reads top to bottom:
+
+```
+CARDS          COPIES
+35 unique      40 on hand
+35 on eBay     40 on eBay
+```
+
 | Where | Label | Means | Unit |
 |---|---|---|---|
-| Ribbon | **Unique Cards** | Distinct rows in your catalog | cards |
-| Ribbon | **Copies On Hand** | Total you physically hold, summed from your dump | copies |
-| Ribbon | **Cards on eBay** | Distinct cards linked to a live listing. Many share one variation listing, so this is *not* a count of eBay listings | cards |
-| Ribbon | **Copies on eBay** | Total eBay reports as available | copies |
+| Ribbon | **Cards / unique** | Distinct rows in your catalog | cards |
+| Ribbon | **Cards / on eBay** | Distinct cards linked to a live listing. Many share one variation listing, so this is *not* a count of eBay listings | cards |
+| Ribbon | **Copies / on hand** | Total you physically hold, summed from your dump | copies |
+| Ribbon | **Copies / on eBay** | Total eBay reports as available | copies |
 | Table | **On Hand** | Copies of *this* card you hold | copies |
 | Table | **On eBay** | Copies of *this* card eBay reports available | copies |
 
@@ -1044,8 +1053,8 @@ shared baseline.
 
 ## 💾 Backup and restore
 
-Everything lives behind the **Database** button in the top navigation, which
-appears for administrators only and carries an `ADMIN` badge. The endpoints
+Everything lives behind **Database** in the account menu — click your name in
+the top-right. It appears for administrators only and carries an `ADMIN` badge. The endpoints
 enforce that too — hiding the button is not the control, and a non-admin request
 returns `403` whether or not the button was ever on screen.
 
