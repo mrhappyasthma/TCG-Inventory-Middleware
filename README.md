@@ -387,6 +387,53 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ---
 
+## 📌 Revising a variation listing
+
+Confirmed against a live listing, because the failure mode is unobvious.
+
+A Revise that carries `Relationship` / `RelationshipDetails` **must also
+include the parent container row** declaring the complete option list:
+
+```
+Action,ItemID,Relationship,RelationshipDetails,CustomLabel,Quantity
+Revise,227511361186,,Card=Ledyba (004/198);Ledian (005/198);...all of them...,,
+Revise,227511361186,Variation,Card=Ledyba (004/198),ID1050-C-1,1
+Revise,227511361186,Variation,Card=Ledian (005/198),ID1066-C-1,1
+```
+
+* The parent row leaves `Relationship` **empty**. Marking it `Variation`
+  leaves eBay unable to tell which row is the container.
+* The parent's `RelationshipDetails` lists every option, separated by `;`. A
+  pipe would start a second attribute.
+* `Quantity` is blank on the parent: eBay ignores item-level quantity on a
+  variation listing and sums the children (warning `21916619`).
+
+Sending only child rows fails with:
+
+```
+21916664  Variation Specifics provided does not match with the variation
+          specifics of the variations on the item.
+21916639  Variation specific value "X" used for pictures does not exist in
+          variation specific set.
+```
+
+The second error is the tell. eBay derives the variation specific set from
+what you sent, and with no parent row that set is just the values in the child
+rows — which no longer accounts for the per-variation picture mappings the
+listing already holds. It reads like a picture problem and is really a missing
+parent row.
+
+The option values must match eBay's exactly, so take them from the **Active
+Listings report's `Variation details` column** rather than regenerating them.
+A stored title template can be edited after a listing is created, at which
+point regenerating an option name produces a value eBay has never heard of.
+
+Note that Module A's ordinary Revise file is a different, simpler shape
+(`Action,ItemID,CustomLabel,Quantity,Price`) that identifies variations by SKU
+alone and mentions no specifics, so none of the above applies to it.
+
+---
+
 ## 🧮 Why a Revise file can be empty
 
 Module A only writes a Revise row when it would **change** something. A full
