@@ -423,10 +423,28 @@ rows — which no longer accounts for the per-variation picture mappings the
 listing already holds. It reads like a picture problem and is really a missing
 parent row.
 
+Prices sit in different columns depending on the row: a child row carries
+`Start price` and leaves `Current price` **empty**, while the parent row does
+the opposite. Reading `Current price` first therefore learns nothing for
+variations, which is why `find_column` takes a `skip_blank` flag. It is off by
+default because emptiness is meaningful elsewhere -- a blank `Custom label
+(SKU)` is exactly how the parent row is recognised.
+
 The option values must match eBay's exactly, so take them from the **Active
 Listings report's `Variation details` column** rather than regenerating them.
 A stored title template can be edited after a listing is created, at which
 point regenerating an option name produces a value eBay has never heard of.
+
+### A variation's CustomLabel cannot be renamed
+
+Confirmed: a Revise that changes a child row's `CustomLabel` returns
+**Success** and does not change it. Verified by re-downloading the Active
+Listings report afterwards and finding every label unchanged.
+
+That is worth knowing twice over. First, it means a card's bin/remark cannot be
+pushed to an existing variation listing, so the bin is display-only once the
+listing exists. Second, and more generally: **a File Exchange `Success` does
+not mean your change was applied.** Always confirm against a fresh report.
 
 Note that Module A's ordinary Revise file is a different, simpler shape
 (`Action,ItemID,CustomLabel,Quantity,Price`) that identifies variations by SKU

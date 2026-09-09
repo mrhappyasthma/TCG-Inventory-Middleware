@@ -128,6 +128,7 @@ def sync_active_listings_csv(
                 "Quantity",
                 "Qty",
             ],
+            skip_blank=True,
         )
         try:
             quantity = int(qty_str.strip()) if qty_str else 0
@@ -140,6 +141,10 @@ def sync_active_listings_csv(
         # whether a Revise row would change anything, and has to emit one for
         # every card. Absent from some report layouts, which is why "unknown"
         # is a distinct state from "zero".
+        # On a variation listing the child rows carry "Start price" and leave
+        # "Current price" blank; the parent row is the other way round. Without
+        # skip_blank the first candidate wins with an empty string and the
+        # price is never learned, which silently disables no-op suppression.
         price_cell = _find_column(
             row,
             [
@@ -152,6 +157,7 @@ def sync_active_listings_csv(
                 "Price",
                 "Fixed price",
             ],
+            skip_blank=True,
         )
         reported_price = parse_price(price_cell) if price_cell else 0.0
         known_price = reported_price if reported_price > 0 else None

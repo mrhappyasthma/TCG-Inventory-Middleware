@@ -2663,6 +2663,54 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(res["zeroed_count"], 1)
         self.assertEqual(
             self.db.get_variation(ids["Heracross"])["pending_qty"], 0)
+    # -- eBay puts the same value in different columns per row type ---------
+
+    def test_find_column_can_skip_present_but_empty_columns(self):
+        """
+        On a variation listing the child rows carry "Start price" and leave
+        "Current price" blank; the parent row is the other way round. Without
+        skip_blank the first candidate wins with an empty string.
+        """
+        from tcg_engine.csvtools import find_column
+
+        child = {"Start price": "1.99", "Current price": ""}
+        parent = {"Start price": "1.99", "Current price": "2.49"}
+        order = ["Current price", "Start price"]
+
+        # Default behaviour is unchanged: first present column wins.
+        self.assertEqual(find_column(child, order), "")
+        self.assertEqual(find_column(parent, order), "2.49")
+
+        self.assertEqual(find_column(child, order, skip_blank=True), "1.99")
+        self.assertEqual(find_column(parent, order, skip_blank=True), "2.49")
+
+        # Whitespace counts as blank, and exhausting the candidates is None.
+        self.assertIsNone(
+            find_column({"Current price": "   "}, order, skip_blank=True))
+
+    def test_sync_learns_a_variation_price_from_start_price(self):
+        """
+        The real report leaves Current price empty on child rows, so reading
+        it would learn nothing and silently disable no-op suppression.
+        """
+        header = ("Item number,Title,Variation details,Custom label (SKU),"
+                  "Available quantity,Start price,Current price")
+        ids = self._seed_live_dump()
+        mid = ids["Ledyba"]
+        report = chr(10).join([
+            header,
+            f'"227511361186",Pick Your Card,"Card=Ledyba (004/198)",,"3",1.99,1.99',
+            f'"227511361186",Pick Your Card,"Card=Ledyba (004/198)",{mid},"3",2.49,',
+        ]) + chr(10)
+
+        res = sync_active_listings_csv(report, self.db)
+        self.assertEqual(res["skipped_parent_count"], 1,
+                         "a blank custom label must still mean parent")
+        variation = self.db.get_variation(mid)
+        self.assertEqual(variation["last_known_qty"], 3)
+        self.assertEqual(variation["last_known_price"], 2.49,
+                         "the price must come from Start price")
+
 
 if __name__ == "__main__":
     unittest.main()
