@@ -2570,6 +2570,99 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             self.assertAlmostEqual(parse_price(raw), want, places=2,
                                    msg=repr(raw))
 
+    # -- skipped rows must never look like sold-out cards -------------------
+
+    NO_CONDITION_ID_DUMP = (
+        '"Game","Set","Card Number","Name","Market Price","Condition",'
+        '"Language","Printing","Quantity","Remarks"' + chr(10)
+        + '"Pokemon","Chilling Reign","004/198","Ledyba","0.30","NM",'
+          '"English","Normal",2,"Bin A-1"' + chr(10)
+        + '"Pokemon","Chilling Reign","006/198","Heracross","0.40","NM",'
+          '"English","Normal",2,"Bin A-2"' + chr(10)
+    )
+
+    def test_an_unparseable_dump_never_zeroes_live_listings(self):
+        """
+        Every skip happens before a row reaches file_totals, so a skipped row
+        is indistinguishable from a card the dump omitted -- and the remedy for
+        an omitted card is to stop selling it. A file whose rows all fail to
+        parse would therefore have revised the entire store to zero. This is
+        the exact shape of a real report: a SortSwift export with no
+        *ConditionID column.
+        """
+        ids = self._seed_live_dump()
+        for mid in ids.values():
+            self.db.upsert_variation(mid, "227511361186", 3,
+                                     custom_label=mid + "-C-1",
+                                     last_known_price=2.49)
+
+        res = process_batch_csv(self.NO_CONDITION_ID_DUMP, self.db,
+                                source_name="no-condid.csv")
+
+        self.assertEqual(res["parsed_rows"], 0)
+        self.assertEqual(res["skipped_count"], 2)
+        self.assertFalse(res["reconciled"])
+        self.assertEqual(res["zeroed_count"], 0, "nothing may be delisted")
+
+        rows = list(csv.DictReader(io.StringIO(res["revise_csv"])))
+        self.assertEqual([r for r in rows if r["Quantity"] == "0"], [],
+                         "no zero-quantity row may reach the file")
+
+        # The live store is untouched.
+        for mid in ids.values():
+            self.assertEqual(
+                self.db.get_variation(mid)["last_known_qty"], 3)
+
+        messages = chr(10).join(lg["message"] for lg in res["logs"])
+        self.assertIn("not a reliable picture", messages)
+        self.assertIn("Not one row", messages)
+
+    def test_a_partially_skipped_dump_also_withholds_reconciliation(self):
+        """
+        Even one unreadable row means the file is not a complete picture, and
+        the cost of being wrong is a delisted card.
+        """
+        ids = self._seed_live_dump()
+        for mid in ids.values():
+            self.db.upsert_variation(mid, "227511361186", 3,
+                                     custom_label=mid + "-C-1",
+                                     last_known_price=2.49)
+
+        # One good row, one with no ConditionID.
+        mixed = (
+            '"Game","Set","Card Number","Name","Market Price","Condition",'
+            '"Language","Printing","Quantity","Remarks","*ConditionID"' + chr(10)
+            + '"Pokemon","Chilling Reign","004/198","Ledyba","0.30","NM",'
+              '"English","Normal",3,"Bin A-1","4000"' + chr(10)
+            + '"Pokemon","Chilling Reign","099/198","Mystery","0.30","NM",'
+              '"English","Normal",1,"Bin Z-9",""' + chr(10)
+        )
+        res = process_batch_csv(mixed, self.db, source_name="mixed.csv")
+
+        self.assertEqual(res["skipped_count"], 1)
+        self.assertGreater(res["parsed_rows"], 0)
+        self.assertFalse(res["reconciled"])
+        self.assertEqual(res["zeroed_count"], 0)
+        self.assertIn("not a reliable picture",
+                      chr(10).join(lg["message"] for lg in res["logs"]))
+
+    def test_a_clean_dump_still_reconciles_sold_out_cards(self):
+        """The guard must not disable the feature for a file that parsed fine."""
+        ids = self._seed_live_dump()
+        for mid in ids.values():
+            self.db.upsert_variation(mid, "227511361186", 3,
+                                     custom_label=mid + "-C-1",
+                                     last_known_price=2.49)
+
+        # Header plus the two Ledyba rows only: Heracross genuinely dropped.
+        smaller = chr(10).join(self.FULL_DUMP.splitlines()[:3]) + chr(10)
+        res = process_batch_csv(smaller, self.db, source_name="clean.csv")
+
+        self.assertEqual(res["skipped_count"], 0)
+        self.assertTrue(res["reconciled"])
+        self.assertEqual(res["zeroed_count"], 1)
+        self.assertEqual(
+            self.db.get_variation(ids["Heracross"])["pending_qty"], 0)
 
 if __name__ == "__main__":
     unittest.main()

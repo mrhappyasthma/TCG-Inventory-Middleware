@@ -1059,7 +1059,13 @@ async function handleBatchUpload(file, mode = "normal") {
         // "Nothing to upload" on its own reads like a failure. When the
         // reason is that everything already matches eBay, say so.
         const nothingToSend = data.revise_count === 0 && data.add_count === 0;
-        document.getElementById("batchReadyText").innerText = nothingToSend
+        // Every row unusable is a failure, not an empty result. Saying
+        // "nothing to upload" there reads like everything was already in
+        // order, which is the opposite of the truth.
+        const nothingParsed = data.parsed_rows === 0 && data.skipped_count > 0;
+        document.getElementById("batchReadyText").innerText = nothingParsed
+            ? `No rows could be read \u2014 all ${data.skipped_count} were skipped. See the console for why.`
+            : nothingToSend
             ? (data.unchanged_count > 0
                 ? `Nothing to upload \u2014 all ${data.unchanged_count} card(s) already match eBay${suffix}`
                 : `Nothing to upload${suffix}`)
@@ -1074,6 +1080,14 @@ async function handleBatchUpload(file, mode = "normal") {
             logToTerminal(
                 "INFO",
                 `[MODULE A] No Revise file needed: all ${data.unchanged_count} linked card(s) already match eBay on quantity and price.`
+            );
+        }
+
+        if (data.reconciled === false && data.skipped_count > 0
+            && data.parsed_rows > 0) {
+            logToTerminal(
+                "WARN",
+                `[MODULE A] Sold-out reconciliation was skipped: ${data.skipped_count} row(s) could not be read, so a missing card cannot be told apart from an unreadable one. No listing was revised to 0.`
             );
         }
 

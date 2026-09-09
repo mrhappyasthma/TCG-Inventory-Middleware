@@ -414,6 +414,14 @@ That last row matters: suppression is based on what eBay is *known* to hold,
 never on what we last asked for. Otherwise a change you generated but never
 uploaded would silently vanish from every subsequent file.
 
+### Every row skipped?
+
+`*ConditionID` is required and is never inferred, so a SortSwift export without
+that column has **every** row skipped. The dashboard then says *"No rows could
+be read — all N were skipped"* rather than reporting a file as ready, and the
+console names the reason per row. Re-export from SortSwift with the
+ConditionID column included.
+
 ### It needs one sync first
 
 The price comparison depends on `ebay_variations.last_known_price`, which
@@ -592,12 +600,19 @@ why an unrecognised `quantity_mode` is rejected rather than guessed at.
 * **One Revise row per card.** Emitting one row per CSV row would produce two
   rows for that card whose `CustomLabel`s differ by bin, and only one of those
   labels exists on the listing.
-* **Cards absent from the dump are revised down to `0`.** A full dump that
-  omits a card means the card is gone; leaving it alone would keep selling
-  stock you no longer have. The row carries a **blank `Price`**, which tells
-  eBay to leave the price alone — the row is only about stock. Each one is
-  logged as `[SOLD OUT]` naming the card, and a card already at `0` is not
-  re-zeroed.
+* **Cards absent from the dump are revised down to `0`** — but only if the
+  file parsed cleanly. A full dump that omits a card means the card is gone;
+  leaving it alone would keep selling stock you no longer have. The row carries
+  a **blank `Price`**, which tells eBay to leave the price alone — the row is
+  only about stock. Each one is logged as `[SOLD OUT]` naming the card, and a
+  card already at `0` is not re-zeroed.
+* **If any row was skipped, nothing is zeroed.** Every skip happens before a
+  row is counted, so a skipped row is indistinguishable from a card the dump
+  omitted — and the remedy for an omitted card is to stop selling it. A file
+  whose rows all fail to parse would otherwise revise the *entire store* to
+  zero, from a file that in fact listed all of it. One unreadable row costs
+  that run's sold-out detection, which is trivially recoverable next to
+  delisting live inventory. Fix the skipped rows and re-run.
 * **The `CustomLabel` comes from eBay, not from the file.** A zero-out row has
   no CSV row to derive a label from, and the bin suffix cannot be
   reconstructed from a card's identity. Module B records the label from eBay's

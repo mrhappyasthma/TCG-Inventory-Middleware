@@ -373,6 +373,8 @@ def _empty_batch_result(
         "revise_count": 0,
         "zeroed_count": 0,
         "unchanged_count": 0,
+        "parsed_rows": 0,
+        "reconciled": False,
         "add_count": 0,
         "new_catalog_count": 0,
         "skipped_count": 0,
@@ -1138,7 +1140,33 @@ def process_batch_csv(
         })
 
     zeroed_count = 0
-    if replace_quantities:
+
+    # Zeroing is only safe if we actually understood the file. Every skip
+    # happens before a row reaches file_totals, so a skipped row looks
+    # identical to a card the dump omitted -- and the remedy for an omitted
+    # card is to stop selling it. A file whose rows we could not parse is
+    # therefore the most dangerous input there is: with every row skipped,
+    # file_totals is empty and every live listing would be revised to zero,
+    # delisting the whole store from a file that in fact listed all of it.
+    #
+    # So reconcile only against a file that parsed cleanly. One unreadable row
+    # costs this run's sold-out detection, which is a trivially recoverable
+    # loss next to wiping live inventory.
+    reconcile = replace_quantities and skipped_count == 0
+
+    if replace_quantities and skipped_count:
+        logs.append({
+            "level": "WARN",
+            "message": (
+                f"{skipped_count} row(s) could not be processed, so this file is "
+                f"not a reliable picture of your stock. Cards missing from it "
+                f"have NOT been revised down to 0 -- a skipped row is "
+                f"indistinguishable from a card you no longer hold. Fix the "
+                f"skipped rows above and re-run to reconcile sold-out cards."
+            ),
+        })
+
+    if reconcile:
 
         # A full dump lists everything on hand, so a card that is live on eBay
         # and absent from the file has sold out. Left alone it would keep its
@@ -1189,14 +1217,15 @@ def process_batch_csv(
                 ),
             })
 
-        if zeroed_count:
-            logs.append({
-                "level": "INFO",
-                "message": (
-                    f"{zeroed_count} card(s) live on eBay were absent from this "
-                    f"dump and are revised down to 0."
-                ),
-            })
+    if zeroed_count:
+        logs.append({
+            "level": "WARN",
+            "message": (
+                f"{zeroed_count} card(s) live on eBay were absent from this dump "
+                f"and are revised down to 0. Check that list before uploading: "
+                f"these listings stop selling."
+            ),
+        })
 
     # Generate REVISE CSV
     revise_io = io.StringIO()
@@ -1219,6 +1248,17 @@ def process_batch_csv(
         "message": f"Batch routing finished: {len(revise_rows)} items to REVISE ({zeroed_count} of them zeroed as sold out, {unchanged_count} unchanged and skipped), {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
     })
 
+    parsed_rows = len(file_totals)
+    if skipped_count and not parsed_rows:
+        logs.append({
+            "level": "ERROR",
+            "message": (
+                f"Not one row of this file could be processed ({skipped_count} "
+                f"skipped), so nothing was catalogued and no eBay file was "
+                f"built from it. See the warnings above for the reason."
+            ),
+        })
+
     # Fingerprint only after the batch has actually been applied, so a failure
     # part-way through does not mark the file as done.
     if not dry_run:
@@ -1234,6 +1274,8 @@ def process_batch_csv(
         "revise_count": len(revise_rows),
         "zeroed_count": zeroed_count,
         "unchanged_count": unchanged_count,
+        "parsed_rows": parsed_rows,
+        "reconciled": reconcile,
         "quantity_mode": mode,
         "add_count": total_added_cards,
         "new_catalog_count": new_catalog_count,
