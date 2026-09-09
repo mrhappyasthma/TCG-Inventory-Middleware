@@ -482,6 +482,52 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(len(set(quantities)), 1,
                          f"quantity drifted across uploads: {quantities}")
 
+    # -- asset cache coherence ---------------------------------------------
+
+    def test_20_dashboard_is_never_cached_and_assets_are_versioned(self):
+        """
+        A browser holding a cached index.html from an earlier deploy pairs old
+        markup with a new script, which is not a slow page but a broken one:
+        renaming one element id makes the script dereference null. The HTML is
+        therefore no-store, and the assets it names carry a content hash so
+        the pair always matches.
+        """
+        import re
+
+        res = self.client.get("/")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("no-store", res.headers.get("cache-control", ""))
+
+        html = res.text
+        for asset in ("/static/app.js", "/static/style.css"):
+            match = re.search(re.escape(asset) + r"[?]v=([0-9a-f]{12})", html)
+            self.assertIsNotNone(match, asset + " should be versioned")
+            # The versioned URL must actually serve.
+            served = self.client.get(asset + "?v=" + match.group(1))
+            self.assertEqual(served.status_code, 200, asset)
+
+    def test_21_asset_version_tracks_content(self):
+        """A hash that does not change on edit would defeat the point."""
+        import os
+        from app.main import _asset_version, static_dir
+
+        path = os.path.join(static_dir, "app.js")
+        with open(path, "r", encoding="utf-8") as handle:
+            original = handle.read()
+
+        before = _asset_version("/static/app.js")
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(original + chr(10) + "// touched by a test" + chr(10))
+            self.assertNotEqual(_asset_version("/static/app.js"), before)
+        finally:
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(original)
+        self.assertEqual(_asset_version("/static/app.js"), before,
+                         "restoring the file must restore the hash")
+
+        # A file that is not there must not raise; it is simply not versioned.
+        self.assertEqual(_asset_version("/static/does-not-exist.js"), "")
 
 if __name__ == "__main__":
     unittest.main()

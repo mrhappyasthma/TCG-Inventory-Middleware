@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import csv
+import hashlib
 import mimetypes
 import shutil
 import tempfile
@@ -1059,14 +1060,62 @@ def health_check():
 # FRONTEND HTML ROUTE
 # ---------------------------------------------------------
 
+# Assets whose URLs get a content hash appended, so the browser is forced to
+# fetch the version that belongs with the HTML it just received.
+VERSIONED_ASSETS = ("/static/app.js", "/static/style.css")
+
+
+def _asset_version(url_path: str) -> str:
+    """Short content hash for a static file, or an empty string if absent."""
+    relative = url_path.replace("/static/", "", 1)
+    path = os.path.join(static_dir, *relative.split("/"))
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+def _version_asset_urls(html: str) -> str:
+    """
+    Append a content hash to the app's own asset URLs.
+
+    Without this a browser can hold a cached app.js from a previous deploy and
+    pair it with fresh HTML, or vice versa. That combination is not a slow
+    page, it is a broken one: renaming a single element id makes the old script
+    dereference null on an element the new markup no longer has.
+    """
+    for asset in VERSIONED_ASSETS:
+        version = _asset_version(asset)
+        if version:
+            html = html.replace(asset + '"', f'{asset}?v={version}"')
+    return html
+
+
 @app.get("/")
 def serve_dashboard():
-    """Serve the single-page dashboard."""
+    """
+    Serve the single-page dashboard.
+
+    Sent with no-store: the HTML is the index of which asset versions belong
+    together, so a stale copy pairs old markup with a new script. It is a few
+    tens of kilobytes and the assets it points at are hashed, so there is
+    nothing to gain by caching it.
+    """
     index_file = os.path.join(static_dir, "index.html")
+    headers = {
+        "Cache-Control": "no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
     if os.path.exists(index_file):
         with open(index_file, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    return HTMLResponse("<h1>TCG Inventory Middleware API is running.</h1>")
+            return HTMLResponse(
+                content=_version_asset_urls(f.read()), headers=headers
+            )
+    return HTMLResponse(
+        "<h1>TCG Inventory Middleware API is running.</h1>", headers=headers
+    )
 
 
 if __name__ == "__main__":

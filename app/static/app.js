@@ -133,10 +133,28 @@ function showGoogleUnavailable() {
     document.getElementById("googleAuthUnavailable")?.classList.remove("hidden");
 }
 
+// A browser holding a cached index.html from a previous deploy will be missing
+// elements this script expects, and the failure surfaces as an unreadable
+// "Cannot read properties of null" somewhere far from the cause. Naming the
+// element and the remedy turns that into a one-line diagnosis. The server now
+// sends the HTML no-store so this should not recur, but a proxy or service
+// worker can still serve a stale copy.
+function requireElement(id) {
+    const el = document.getElementById(id);
+    if (!el) {
+        throw new Error(
+            `This page is out of date: it has no "${id}" element, which this ` +
+            `script version expects. Reload with Ctrl+Shift+R (Cmd+Shift+R on ` +
+            `a Mac) to pick up the current page.`
+        );
+    }
+    return el;
+}
+
 function updateAuthUI(data) {
-    const btnOpenLogin = document.getElementById("btnOpenLoginModal");
-    const btnAccountMenu = document.getElementById("btnAccountMenu");
-    const pendingBanner = document.getElementById("pendingApprovalBanner");
+    const btnOpenLogin = requireElement("btnOpenLoginModal");
+    const btnAccountMenu = requireElement("btnAccountMenu");
+    const pendingBanner = requireElement("pendingApprovalBanner");
 
     if (data.is_authenticated && data.user) {
         btnOpenLogin.classList.add("hidden");
@@ -144,18 +162,18 @@ function updateAuthUI(data) {
         btnAccountMenu.classList.add("flex");
         pendingBanner.classList.add("hidden");
 
-        document.getElementById("userNameText").innerText = data.user.username;
-        document.getElementById("userAvatarText").innerText = data.user.username[0].toUpperCase();
-        document.getElementById("accountMenuName").innerText = data.user.username;
-        document.getElementById("accountMenuEmail").innerText = data.user.email || "";
+        requireElement("userNameText").innerText = data.user.username;
+        requireElement("userAvatarText").innerText = data.user.username[0].toUpperCase();
+        requireElement("accountMenuName").innerText = data.user.username;
+        requireElement("accountMenuEmail").innerText = data.user.email || "";
 
-        const roleBadge = document.getElementById("userRoleBadge");
+        const roleBadge = requireElement("userRoleBadge");
         roleBadge.innerText = data.user.role.toUpperCase();
 
         // One group rather than two buttons: the divider and the whole admin
         // section should disappear together for an ordinary user, leaving a
         // menu that holds only Sign out.
-        const adminGroup = document.getElementById("accountMenuAdminGroup");
+        const adminGroup = requireElement("accountMenuAdminGroup");
         if (data.user.role === "admin") {
             adminGroup.classList.remove("hidden");
             roleBadge.className = "text-[10px] uppercase px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800";
@@ -169,7 +187,7 @@ function updateAuthUI(data) {
         btnOpenLogin.classList.remove("hidden");
         btnAccountMenu.classList.add("hidden");
         btnAccountMenu.classList.remove("flex");
-        document.getElementById("accountMenuAdminGroup").classList.add("hidden");
+        requireElement("accountMenuAdminGroup").classList.add("hidden");
         closeAccountMenu();
 
         if (data.is_pending) {

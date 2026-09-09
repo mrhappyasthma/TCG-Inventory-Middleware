@@ -427,6 +427,26 @@ behaviour is exactly as before. It never guesses.
 
 ---
 
+## 🔄 Asset caching
+
+`GET /` is sent `Cache-Control: no-store`, and the `app.js` / `style.css` URLs
+it references carry a short content hash (`app.js?v=af090320e867`).
+
+This is not a performance tweak. The HTML is the index of which asset versions
+belong together, so a browser holding a cached copy from an earlier deploy
+pairs **old markup with a new script**. That is not a stale page, it is a
+broken one: renaming a single element id makes the script dereference `null`,
+and the error surfaces as `Cannot read properties of null (reading
+'classList')` from somewhere unrelated to the cause.
+
+The hash means a new HTML always pulls the matching script, and `no-store`
+means the HTML itself cannot go stale. `updateAuthUI` also fetches its elements
+through `requireElement(id)`, so if a proxy or service worker still manages to
+serve a stale page, the terminal says which element is missing and to reload
+with Ctrl+Shift+R rather than reporting a null dereference.
+
+---
+
 ## ⏳ While a module is working
 
 Each module card covers itself with its own overlay while it runs, rather than
