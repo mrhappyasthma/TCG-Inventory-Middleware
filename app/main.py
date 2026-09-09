@@ -55,7 +55,11 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from tcg_engine.csvtools import decode_csv_bytes
-from tcg_engine.db import Database
+from tcg_engine.db import (
+    Database,
+    apply_pricing_rules,
+    apply_condition_multiplier,
+)
 from tcg_engine.orders import (
     process_orders_csv,
     build_deduction_csv,
@@ -513,8 +517,21 @@ class PricingRulesUpdateRequest(BaseModel):
     rules: List[PricingRuleItem]
 
 
+class ConditionMultiplierItem(BaseModel):
+    condition_key: str
+    multiplier: float
+    label: Optional[str] = ""
+
+
+class ConditionMultipliersUpdateRequest(BaseModel):
+    multipliers: List[ConditionMultiplierItem]
+
+
 class PricePreviewRequest(BaseModel):
     price: float
+    # Optional so existing callers keep working; without it the preview is the
+    # mint price, which is what it always was.
+    condition: Optional[str] = None
 
 
 @app.get("/api/pricing-rules")
@@ -565,15 +582,91 @@ def reset_pricing_rules_endpoint(user: Dict[str, Any] = Depends(require_active_u
     }
 
 
+@app.get("/api/condition-multipliers")
+def get_condition_multipliers_endpoint(
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    The grade discounts that apply to the signed-in user.
+
+    The market price we can obtain is product-level -- neither TCGplayer's
+    public price data nor the SortSwift export it was relayed through breaks
+    down by condition -- so the grade adjustment is policy, configured here.
+    """
+    return {
+        "multipliers": db.get_condition_multipliers(user_id=user["id"]),
+        "is_own": db.has_own_condition_multipliers(user["id"]),
+    }
+
+
+@app.post("/api/condition-multipliers")
+def update_condition_multipliers_endpoint(
+    req: ConditionMultipliersUpdateRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """Save the signed-in user's own grade discounts."""
+    for item in req.multipliers:
+        if item.multiplier < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"The multiplier for {item.condition_key} is negative. "
+                    f"A grade discount cannot invert a price."
+                ),
+            )
+        if item.multiplier > 10:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"The multiplier for {item.condition_key} is {item.multiplier}, "
+                    f"which would multiply the price rather than discount it. "
+                    f"Use a markup rule for that."
+                ),
+            )
+    db.set_condition_multipliers(
+        [m.model_dump() for m in req.multipliers], user_id=user["id"]
+    )
+    return {
+        "success": True,
+        "multipliers": db.get_condition_multipliers(user_id=user["id"]),
+        "is_own": db.has_own_condition_multipliers(user["id"]),
+    }
+
+
+@app.post("/api/condition-multipliers/reset")
+def reset_condition_multipliers_endpoint(
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """Discard the caller's own grade discounts and inherit the shared set."""
+    multipliers = db.reset_condition_multipliers(user_id=user["id"])
+    return {
+        "success": True,
+        "multipliers": multipliers,
+        "is_own": db.has_own_condition_multipliers(user["id"]),
+    }
+
+
 @app.post("/api/pricing-rules/preview")
 def preview_pricing_endpoint(
     req: PricePreviewRequest,
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Test and preview what an eBay price would be for a given TCG price."""
-    calculated_price, rule = db.calculate_price(req.price, user_id=user["id"])
+    multipliers = {
+        m["condition_key"]: m["multiplier"]
+        for m in db.get_condition_multipliers(user_id=user["id"])
+    }
+    adjusted, factor = apply_condition_multiplier(
+        req.price, req.condition, multipliers
+    )
+    calculated_price, rule = apply_pricing_rules(
+        db.get_pricing_rules(user_id=user["id"]), adjusted
+    )
     return {
         "input_price": req.price,
+        "condition": req.condition,
+        "condition_multiplier": factor,
+        "adjusted_price": round(adjusted, 2),
         "calculated_price": calculated_price,
         "matched_rule": rule,
     }

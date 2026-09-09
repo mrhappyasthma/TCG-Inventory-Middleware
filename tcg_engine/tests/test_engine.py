@@ -4,7 +4,9 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from tcg_engine.db import Database, apply_pricing_rules
+from tcg_engine.db import (Database, apply_pricing_rules,
+                          apply_condition_multiplier,
+                          normalize_condition_key)
 from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import process_batch_csv
 from tcg_engine.sync import sync_active_listings_csv
@@ -2710,6 +2712,131 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(variation["last_known_qty"], 3)
         self.assertEqual(variation["last_known_price"], 2.49,
                          "the price must come from Start price")
+
+    # -- condition multipliers ---------------------------------------------
+
+    def test_condition_aliases_fold_onto_canonical_keys(self):
+        """Each export spells the grades differently; all must resolve."""
+        for raw, want in (("NM", "NM"), ("nm", "NM"), ("Near Mint", "NM"),
+                          ("Near mint or better", "NM"), ("Mint", "NM"),
+                          ("LP", "LP"), ("Lightly Played", "LP"),
+                          ("Excellent", "LP"),
+                          ("Lightly played (Excellent)", "LP"),
+                          ("MP", "MP"), ("Very Good", "MP"), ("VG", "MP"),
+                          ("HP", "HP"), ("Poor", "HP"),
+                          ("Damaged", "D"), ("dmg", "D")):
+            self.assertEqual(normalize_condition_key(raw), want, raw)
+
+        # An unrecognised grade must resolve to nothing, not to mint.
+        for raw in ("Gem Mint 10", "PSA 9", "", None, "   "):
+            self.assertEqual(normalize_condition_key(raw), "", repr(raw))
+
+    def test_unknown_grade_is_not_silently_priced_as_mint(self):
+        """
+        Defaulting an unrecognised grade to 1.0 would over-price a played
+        card while looking perfectly normal, so the multiplier comes back as
+        None and the caller can say so.
+        """
+        mults = {m["condition_key"]: m["multiplier"]
+                 for m in self.db.get_condition_multipliers()}
+
+        price, factor = apply_condition_multiplier(10.0, "PSA 9", mults)
+        self.assertEqual(price, 10.0)
+        self.assertIsNone(factor)
+
+        price, factor = apply_condition_multiplier(10.0, "LP", mults)
+        self.assertAlmostEqual(price, 8.50, places=2)
+        self.assertAlmostEqual(factor, 0.85, places=2)
+
+    def test_grade_discount_shifts_the_tier(self):
+        """
+        The discount is applied before the tiers on purpose: a played card
+        should land in a cheaper band, not the one its mint price implies.
+        """
+        mults = {m["condition_key"]: m["multiplier"]
+                 for m in self.db.get_condition_multipliers()}
+        rules = self.db.get_pricing_rules()
+
+        # 0.30 mint sits in the 0.25-0.50 tier -> fixed 2.49.
+        nm, _ = apply_condition_multiplier(0.30, "NM", mults)
+        self.assertEqual(apply_pricing_rules(rules, nm)[0], 2.49)
+
+        # x0.5 puts the same card at 0.15, which is the 0.00-0.25 tier.
+        hp, _ = apply_condition_multiplier(0.30, "HP", mults)
+        self.assertAlmostEqual(hp, 0.15, places=2)
+        self.assertEqual(apply_pricing_rules(rules, hp)[0], 1.99,
+                         "the discount should move it into the cheaper tier")
+
+    def test_multipliers_are_per_user_like_pricing_rules(self):
+        """All-or-nothing, so grades cannot be priced by two policies at once."""
+        shared = self.db.get_condition_multipliers()
+        self.assertFalse(self.db.has_own_condition_multipliers(7))
+        self.assertEqual(self.db.get_condition_multipliers(user_id=7), shared)
+
+        self.db.set_condition_multipliers(
+            [{"condition_key": "NM", "multiplier": 0.9, "label": "mine"}],
+            user_id=7,
+        )
+        self.assertTrue(self.db.has_own_condition_multipliers(7))
+        own = self.db.get_condition_multipliers(user_id=7)
+        self.assertEqual([(m["condition_key"], m["multiplier"]) for m in own],
+                         [("NM", 0.9)])
+        self.assertEqual(self.db.get_condition_multipliers(), shared,
+                         "the shared set must not move")
+
+        self.db.reset_condition_multipliers(user_id=7)
+        self.assertEqual(self.db.get_condition_multipliers(user_id=7), shared)
+
+    def test_batch_discounts_a_played_card_and_reports_unknown_grades(self):
+        """The whole path: dump -> grade discount -> tiers -> Add CSV."""
+        header = ('"Game","Set","Card Number","Name","Market Price",'
+                  '"Condition","Language","Printing","Quantity","Remarks",'
+                  '"*ConditionID"')
+        rows = [
+            '"Pokemon","Chilling Reign","004/198","Mint Card","10.00","NM",'
+            '"English","Normal",1,"C-1","4000"',
+            '"Pokemon","Chilling Reign","005/198","Played Card","10.00","MP",'
+            '"English","Normal",1,"C-1","4000"',
+        ]
+        dump = chr(10).join([header] + rows) + chr(10)
+
+        res = process_batch_csv(dump, self.db, source_name="grades.csv")
+        prices = {}
+        for row in csv.DictReader(io.StringIO(res["add_csv"])):
+            label = row.get("Title") or ""
+            if row.get("Price"):
+                prices[label] = row["Price"]
+
+        # $10 mint -> markup_fixed +3.00 = 13.00; MP is x0.70 -> 7.00 -> 10.00.
+        self.assertIn("13.00", res["add_csv"])
+        self.assertIn("10.00", res["add_csv"])
+
+        # An unrecognised grade is reported rather than quietly priced as mint.
+        odd = chr(10).join([header,
+            '"Pokemon","Chilling Reign","006/198","Slabbed","10.00","PSA 9",'
+            '"English","Normal",1,"C-1","4000"']) + chr(10)
+        res2 = process_batch_csv(odd, self.db, source_name="odd.csv")
+        self.assertTrue(
+            any("No condition multiplier is configured" in lg["message"]
+                for lg in res2["logs"]),
+            "an unpriced grade must be surfaced",
+        )
+
+    def test_an_explicit_ebay_price_is_not_discounted_twice(self):
+        """
+        An eBay Price column is a per-card override the operator has already
+        decided on; applying a grade discount to it would second-guess them.
+        """
+        header = ('"Game","Set","Card Number","Name","Market Price",'
+                  '"eBay Price","Condition","Language","Printing","Quantity",'
+                  '"Remarks","*ConditionID"')
+        dump = chr(10).join([header,
+            '"Pokemon","Chilling Reign","004/198","Override","10.00","4.44",'
+            '"MP","English","Normal",1,"C-1","4000"']) + chr(10)
+
+        res = process_batch_csv(dump, self.db, source_name="override.csv")
+        self.assertIn("4.44", res["add_csv"],
+                      "the override must survive the grade discount")
 
 
 if __name__ == "__main__":

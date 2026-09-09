@@ -328,6 +328,37 @@ work.
 * **Interactive Calculator**: The Pricing Rules page includes a live test calculator so you can enter any base price and see the computed eBay price immediately.
 * **Reset Defaults**: restores exactly the four rules in the table above.
 
+### Condition multipliers
+
+The market price we can obtain is **product-level**. Neither TCGplayer's
+public price data nor the SortSwift export that relayed it breaks a price down
+by condition, so the grade adjustment is *policy*, not data — configured in the
+Pricing Rules dialog and stored per user like the tiers.
+
+Shipped defaults:
+
+| Grade | x | Covers |
+|---|---|---|
+| `NM` | 1.00 | Near mint or better, Mint |
+| `LP` | 0.85 | Lightly played, Excellent |
+| `MP` | 0.70 | Moderately played, Very good, Good |
+| `HP` | 0.50 | Heavily played, Played, Poor |
+| `D` | 0.40 | Damaged |
+
+Two deliberate details:
+
+* **The discount is applied before the tiers**, so a played card falls into a
+  cheaper band rather than the one its mint price implies. A $0.30 mint card
+  lands in the 0.25–0.50 tier at `$2.49`; the same card at `HP` becomes $0.15,
+  lands in 0.00–0.25, and lists at `$1.99`.
+* **An unrecognised grade is never treated as mint.** It is priced at full
+  market value *and reported in the console*, because silently discounting by
+  1.0 would over-price played stock while looking entirely normal. Graded
+  slabs (`PSA 9`, `Gem Mint 10`) hit this path today.
+
+An explicit `eBay Price` column still wins outright and is **not** discounted —
+it is a per-card decision you have already made.
+
 ### How the base price is chosen
 
 This is the precedence the engine actually applies, in order:

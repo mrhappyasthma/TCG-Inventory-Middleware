@@ -314,6 +314,7 @@ async function loadPricingRules() {
         setScopeBadge("pricingScopeBadge", data.is_own);
         renderPricingRulesEditor();
         updateTestPricePreview();
+        loadConditionMultipliers();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400">Failed to load rules: ${escapeHtml(err.message)}</td></tr>`;
     }
@@ -428,8 +429,81 @@ async function savePricingRules() {
 
         cachedPricingRules = data.rules;
         setScopeBadge("pricingScopeBadge", data.is_own);
+        await saveConditionMultipliers();
         closePricingModal();
-        logToTerminal("SUCCESS", "Saved your tiered pricing rules. Other users are unaffected.");
+        logToTerminal("SUCCESS", "Saved your pricing rules and condition multipliers. Other users are unaffected.");
+    } catch (err) {
+        alert(err.message);
+    }
+}
+
+// -------------------------------------------------------------------
+// CONDITION MULTIPLIERS
+// -------------------------------------------------------------------
+//
+// The market price available to us is product-level: neither TCGplayer's
+// public price data nor the SortSwift export it was relayed through breaks
+// down by condition. The grade discount is therefore policy, configured
+// here, and applied before the tier rules so a played card falls into a
+// cheaper tier rather than the one its mint price implies.
+
+let cachedConditionMultipliers = [];
+
+async function loadConditionMultipliers() {
+    const target = document.getElementById("conditionMultipliersRows");
+    if (!target) return;
+    try {
+        const res = await fetch("/api/condition-multipliers");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail);
+
+        cachedConditionMultipliers = data.multipliers || [];
+        setScopeBadge("conditionScopeBadge", data.is_own);
+
+        target.innerHTML = cachedConditionMultipliers.map((m, idx) => `
+            <label class="flex items-center gap-2 p-2 rounded-lg bg-dark-900/70 border border-slate-700/70">
+                <span class="w-9 shrink-0 text-[11px] font-bold font-mono text-slate-200">${escapeHtml(m.condition_key)}</span>
+                <input type="number" step="0.01" min="0" max="10" value="${m.multiplier}"
+                       onchange="updateConditionMultiplier(${idx}, this.value)"
+                       class="w-20 bg-dark-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white focus:border-brand-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500 truncate">${escapeHtml(m.label || "")}</span>
+            </label>
+        `).join("");
+    } catch (err) {
+        target.innerHTML = `<p class="text-[11px] text-rose-300">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+function updateConditionMultiplier(idx, value) {
+    const parsed = parseFloat(value);
+    // Leave the cached value alone on a non-numeric entry rather than storing
+    // NaN, which serialises as null and would be rejected by the endpoint.
+    if (!Number.isFinite(parsed)) return;
+    cachedConditionMultipliers[idx].multiplier = parsed;
+    updateTestPricePreview();
+}
+
+async function saveConditionMultipliers() {
+    const res = await fetch("/api/condition-multipliers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ multipliers: cachedConditionMultipliers })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail);
+    cachedConditionMultipliers = data.multipliers;
+    setScopeBadge("conditionScopeBadge", data.is_own);
+}
+
+async function resetConditionMultipliers() {
+    if (!confirm("Discard your own condition multipliers and go back to the shared defaults?")) return;
+    try {
+        const res = await fetch("/api/condition-multipliers/reset", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail);
+        logToTerminal("INFO", "Condition multipliers reset to the shared defaults.");
+        await loadConditionMultipliers();
+        updateTestPricePreview();
     } catch (err) {
         alert(err.message);
     }

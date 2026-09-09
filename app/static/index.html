@@ -992,6 +992,24 @@
                 </table>
             </div>
 
+            <!-- Condition multipliers. Separate from the tiers because they
+                 answer a different question: the tiers say what a price band
+                 is worth, this says what a grade is worth relative to mint. -->
+            <div class="mt-5 pt-4 border-t border-slate-700">
+                <div class="flex items-start justify-between gap-3 mb-2">
+                    <div>
+                        <h4 class="text-sm font-bold text-white flex items-center gap-2">
+                            Condition Multipliers
+                            <span id="conditionScopeBadge" class="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">Yours</span>
+                        </h4>
+                        <p class="text-[11px] text-slate-400 mt-1">Market price is <strong>product-level</strong> &mdash; neither TCGplayer&rsquo;s public data nor the SortSwift export breaks it down by grade. So the discount is yours to set. Applied <em>before</em> the tiers above, so a played card falls into a cheaper tier.</p>
+                    </div>
+                    <button type="button" onclick="resetConditionMultipliers()" class="text-xs text-slate-400 hover:text-slate-200 underline shrink-0">Reset</button>
+                </div>
+                <div id="conditionMultipliersRows" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
+                <p class="text-[10px] text-slate-500 mt-2">A grade with no multiplier is priced at full market value and reported in the console &mdash; it is never silently treated as mint.</p>
+            </div>
+
             <!-- Modal Action Buttons -->
             <div class="flex items-center justify-between pt-3 border-t border-slate-700">
                 <button onclick="addEmptyPricingRuleRow()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-all">

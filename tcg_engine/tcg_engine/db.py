@@ -30,6 +30,68 @@ DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
 # NULLs compare as distinct in SQLite, which would let duplicates through.
 SHARED_SCOPE = 0
 
+# A card's grade is a discount off the market price, and the market price we
+# can obtain is product-level -- TCGplayer's public price data does not break
+# down by condition, and neither did the SortSwift export it was relayed
+# through. So the adjustment is policy, set here, rather than data fetched from
+# anywhere. Keys are the canonical grades; the aliases each export uses are
+# folded onto them by normalize_condition_key.
+SHIPPED_CONDITION_MULTIPLIERS = [
+    ("NM", 1.00, "Near mint or better"),
+    ("LP", 0.85, "Lightly played / Excellent"),
+    ("MP", 0.70, "Moderately played / Very good"),
+    ("HP", 0.50, "Heavily played / Poor"),
+    ("D", 0.40, "Damaged"),
+]
+
+# Every spelling seen in a SortSwift or eBay export, folded onto one key.
+CONDITION_KEY_ALIASES = {
+    "nm": "NM", "m": "NM", "mint": "NM", "near mint": "NM",
+    "near mint or better": "NM", "nearmint": "NM",
+    "lp": "LP", "lightly played": "LP", "excellent": "LP",
+    "lightly played (excellent)": "LP",
+    "mp": "MP", "moderately played": "MP", "very good": "MP", "vg": "MP",
+    "good": "MP",
+    "hp": "HP", "heavily played": "HP", "played": "HP", "poor": "HP",
+    "d": "D", "dm": "D", "dmg": "D", "damaged": "D",
+}
+
+
+def normalize_condition_key(condition) -> str:
+    """
+    Fold a condition string onto a canonical multiplier key.
+
+    Returns "" when the condition is unrecognised, which callers must treat as
+    "no multiplier known" rather than substituting 1.0 -- silently pricing an
+    unknown grade as mint is the expensive direction to be wrong in.
+    """
+    text = str(condition or "").strip().lower()
+    if not text:
+        return ""
+    return CONDITION_KEY_ALIASES.get(text, "")
+
+
+def apply_condition_multiplier(
+    base_price: float,
+    condition,
+    multipliers: Dict[str, float],
+) -> Tuple[float, Optional[float]]:
+    """
+    Discount a product-level market price for a card's grade.
+
+    Returns (adjusted_price, multiplier_applied_or_None). The multiplier is
+    None when the grade is not recognised or has no configured value, and the
+    price comes back untouched -- deliberately not defaulted to 1.0, so the
+    caller can say "priced as mint because the grade was unknown" instead of
+    quietly doing it.
+    """
+    price = float(base_price or 0.0)
+    key = normalize_condition_key(condition)
+    if not key or key not in multipliers:
+        return price, None
+    factor = float(multipliers[key])
+    return round(price * factor, 4), factor
+
 
 def apply_pricing_rules(
     rules: List[Dict[str, Any]], base_price: float
@@ -40,6 +102,10 @@ def apply_pricing_rules(
     Split out from Database.calculate_price so a caller pricing thousands of
     cards can read the rules once instead of once per card. Pure, so the
     pricing behaviour is testable without a database.
+
+    Note this takes the price *after* any condition multiplier: the grade
+    discount shifts which tier a card lands in, which is the intended
+    behaviour -- a played card should fall into a cheaper tier.
 
     Returns (calculated_price, matched_rule_or_None).
     """
@@ -202,6 +268,17 @@ class Database:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS condition_multipliers (
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    condition_key TEXT NOT NULL,
+                    multiplier REAL NOT NULL,
+                    label TEXT,
+                    PRIMARY KEY (user_id, condition_key)
+                );
+                """,
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS listing_settings (
                     user_id INTEGER NOT NULL DEFAULT 0,
                     key TEXT NOT NULL,
@@ -356,6 +433,20 @@ class Database:
                 ON pricing_rules(user_id, sort_order);
                 """
             )
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM condition_multipliers "
+                "WHERE user_id = 0"
+            )
+            if cursor.fetchone()["count"] == 0:
+                cursor.executemany(
+                    """
+                    INSERT INTO condition_multipliers
+                        (user_id, condition_key, multiplier, label)
+                    VALUES (0, ?, ?, ?)
+                    """,
+                    SHIPPED_CONDITION_MULTIPLIERS,
+                )
 
             # Seed default pricing rules if empty
             cursor.execute(
@@ -1495,6 +1586,99 @@ class Database:
         return apply_pricing_rules(
             self.get_pricing_rules(user_id=user_id), base_price
         )
+
+    def has_own_condition_multipliers(self, user_id: int = SHARED_SCOPE) -> bool:
+        """Whether this user has saved a multiplier set of their own."""
+        if int(user_id) == SHARED_SCOPE:
+            return True
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM condition_multipliers WHERE user_id = ? LIMIT 1",
+                (int(user_id),),
+            )
+            return cursor.fetchone() is not None
+
+    def get_condition_multipliers(
+        self, user_id: int = SHARED_SCOPE
+    ) -> List[Dict[str, Any]]:
+        """
+        The condition multipliers that apply to this user.
+
+        All-or-nothing like pricing rules: a partially inherited set would
+        leave some grades priced by one policy and some by another.
+        """
+        scope = int(user_id)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if scope != SHARED_SCOPE:
+                cursor.execute(
+                    "SELECT 1 FROM condition_multipliers WHERE user_id = ? LIMIT 1",
+                    (scope,),
+                )
+                if cursor.fetchone() is None:
+                    scope = SHARED_SCOPE
+            cursor.execute(
+                """
+                SELECT condition_key, multiplier, label
+                FROM condition_multipliers
+                WHERE user_id = ?
+                """,
+                (scope,),
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+
+        # Present in a stable, meaningful order rather than alphabetically.
+        order = [key for key, _, _ in SHIPPED_CONDITION_MULTIPLIERS]
+        rows.sort(key=lambda r: order.index(r["condition_key"])
+                  if r["condition_key"] in order else len(order))
+        return rows
+
+    def set_condition_multipliers(
+        self, multipliers: List[Dict[str, Any]], user_id: int = SHARED_SCOPE
+    ):
+        """Replace this user's multiplier set, leaving other scopes alone."""
+        scope = int(user_id)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM condition_multipliers WHERE user_id = ?", (scope,)
+            )
+            for m in multipliers:
+                key = str(m.get("condition_key", "")).strip().upper()
+                if not key:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO condition_multipliers
+                        (user_id, condition_key, multiplier, label)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, condition_key) DO UPDATE SET
+                        multiplier = excluded.multiplier,
+                        label = excluded.label
+                    """,
+                    (scope, key, float(m.get("multiplier", 1.0)),
+                     str(m.get("label") or "")),
+                )
+            conn.commit()
+
+    def reset_condition_multipliers(self, user_id: int = SHARED_SCOPE):
+        """Drop this user's set so they inherit the shared one again."""
+        scope = int(user_id)
+        if scope == SHARED_SCOPE:
+            self.set_condition_multipliers(
+                [{"condition_key": k, "multiplier": v, "label": lab}
+                 for k, v, lab in SHIPPED_CONDITION_MULTIPLIERS],
+                user_id=SHARED_SCOPE,
+            )
+        else:
+            with self.get_connection() as conn:
+                conn.execute(
+                    "DELETE FROM condition_multipliers WHERE user_id = ?",
+                    (scope,),
+                )
+                conn.commit()
+        return self.get_condition_multipliers(user_id=scope)
 
     def get_listing_settings(self, user_id: int = SHARED_SCOPE) -> Dict[str, str]:
         """

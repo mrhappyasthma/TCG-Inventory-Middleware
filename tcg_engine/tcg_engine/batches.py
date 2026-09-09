@@ -5,7 +5,13 @@ import os
 import re
 from typing import Dict, Any, List, Optional
 from .csvtools import find_column as _find_column, read_csv_text, strip_bom
-from .db import Database, SHARED_SCOPE, apply_pricing_rules
+from .db import (
+    Database,
+    SHARED_SCOPE,
+    apply_pricing_rules,
+    apply_condition_multiplier,
+    normalize_condition_key,
+)
 
 
 # eBay File Exchange / Seller Hub Headers
@@ -462,6 +468,13 @@ def process_batch_csv(
     # The rules cannot change while a batch runs, so read them once instead of
     # once per card.
     pricing_rules = db.get_pricing_rules(user_id=user_id)
+    condition_multipliers = {
+        m["condition_key"]: m["multiplier"]
+        for m in db.get_condition_multipliers(user_id=user_id)
+    }
+    # Grades seen that have no multiplier, reported once each rather than once
+    # per row: a whole set of played cards would otherwise bury the log.
+    unpriced_grades = set()
 
     # Total seen in *this file* per card, so several rows for one card (the
     # same card in two bins) sum together before replacing the stored value.
@@ -688,13 +701,6 @@ def process_batch_csv(
 
         raw_base_price = market_price_val if market_price_val > 0 else standard_price_val
 
-        if ebay_price_val > 0:
-            effective_price = ebay_price_val
-        else:
-            effective_price, _ = apply_pricing_rules(
-                pricing_rules, raw_base_price
-            )
-
         if not product_name or not set_name:
             skipped_count += 1
             logs.append({
@@ -708,6 +714,28 @@ def process_batch_csv(
         # eBay or back into SortSwift, so interposing our own vocabulary only
         # creates a third one that can disagree with both.
         condition_name = str(raw_condition or "").strip()
+
+        # Priced here rather than above, because the grade is part of the
+        # calculation and is only known now. An explicit eBay Price column
+        # still wins outright: it is a per-card override and must not be
+        # discounted a second time.
+        if ebay_price_val > 0:
+            effective_price = ebay_price_val
+        else:
+            # The market price available to us is product-level -- neither
+            # TCGplayer's public data nor the SortSwift export breaks it down
+            # by condition -- so the grade discount is applied here, before
+            # the tiers. Discounting first is deliberate: a played card should
+            # fall into a cheaper tier, not the tier its mint price implies.
+            adjusted_base, condition_factor = apply_condition_multiplier(
+                raw_base_price, condition_name, condition_multipliers
+            )
+            if condition_factor is None and condition_name:
+                unpriced_grades.add(condition_name)
+            effective_price, _ = apply_pricing_rules(
+                pricing_rules, adjusted_base
+            )
+
         if not condition_name:
             skipped_count += 1
             logs.append({
@@ -1247,6 +1275,18 @@ def process_batch_csv(
         "level": "INFO",
         "message": f"Batch routing finished: {len(revise_rows)} items to REVISE ({zeroed_count} of them zeroed as sold out, {unchanged_count} unchanged and skipped), {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
     })
+
+    if unpriced_grades:
+        logs.append({
+            "level": "WARN",
+            "message": (
+                "No condition multiplier is configured for: "
+                + ", ".join(sorted(unpriced_grades))
+                + ". Those cards were priced from the market price with no "
+                "grade discount, which over-prices a played card. Add them "
+                "under Pricing Rules."
+            ),
+        })
 
     parsed_rows = len(file_totals)
     if skipped_count and not parsed_rows:
