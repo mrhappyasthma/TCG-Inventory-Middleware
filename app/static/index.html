@@ -145,6 +145,19 @@
                     Pricing Rules
                 </button>
 
+                <!-- Reprice indicator. Persistent on purpose: the nightly
+                     refresh finishes with nobody watching, so a transient
+                     toast would be missed. Hidden until there is something
+                     to do. -->
+                <a id="repriceReady" href="/api/pricing/reprice.csv" download
+                   class="hidden items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-950/70 hover:bg-amber-900/70 border border-amber-800 text-amber-200 transition-all"
+                   title="Prices changed. Download the eBay Revise file.">
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <span id="repriceReadyText">Reprice ready</span>
+                </a>
+
                 <!-- Account menu. The username was a dead badge; it is now the
                      control that owns everything scoped to the person signed
                      in, which is where people look for it. -->
@@ -1008,6 +1021,33 @@
                 </div>
                 <div id="conditionMultipliersRows" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
                 <p class="text-[10px] text-slate-500 mt-2">A grade with no multiplier is priced at full market value and reported in the console &mdash; it is never silently treated as mint.</p>
+            </div>
+
+            <!-- Market price refresh -->
+            <div class="mt-5 pt-4 border-t border-slate-700">
+                <div class="flex items-start justify-between gap-3">
+                    <div>
+                        <h4 class="text-sm font-bold text-white">Market Prices</h4>
+                        <p class="text-[11px] text-slate-400 mt-1">Fetched from <span class="font-mono">tcgcsv.com</span>, a free daily mirror of TCGplayer&rsquo;s own price data, joined on your <span class="font-mono">TCGplayer Id</span> and printing. Refreshes automatically once a day; nothing is fetched if they haven&rsquo;t published a new snapshot.</p>
+                        <p id="priceRefreshStatus" class="text-[11px] font-mono text-slate-500 mt-1.5"></p>
+                    </div>
+                    <button type="button" id="btnRefreshPrices" onclick="refreshMarketPrices()" class="shrink-0 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                        <svg id="refreshPricesIcon" class="w-4 h-4 text-accent-emerald" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                        </svg>
+                        <span id="btnRefreshPricesLabel">Refresh now</span>
+                    </button>
+                </div>
+
+                <div id="repricePreview" class="hidden mt-3 p-3 rounded-xl bg-dark-900/70 border border-slate-700/80">
+                    <p id="repricePreviewText" class="text-[11px] text-slate-300"></p>
+                    <a id="repriceDownload" href="/api/pricing/reprice.csv" download class="hidden mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20 transition-all">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                        <span>Download ebay_reprice_updates.csv</span>
+                    </a>
+                </div>
             </div>
 
             <!-- Modal Action Buttons -->

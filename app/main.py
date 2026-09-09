@@ -72,6 +72,11 @@ from tcg_engine.batches import (
     QUANTITY_MODES,
 )
 from tcg_engine.sync import sync_active_listings_csv
+from tcg_engine.pricing_feed import (
+    refresh_market_prices,
+    build_reprice_csv,
+    PriceFeedError,
+)
 
 try:
     from app.user_db import UserDatabase
@@ -580,6 +585,132 @@ def reset_pricing_rules_endpoint(user: Dict[str, Any] = Depends(require_active_u
         "rules": rules,
         "is_own": db.has_own_pricing_rules(user["id"]),
     }
+
+
+# How often the background refresh runs, and whether it runs at all. TCGCSV
+# publishes once a day and asks for at most one sync per 24 hours, so anything
+# under that is wasted requests against a service that asks us not to.
+PRICE_REFRESH_ENABLED = os.environ.get(
+    "PRICE_REFRESH_ENABLED", "true"
+).strip().lower() not in ("0", "false", "no", "off")
+PRICE_REFRESH_INTERVAL_HOURS = max(
+    1, int(os.environ.get("PRICE_REFRESH_INTERVAL_HOURS", "24"))
+)
+
+
+@app.post("/api/pricing/refresh")
+async def refresh_prices_endpoint(
+    force: bool = Form(False),
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Fetch current market prices from TCGCSV.
+
+    Not admin-only. It writes the shared catalogue's market_price, but the
+    value is objective external data rather than a preference, the write is
+    idempotent, and every previous value is kept in price_history -- so no
+    information can be lost and there is nothing for one user to impose on
+    another.
+
+    Runs in a worker thread: it makes outbound HTTP calls with deliberate
+    spacing between them, and doing that on the event loop would freeze the
+    dashboard exactly as the CSV pipelines used to.
+    """
+    def run():
+        with db.session():
+            return refresh_market_prices(db, force=force)
+
+    try:
+        result = await run_in_threadpool(run)
+    except PriceFeedError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
+
+
+@app.get("/api/pricing/reprice")
+def reprice_csv_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
+    """
+    Summarise the eBay Revise file that current prices would produce.
+
+    Separate from the download so the dashboard can say how many listings
+    would change before anyone commits to a file, and so the indicator can
+    appear without triggering a browser download.
+    """
+    result = build_reprice_csv(db, user_id=user["id"])
+    return {
+        "reprice_count": result["reprice_count"],
+        "unchanged_count": result["unchanged_count"],
+        "missing_price_count": result["missing_price_count"],
+        "logs": result["logs"],
+    }
+
+
+@app.get("/api/pricing/reprice.csv")
+def reprice_csv_download(user: Dict[str, Any] = Depends(require_active_user)):
+    """The Revise file itself, priced by the caller's own rules."""
+    result = build_reprice_csv(db, user_id=user["id"])
+    return StreamingResponse(
+        iter([result["csv_content"]]),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                "attachment; filename=ebay_reprice_updates.csv"
+        },
+    )
+
+
+@app.get("/api/pricing/history/{manifest_id}")
+def price_history_endpoint(
+    manifest_id: str,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """Recent market prices for one card, so a surprising reprice is traceable."""
+    return {"manifest_id": manifest_id,
+            "history": db.get_price_history(manifest_id)}
+
+
+@app.on_event("startup")
+async def start_price_refresh_loop():
+    """
+    Refresh prices on a schedule.
+
+    An in-process task rather than a host cron, so a Synology deployment needs
+    no extra setup. The first run is delayed: a container restart should not
+    fire an outbound fetch before the app is even serving. Every run is gated
+    on TCGCSV's own last-updated timestamp, so a loop that wakes more often
+    than they publish costs one request and changes nothing.
+    """
+    if not PRICE_REFRESH_ENABLED:
+        print("[prices] background refresh disabled", flush=True)
+        return
+
+    import asyncio
+
+    async def loop():
+        await asyncio.sleep(120)
+        while True:
+            try:
+                def run():
+                    with db.session():
+                        return refresh_market_prices(db)
+
+                result = await run_in_threadpool(run)
+                if result.get("skipped"):
+                    print(f"[prices] already current ({result.get('snapshot')})",
+                          flush=True)
+                else:
+                    print(f"[prices] updated {result.get('updated')} card(s) "
+                          f"from snapshot {result.get('snapshot')}", flush=True)
+            except PriceFeedError as exc:
+                # Never fatal: a refresh that cannot reach TCGCSV leaves every
+                # stored price exactly as it was.
+                print(f"[prices] refresh failed, prices unchanged: {exc}",
+                      flush=True)
+            except Exception as exc:
+                print(f"[prices] unexpected refresh error: {exc}", flush=True)
+            await asyncio.sleep(PRICE_REFRESH_INTERVAL_HOURS * 3600)
+
+    asyncio.create_task(loop())
 
 
 @app.get("/api/condition-multipliers")

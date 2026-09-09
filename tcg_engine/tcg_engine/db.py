@@ -268,6 +268,28 @@ class Database:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS tcgcsv_groups (
+                    category_id INTEGER NOT NULL,
+                    group_id INTEGER NOT NULL,
+                    name TEXT,
+                    abbreviation TEXT,
+                    PRIMARY KEY (category_id, group_id)
+                );
+                """,
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS price_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_id TEXT NOT NULL,
+                    market_price REAL NOT NULL,
+                    source TEXT,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS condition_multipliers (
                     user_id INTEGER NOT NULL DEFAULT 0,
                     condition_key TEXT NOT NULL,
@@ -427,6 +449,12 @@ class Database:
                     "ALTER TABLE listing_settings_scoped RENAME TO listing_settings"
                 )
 
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_price_history_manifest
+                ON price_history(manifest_id, fetched_at DESC);
+                """
+            )
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_pricing_rules_user
@@ -1679,6 +1707,132 @@ class Database:
                 )
                 conn.commit()
         return self.get_condition_multipliers(user_id=scope)
+
+    # -- market price feed -------------------------------------------------
+
+    def replace_tcgcsv_groups(
+        self, category_id: int, rows: List[Dict[str, Any]]
+    ) -> None:
+        """Cache the set list used to resolve a set code to a group id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM tcgcsv_groups WHERE category_id = ?",
+                (int(category_id),),
+            )
+            cursor.executemany(
+                """
+                INSERT INTO tcgcsv_groups
+                    (category_id, group_id, name, abbreviation)
+                VALUES (?, ?, ?, ?)
+                """,
+                [(int(r["category_id"]), int(r["group_id"]),
+                  r.get("name") or "", r.get("abbreviation") or "")
+                 for r in rows],
+            )
+            conn.commit()
+
+    def get_tcgcsv_groups_by_abbreviation(
+        self, category_id: int
+    ) -> Dict[str, int]:
+        """
+        Set abbreviation -> group id, upper-cased for matching.
+
+        TCGCSV's abbreviation is our set_code ("SWSH06" on both sides), which
+        is what lets a card be priced without a hand-maintained map.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT group_id, abbreviation FROM tcgcsv_groups "
+                "WHERE category_id = ? AND TRIM(COALESCE(abbreviation,'')) != ''",
+                (int(category_id),),
+            )
+            return {str(r["abbreviation"]).strip().upper(): int(r["group_id"])
+                    for r in cursor.fetchall()}
+
+    def get_cards_for_repricing(self) -> List[Dict[str, Any]]:
+        """Every catalogued card that can be matched to a TCGplayer product."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT manifest_id, tcgplayer_id, set_code, printing, condition
+                FROM manifest
+                WHERE TRIM(COALESCE(tcgplayer_id, '')) != ''
+                ORDER BY manifest_id
+                """
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def record_market_prices(
+        self, updates: List[Tuple[str, float]], source: str = ""
+    ) -> int:
+        """
+        Store new market prices, keeping the previous values as history.
+
+        Writes unconditionally, unlike the backfill in get_or_create_manifest
+        which only fills a blank: a refresh whose whole purpose is to change
+        the number must not be blocked by there already being one.
+        """
+        if not updates:
+            return 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for manifest_id, price in updates:
+                cursor.execute(
+                    "UPDATE manifest SET market_price = ? WHERE manifest_id = ?",
+                    (float(price), manifest_id),
+                )
+                cursor.execute(
+                    "INSERT INTO price_history (manifest_id, market_price, source) "
+                    "VALUES (?, ?, ?)",
+                    (manifest_id, float(price), source),
+                )
+            conn.commit()
+        return len(updates)
+
+    def get_price_history(
+        self, manifest_id: str, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Recent market prices recorded for one card, newest first."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT market_price, source, fetched_at
+                FROM price_history
+                WHERE manifest_id = ?
+                ORDER BY fetched_at DESC, id DESC
+                LIMIT ?
+                """,
+                (manifest_id.strip(), int(limit)),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_live_cards_for_repricing(self) -> List[Dict[str, Any]]:
+        """
+        Cards live on eBay, with everything a reprice row needs.
+
+        Includes last_known_price so an unchanged row can be dropped, and the
+        stored custom_label because that is the SKU eBay knows -- one rebuilt
+        from a card's identity would address a variation that does not exist.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
+                       m.printing, m.market_price, m.price,
+                       v.ebay_parent_id, v.custom_label, v.last_known_price,
+                       v.last_known_qty
+                FROM manifest m
+                JOIN ebay_variations v ON v.manifest_id = m.manifest_id
+                WHERE TRIM(COALESCE(v.ebay_parent_id, '')) != ''
+                ORDER BY m.manifest_id
+                """
+            )
+            return [dict(r) for r in cursor.fetchall()]
 
     def get_listing_settings(self, user_id: int = SHARED_SCOPE) -> Dict[str, str]:
         """

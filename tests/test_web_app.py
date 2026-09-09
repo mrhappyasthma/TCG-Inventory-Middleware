@@ -16,6 +16,9 @@ os.environ["USER_DATABASE_URL"] = os.path.join(temp_dir.name, "test_users.db")
 os.environ["GOOGLE_CLIENT_ID"] = "test-client-id.apps.googleusercontent.com"
 os.environ["JWT_SECRET"] = "test-secret-key-123"
 os.environ["COOKIE_SECURE"] = "false"
+# The background price refresh makes outbound HTTP calls. Tests must
+# never depend on the network, and never poke a third-party service.
+os.environ["PRICE_REFRESH_ENABLED"] = "false"
 
 from app.main import app, db, user_db  # noqa: E402
 

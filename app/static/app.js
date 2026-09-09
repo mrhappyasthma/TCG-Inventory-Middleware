@@ -81,6 +81,9 @@ async function initAuth() {
             fetchStats();
             fetchSetFilter();
             fetchInventory();
+            // The scheduled refresh runs with nobody watching, so the pill has
+            // to be computed on arrival rather than only after a manual run.
+            refreshRepriceIndicator();
         } else if (data.is_pending) {
             document.getElementById("pendingApprovalBanner").classList.remove("hidden");
         } else {
@@ -315,6 +318,7 @@ async function loadPricingRules() {
         renderPricingRulesEditor();
         updateTestPricePreview();
         loadConditionMultipliers();
+        refreshRepriceIndicator();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400">Failed to load rules: ${escapeHtml(err.message)}</td></tr>`;
     }
@@ -506,6 +510,92 @@ async function resetConditionMultipliers() {
         updateTestPricePreview();
     } catch (err) {
         alert(err.message);
+    }
+}
+
+// -------------------------------------------------------------------
+// MARKET PRICE REFRESH / REPRICE
+// -------------------------------------------------------------------
+
+async function refreshMarketPrices() {
+    const button = document.getElementById("btnRefreshPrices");
+    const label = document.getElementById("btnRefreshPricesLabel");
+    const icon = document.getElementById("refreshPricesIcon");
+    const status = document.getElementById("priceRefreshStatus");
+
+    button.disabled = true;
+    label.innerText = "Fetching\u2026";
+    icon.classList.add("animate-spin");
+    status.innerText = "";
+
+    try {
+        const form = new FormData();
+        form.append("force", "false");
+        const res = await fetch("/api/pricing/refresh", {
+            method: "POST", body: form,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Refresh failed");
+
+        (data.logs || []).forEach(l => logToTerminal(l.level, `[PRICES] ${l.message}`));
+
+        status.innerText = data.skipped
+            ? `Already current (${data.snapshot || "unknown snapshot"})`
+            : `Updated ${data.updated} card(s) from ${data.groups_fetched} set(s)`;
+
+        // Recompute what a reprice would now produce.
+        await refreshRepriceIndicator();
+    } catch (err) {
+        // A failed fetch leaves every stored price untouched, so this is
+        // informational rather than something to recover from.
+        status.innerText = err.message;
+        logToTerminal("ERROR", `[PRICES] ${err.message}`);
+    } finally {
+        button.disabled = false;
+        label.innerText = "Refresh now";
+        icon.classList.remove("animate-spin");
+    }
+}
+
+// Asks how many listings a reprice would change, without generating a
+// download. Drives both the in-dialog preview and the header pill.
+async function refreshRepriceIndicator() {
+    try {
+        const res = await fetch("/api/pricing/reprice");
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const pill = document.getElementById("repriceReady");
+        const pillText = document.getElementById("repriceReadyText");
+        if (pill && pillText) {
+            if (data.reprice_count > 0) {
+                pillText.innerText = `Reprice ${data.reprice_count}`;
+                pill.classList.remove("hidden");
+                pill.classList.add("flex");
+            } else {
+                pill.classList.add("hidden");
+                pill.classList.remove("flex");
+            }
+        }
+
+        const box = document.getElementById("repricePreview");
+        const text = document.getElementById("repricePreviewText");
+        const link = document.getElementById("repriceDownload");
+        if (box && text && link) {
+            const parts = [];
+            if (data.reprice_count > 0) parts.push(`${data.reprice_count} to update`);
+            if (data.unchanged_count > 0) parts.push(`${data.unchanged_count} already correct`);
+            if (data.missing_price_count > 0) parts.push(`${data.missing_price_count} with no market price`);
+            text.innerText = data.reprice_count > 0
+                ? `Prices differ \u2014 ${parts.join(", ")}.`
+                : `Nothing to reprice \u2014 ${parts.join(", ") || "no live listings"}.`;
+            box.classList.remove("hidden");
+            link.classList.toggle("hidden", data.reprice_count === 0);
+        }
+    } catch (err) {
+        // The indicator is advisory; failing to compute it must not surface
+        // as an error the operator has to act on.
+        console.error("reprice indicator:", err);
     }
 }
 

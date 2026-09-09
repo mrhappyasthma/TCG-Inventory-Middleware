@@ -11,6 +11,9 @@ from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import process_batch_csv
 from tcg_engine.sync import sync_active_listings_csv
 from tcg_engine.relink import relink_from_active_listings, parse_option_name
+from tcg_engine.pricing_feed import (refresh_market_prices,
+                                     build_reprice_csv,
+                                     PriceFeedError)
 
 
 class TestTCGEngine(unittest.TestCase):
@@ -2837,6 +2840,267 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         res = process_batch_csv(dump, self.db, source_name="override.csv")
         self.assertIn("4.44", res["add_csv"],
                       "the override must survive the grade discount")
+
+    # -- market price feed -------------------------------------------------
+
+    PRICED_DUMP_HEADER = (
+        '"Game","Set","Set Code","Card Number","Name","Market Price",'
+        '"Condition","Language","Printing","Quantity","Remarks",'
+        '"TCGplayer Id","*ConditionID"'
+    )
+
+    def _priced_row(self, name, num, tcg_id, printing, market="0.30",
+                    cond="NM", qty=1):
+        return (f'"Pokemon","Chilling Reign","SWSH06","{num}","{name}",'
+                f'"{market}","{cond}","English","{printing}",{qty},"C-1",'
+                f'{tcg_id},"4000"')
+
+    def _fake_feed(self, prices, snapshot="SNAP-1", groups=None):
+        """A stand-in for TCGCSV, shaped like the real responses."""
+        import json as _json
+
+        group_rows = groups if groups is not None else [
+            {"groupId": 2807, "name": "Chilling Reign", "abbreviation": "SWSH06"},
+        ]
+        self.feed_calls = []
+
+        def fetcher(path):
+            self.feed_calls.append(path)
+            if path.endswith("last-updated.txt"):
+                return snapshot
+            if path.endswith("/groups"):
+                return _json.dumps({"success": True, "errors": [],
+                                    "results": group_rows})
+            if path.endswith("/prices"):
+                return _json.dumps({"success": True, "errors": [],
+                                    "results": prices})
+            raise AssertionError(f"unexpected path {path}")
+
+        return fetcher
+
+    def test_prices_join_on_printing_not_product_alone(self):
+        """
+        TCGCSV returns a row per printing, and on real cards Normal and
+        Reverse Holofoil differ several-fold. Joining on productId alone
+        would price every reverse holo as a normal -- a silent underprice
+        that looks entirely plausible.
+        """
+        dump = chr(10).join([
+            self.PRICED_DUMP_HEADER,
+            self._priced_row("Ledyba", "004/198", 241651, "Normal"),
+            self._priced_row("Ledyba", "004/198", 241651, "Reverse Holofoil"),
+        ]) + chr(10)
+        process_batch_csv(dump, self.db, source_name="p.csv")
+
+        fetcher = self._fake_feed([
+            {"productId": 241651, "subTypeName": "Normal", "marketPrice": 0.13},
+            {"productId": 241651, "subTypeName": "Reverse Holofoil",
+             "marketPrice": 0.26},
+        ])
+        res = refresh_market_prices(self.db, fetcher=fetcher)
+        self.assertEqual(res["updated"], 2)
+
+        by_printing = {}
+        with self.db.get_connection() as conn:
+            for row in conn.execute(
+                "SELECT printing, market_price FROM manifest"
+            ):
+                by_printing[row["printing"]] = row["market_price"]
+        self.assertAlmostEqual(by_printing["Normal"], 0.13, places=2)
+        self.assertAlmostEqual(by_printing["Reverse Holofoil"], 0.26, places=2)
+
+    def test_a_missing_price_leaves_the_stored_one_alone(self):
+        """
+        The pricing rules multiply against this number, so a missing price
+        must mean "unknown", never zero -- a silent zero would reprice the
+        catalogue to the floor.
+        """
+        dump = chr(10).join([
+            self.PRICED_DUMP_HEADER,
+            self._priced_row("Gloves", "133/198", 241823, "Normal",
+                             market="0.30"),
+        ]) + chr(10)
+        process_batch_csv(dump, self.db, source_name="p.csv")
+
+        fetcher = self._fake_feed([
+            {"productId": 241823, "subTypeName": "Normal", "marketPrice": None},
+        ])
+        res = refresh_market_prices(self.db, fetcher=fetcher)
+        self.assertEqual(res["updated"], 0)
+        self.assertEqual(res["unmatched"], 1)
+
+        with self.db.get_connection() as conn:
+            price = conn.execute(
+                "SELECT market_price FROM manifest"
+            ).fetchone()["market_price"]
+        self.assertAlmostEqual(price, 0.30, places=2,
+                               msg="the dump's price must survive")
+
+    def test_refresh_is_skipped_when_the_snapshot_is_unchanged(self):
+        """
+        TCGCSV publishes once a day and asks for at most one sync per 24
+        hours, so an already-current day must cost one request, not one per
+        set.
+        """
+        dump = chr(10).join([
+            self.PRICED_DUMP_HEADER,
+            self._priced_row("Ledyba", "004/198", 241651, "Normal"),
+        ]) + chr(10)
+        process_batch_csv(dump, self.db, source_name="p.csv")
+        prices = [{"productId": 241651, "subTypeName": "Normal",
+                   "marketPrice": 0.13}]
+
+        first = refresh_market_prices(self.db, fetcher=self._fake_feed(prices))
+        self.assertFalse(first["skipped"])
+        self.assertGreater(len(self.feed_calls), 1)
+
+        second = refresh_market_prices(self.db, fetcher=self._fake_feed(prices))
+        self.assertTrue(second["skipped"])
+        self.assertEqual(self.feed_calls, ["../last-updated.txt"])
+
+        # force overrides the gate, for when a price looks wrong.
+        third = refresh_market_prices(self.db, fetcher=self._fake_feed(prices),
+                                      force=True)
+        self.assertFalse(third["skipped"])
+
+    def test_an_unresolvable_set_code_is_reported_not_guessed(self):
+        """A set we cannot map keeps its prices, and says so."""
+        dump = chr(10).join([
+            self.PRICED_DUMP_HEADER,
+            self._priced_row("Ledyba", "004/198", 241651, "Normal"),
+        ]).replace('"SWSH06"', '"NOSUCH"') + chr(10)
+        process_batch_csv(dump, self.db, source_name="p.csv")
+
+        res = refresh_market_prices(self.db, fetcher=self._fake_feed([]))
+        self.assertEqual(res["updated"], 0)
+        self.assertTrue(any("does not match any TCGCSV set" in lg["message"]
+                            for lg in res["logs"]))
+
+    def test_a_failed_fetch_changes_nothing(self):
+        """An unreachable feed must leave every stored price as it was."""
+        dump = chr(10).join([
+            self.PRICED_DUMP_HEADER,
+            self._priced_row("Ledyba", "004/198", 241651, "Normal"),
+        ]) + chr(10)
+        process_batch_csv(dump, self.db, source_name="p.csv")
+
+        def broken(path):
+            raise PriceFeedError("network down")
+
+        with self.assertRaises(PriceFeedError):
+            refresh_market_prices(self.db, fetcher=broken)
+
+        with self.db.get_connection() as conn:
+            price = conn.execute(
+                "SELECT market_price FROM manifest"
+            ).fetchone()["market_price"]
+        self.assertAlmostEqual(price, 0.30, places=2)
+
+    def test_price_history_is_kept_rather_than_overwritten(self):
+        """A surprising reprice is only diagnosable with the prior value."""
+        dump = chr(10).join([
+            self.PRICED_DUMP_HEADER,
+            self._priced_row("Ledyba", "004/198", 241651, "Normal"),
+        ]) + chr(10)
+        process_batch_csv(dump, self.db, source_name="p.csv")
+        mid = self.db.get_inventory(limit=5)[0]["manifest_id"]
+
+        for snapshot, price in (("SNAP-1", 0.13), ("SNAP-2", 0.19)):
+            refresh_market_prices(
+                self.db,
+                fetcher=self._fake_feed(
+                    [{"productId": 241651, "subTypeName": "Normal",
+                      "marketPrice": price}],
+                    snapshot=snapshot,
+                ),
+            )
+
+        history = self.db.get_price_history(mid)
+        self.assertEqual([round(h["market_price"], 2) for h in history],
+                         [0.19, 0.13], "newest first, nothing lost")
+        self.assertIn("SNAP-2", history[0]["source"])
+
+    # -- reprice file ------------------------------------------------------
+
+    def _live_priced_card(self, market=0.30, ebay_price=1.99, cond="NM"):
+        dump = chr(10).join([
+            self.PRICED_DUMP_HEADER,
+            self._priced_row("Ledyba", "004/198", 241651, "Normal",
+                             market=str(market), cond=cond),
+        ]) + chr(10)
+        process_batch_csv(dump, self.db, source_name="p.csv")
+        mid = self.db.get_inventory(limit=5)[0]["manifest_id"]
+        self.db.upsert_variation(mid, "227511361186", 1,
+                                 custom_label=mid + "-C-1",
+                                 last_known_price=ebay_price)
+        return mid
+
+    def test_reprice_emits_only_listings_whose_price_changed(self):
+        """
+        A file of unchanged rows tells the operator nothing and asks eBay to
+        rewrite every listing for no reason.
+        """
+        # 0.30 -> the 0.25-0.50 tier -> 2.49, but eBay holds 1.99.
+        self._live_priced_card(market=0.30, ebay_price=1.99)
+        out = build_reprice_csv(self.db)
+        self.assertEqual(out["reprice_count"], 1)
+        rows = list(csv.DictReader(io.StringIO(out["csv_content"])))
+        self.assertEqual(rows[0]["Price"], "2.49")
+        self.assertEqual(rows[0]["Action"], "Revise")
+
+        # Once eBay agrees, nothing is emitted.
+        self.db.upsert_variation(rows[0]["CustomLabel"].split("-")[0],
+                                 "227511361186", 1,
+                                 custom_label=rows[0]["CustomLabel"],
+                                 last_known_price=2.49)
+        settled = build_reprice_csv(self.db)
+        self.assertEqual(settled["reprice_count"], 0)
+        self.assertEqual(settled["unchanged_count"], 1)
+
+    def test_reprice_file_carries_no_quantity_column(self):
+        """
+        A reprice must not touch stock. An absent column is "leave it alone";
+        sending it at all risks changing the very thing this file avoids.
+        """
+        self._live_priced_card()
+        out = build_reprice_csv(self.db)
+        header = out["csv_content"].splitlines()[0]
+        self.assertEqual(header, "Action,ItemID,CustomLabel,Price")
+        self.assertNotIn("Quantity", header)
+
+    def test_reprice_skips_cards_with_no_market_price(self):
+        """Pricing from nothing would emit the floor price for real stock."""
+        mid = self._live_priced_card(market=0.30)
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE manifest SET market_price = 0")
+            conn.commit()
+
+        out = build_reprice_csv(self.db)
+        self.assertEqual(out["reprice_count"], 0)
+        self.assertEqual(out["missing_price_count"], 1)
+        self.assertTrue(any("no stored market price" in lg["message"]
+                            for lg in out["logs"]))
+
+    def test_reprice_applies_the_condition_multiplier(self):
+        """The grade discount belongs in a reprice as much as in a batch."""
+        self._live_priced_card(market=10.00, ebay_price=1.99, cond="MP")
+        out = build_reprice_csv(self.db)
+        rows = list(csv.DictReader(io.StringIO(out["csv_content"])))
+        # 10.00 x 0.70 = 7.00, which is the 1.00+ tier -> +3.00 = 10.00.
+        self.assertEqual(rows[0]["Price"], "10.00")
+
+    def test_reprice_uses_the_label_ebay_knows(self):
+        """
+        A label rebuilt from a card's identity would address a variation that
+        does not exist; the stored one came from eBay's own report.
+        """
+        mid = self._live_priced_card()
+        self.db.upsert_variation(mid, "227511361186", 1,
+                                 custom_label=mid + "-FROM_EBAY",
+                                 last_known_price=1.99)
+        out = build_reprice_csv(self.db)
+        rows = list(csv.DictReader(io.StringIO(out["csv_content"])))
+        self.assertEqual(rows[0]["CustomLabel"], mid + "-FROM_EBAY")
 
 
 if __name__ == "__main__":

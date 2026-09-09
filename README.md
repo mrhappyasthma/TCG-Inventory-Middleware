@@ -328,6 +328,68 @@ work.
 * **Interactive Calculator**: The Pricing Rules page includes a live test calculator so you can enter any base price and see the computed eBay price immediately.
 * **Reset Defaults**: restores exactly the four rules in the table above.
 
+### Market price refresh
+
+Prices come from [TCGCSV](https://tcgcsv.com/), a free daily mirror of
+TCGplayer's own catalogue and price data. TCGplayer's official API has been
+closed to new applicants for years, and the mirror carries the same numbers:
+the Market/Low/Mid/High columns in a SortSwift export were verified field for
+field against TCGCSV's product prices for the same cards.
+
+The join is **`(tcgplayer_id, printing)`**. It has to include the printing:
+TCGCSV returns a row per printing, and on real cards Normal and Reverse
+Holofoil differ by 2-6x, so joining on the product alone would price every
+reverse holo as a normal - a silent underprice that looks entirely plausible.
+Their set `abbreviation` is your `set_code` (`SWSH06` on both sides), which is
+what removes the need for a hand-maintained set map.
+
+Their documented limits are treated as hard constraints:
+
+| | |
+|---|---|
+| Updates | Once per day |
+| Politeness | `last-updated.txt` is checked first; an already-current day costs **one** request, not one per set |
+| Hard cap | Ban above 10,000 requests/24h - a refresh here is one request per set held |
+| Spacing | 100 ms between requests |
+| User-Agent | A custom one is sent; generic headers may be blocked |
+| CORS | Restrictive, so this runs server-side only |
+
+A refresh runs automatically once a day (`PRICE_REFRESH_ENABLED`,
+`PRICE_REFRESH_INTERVAL_HOURS`) and on demand from **Refresh now** in the
+Pricing Rules dialog. Two safety properties matter more than the schedule:
+
+* **A missing or failed price never becomes `0`.** The rules multiply against
+  this number, so a silent zero would reprice the whole catalogue to the
+  floor. An unreachable feed leaves every stored price exactly as it was, and
+  a card TCGCSV has no price for keeps whatever it already had.
+* **Every value is kept in `price_history`.** A reprice that surprises you is
+  only diagnosable if the number it came from still exists.
+
+### The reprice file
+
+Module A prices from the columns of the export it is handed, so without this
+there is no way to push a new price without re-uploading a dump. **Download
+`ebay_reprice_updates.csv`** builds an eBay Revise file from the stored prices
+and your own rules:
+
+```
+Action,ItemID,CustomLabel,Price
+Revise,227511361186,ID1050-C-1,7.00
+```
+
+* **No `Quantity` column.** A reprice must not touch stock, and an absent
+  column is how File Exchange is told to leave a field alone.
+* **Only listings whose price actually changed**, on the same principle as
+  Module A - a file of unchanged rows tells you nothing and asks eBay to
+  rewrite every listing for no reason.
+* The `CustomLabel` is the one **eBay** reported, never one rebuilt from a
+  card's identity.
+
+When a reprice is pending, an amber **Reprice N** pill appears in the header.
+It is deliberately persistent rather than a toast: the nightly refresh
+finishes with nobody watching, so the signal has to survive until it is acted
+on.
+
 ### Condition multipliers
 
 The market price we can obtain is **product-level**. Neither TCGplayer's
