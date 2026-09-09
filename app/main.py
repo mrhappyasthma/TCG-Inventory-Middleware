@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import zipfile
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 
 # Ensure project root is in sys.path when running as direct script
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,17 +116,95 @@ if not os.path.exists(static_dir):
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
+# An upload is read into memory before parsing, so without a ceiling a single
+# request can exhaust the container's RAM. Generous enough for any real
+# SortSwift or eBay export; a 50,000-row dump is a few megabytes.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "25")) * 1024 * 1024
+
+
+async def read_upload_limited(
+    file: UploadFile, limit: int = MAX_UPLOAD_BYTES
+) -> bytes:
+    """
+    Read an upload, refusing anything over the limit.
+
+    Streams in chunks and stops at the ceiling rather than calling read() with
+    no argument, which would materialise the whole body first and so defeat
+    the check it is meant to enforce.
+    """
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"That file is larger than the {limit // (1024 * 1024)} MB "
+                    f"upload limit. Raise MAX_UPLOAD_MB if you really need to "
+                    f"process a file this big."
+                ),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """
+    Baseline response headers.
+
+    The CSP is sent Report-Only deliberately. An enforcing policy has to allow
+    Google Identity Services and the vendored Tailwind build, which compiles
+    classes in the browser, and getting either wrong renders a blank page. In
+    report-only mode violations are visible in the browser console without any
+    risk of breaking the dashboard, so the policy can be tightened against
+    real evidence and then switched to enforcing.
+    """
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    # The dashboard has no reason to be framed, and framing it invites
+    # clickjacking against the admin controls.
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy-Report-Only",
+        "; ".join([
+            "default-src 'self'",
+            # 'unsafe-inline' covers the inline Tailwind config block.
+            "script-src 'self' 'unsafe-inline' https://accounts.google.com",
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data: https:",
+            "connect-src 'self' https://accounts.google.com",
+            "frame-src https://accounts.google.com",
+            "frame-ancestors 'none'",
+            "base-uri 'self'",
+            "form-action 'self'",
+            "object-src 'none'",
+        ]),
+    )
+    return response
+
+
 # Pydantic Schemas
 class GoogleAuthRequest(BaseModel):
     id_token: str
 
 
 class StatusUpdateRequest(BaseModel):
-    status: str
+    # A closed set, not a free string. An arbitrary value would be stored
+    # verbatim and then compared against "active" on every request, so a typo
+    # locks the account out in a way the UI cannot express or undo -- and the
+    # value is rendered back into the admin table, which made it an injection
+    # sink as well.
+    status: Literal["active", "pending", "disabled"]
 
 
 class RoleUpdateRequest(BaseModel):
-    role: str
+    role: Literal["admin", "user"]
 
 
 class CoverImageRequest(BaseModel):
@@ -333,7 +411,7 @@ async def process_orders_endpoint(
     """
     Module C: Process raw eBay orders CSV & convert to SortSwift Orders Import CSV.
     """
-    content_bytes = await file.read()
+    content_bytes = await read_upload_limited(file)
     csv_text = decode_csv_bytes(content_bytes)
 
     def run():
@@ -378,7 +456,7 @@ async def process_batch_endpoint(
             ),
         )
 
-    content_bytes = await file.read()
+    content_bytes = await read_upload_limited(file)
     csv_text = decode_csv_bytes(content_bytes)
 
     # A few thousand card rows is seconds of synchronous SQLite work. Run it in
@@ -409,7 +487,7 @@ async def process_sync_endpoint(
     """
     Module B: Ingest eBay Active Listings report CSV & sync live store mirror state.
     """
-    content_bytes = await file.read()
+    content_bytes = await read_upload_limited(file)
     csv_text = decode_csv_bytes(content_bytes)
 
     def run():
@@ -756,6 +834,23 @@ def delete_card_endpoint(
     return {"success": True, "manifest_id": manifest_id}
 
 
+def _csv_safe(value: Any) -> Any:
+    """
+    Neutralise spreadsheet formula injection for a human-facing export.
+
+    A cell beginning =, +, - or @ is evaluated as a formula by Excel and
+    Sheets, so a card name or bin note carrying one becomes code in whoever
+    opens the file. Prefixing with an apostrophe makes it literal text.
+
+    Applied ONLY to this export, which exists to be opened in a spreadsheet.
+    The eBay Add/Revise files must never be touched this way: eBay parses them
+    as data, and an apostrophe would corrupt a title or a price.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 @app.get("/api/export/manifest")
 def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
     """Export complete Master Catalog & Live Mirror as CSV download."""
@@ -774,7 +869,11 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
     writer.writeheader()
-    writer.writerows(items)
+    # This file is meant to be opened in a spreadsheet, so cells that would
+    # otherwise be read as formulas are made literal first.
+    writer.writerows(
+        {key: _csv_safe(row.get(key)) for key in fieldnames} for row in items
+    )
     output.seek(0)
 
     return StreamingResponse(
@@ -991,8 +1090,19 @@ async def import_inventory_database(
     tmp_dir = tempfile.mkdtemp(prefix="tcg-import-")
     staged = os.path.join(tmp_dir, "upload.db")
     try:
+        written = 0
         with open(staged, "wb") as out:
             while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"That database is larger than the "
+                            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload "
+                            f"limit. Raise MAX_UPLOAD_MB to restore it."
+                        ),
+                    )
                 out.write(chunk)
 
         check = db.inspect_snapshot(staged)
@@ -1050,9 +1160,13 @@ def health_check():
         db.get_stats()
         return {"status": "ok", "database": "reachable"}
     except Exception as exc:
+        # This endpoint is unauthenticated, so the exception text stays in the
+        # server log rather than going to whoever asked. A SQLite error
+        # discloses absolute paths, which is free reconnaissance.
+        print(f"[health] database unreachable: {exc}", flush=True)
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "degraded", "database": "unreachable", "detail": str(exc)},
+            content={"status": "degraded", "database": "unreachable"},
         )
 
 

@@ -315,7 +315,7 @@ async function loadPricingRules() {
         renderPricingRulesEditor();
         updateTestPricePreview();
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400">Failed to load rules: ${err.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400">Failed to load rules: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
 
@@ -683,12 +683,12 @@ async function loadAdminUsers() {
                     <td class="py-2.5 px-3 font-mono text-[11px] text-slate-400">${escapeHtml(u.auth_provider)}</td>
                     <td class="py-2.5 px-3">
                         <span class="px-2 py-0.5 rounded text-[10px] uppercase font-semibold ${u.role === 'admin' ? 'bg-amber-950 text-amber-300 border border-amber-800' : 'bg-slate-800 text-slate-300'}">
-                            ${u.role}
+                            ${escapeHtml(u.role)}
                         </span>
                     </td>
                     <td class="py-2.5 px-3">
                         <span class="px-2 py-0.5 rounded text-[10px] uppercase font-semibold border ${statusColor}">
-                            ${u.status}
+                            ${escapeHtml(u.status)}
                         </span>
                     </td>
                     <td class="py-2.5 px-3 text-slate-500 text-[11px]">${new Date(u.created_at).toLocaleDateString()}</td>
@@ -716,7 +716,7 @@ async function loadAdminUsers() {
             `;
         }).join("");
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="7" class="py-4 text-center text-rose-400">Failed to load users: ${err.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="py-4 text-center text-rose-400">Failed to load users: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
 
@@ -1280,7 +1280,7 @@ async function fetchInventory() {
 
         renderInventoryTable(data.items, data.total, offset);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="11" class="py-6 text-center text-rose-400">Failed to load inventory: ${err.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="11" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
 
@@ -1653,7 +1653,7 @@ async function fetchDatabaseFiles() {
                 </div>`;
         }).join("") || `<p class="text-[11px] text-slate-500">No database files found.</p>`;
     } catch (err) {
-        target.innerHTML = `<p class="text-[11px] text-rose-300">${err.message}</p>`;
+        target.innerHTML = `<p class="text-[11px] text-rose-300">${escapeHtml(err.message)}</p>`;
     }
 }
 
@@ -1947,7 +1947,7 @@ function logToTerminal(level, message) {
     logEl.className = `log-entry flex items-start gap-2 ${levelColor}`;
     logEl.innerHTML = `
         <span class="text-slate-600 select-none">[${now}]</span>
-        <span class="${badgeClass}">[${level}]</span>
+        <span class="${badgeClass}">[${escapeHtml(level)}]</span>
         <span class="text-slate-300 break-words flex-1">${escapeHtml(message)}</span>
     `;
 
@@ -1961,6 +1961,9 @@ function clearConsoleLogs() {
     clearConsoleUnread();
 }
 
+// Deliberately a function declaration, not a const arrow: it is defined at the
+// bottom of the file but called from render code far above, and only
+// declarations hoist.
 function escapeHtml(str) {
     if (!str) return "";
     return String(str)

@@ -528,6 +528,160 @@ class TestWebApp(unittest.TestCase):
 
         # A file that is not there must not raise; it is simply not versioned.
         self.assertEqual(_asset_version("/static/does-not-exist.js"), "")
+    # -- security hardening ------------------------------------------------
+
+    def test_22_status_and_role_are_closed_sets(self):
+        """
+        A free-string status is stored verbatim and then compared against
+        "active" on every request, so an arbitrary value locks the account out
+        in a way the UI cannot express -- and it is rendered back into the
+        admin table, which made it an injection sink too.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        users = self.client.get("/api/admin/users").json()["users"]
+        target = next(u for u in users if u["username"] == "Second User")
+
+        for bad in ("<img src=x onerror=alert(1)>", "ACTIVE", "", "deleted"):
+            res = self.client.post(
+                f"/api/admin/users/{target['id']}/status", json={"status": bad}
+            )
+            self.assertEqual(res.status_code, 422, f"status={bad!r} was accepted")
+
+        for bad in ("<script>", "superadmin", "Admin"):
+            res = self.client.post(
+                f"/api/admin/users/{target['id']}/role", json={"role": bad}
+            )
+            self.assertEqual(res.status_code, 422, f"role={bad!r} was accepted")
+
+        # The legitimate values still work, and nothing was corrupted.
+        ok = self.client.post(
+            f"/api/admin/users/{target['id']}/status", json={"status": "active"}
+        )
+        self.assertEqual(ok.status_code, 200)
+        after = self.client.get("/api/admin/users").json()["users"]
+        self.assertEqual(
+            next(u for u in after if u["id"] == target["id"])["status"], "active"
+        )
+
+    def test_23_oversized_uploads_are_refused(self):
+        """
+        Every CSV endpoint reads the body into memory, so an unbounded upload
+        is a one-request memory exhaustion.
+        """
+        from app.main import MAX_UPLOAD_BYTES
+
+        oversized = b"a,b,c" + b"x" * (MAX_UPLOAD_BYTES + 1024)
+        for path in ("/api/process/batch", "/api/process/sync",
+                     "/api/process/orders"):
+            res = self.client.post(
+                path, files={"file": ("big.csv", oversized, "text/csv")}
+            )
+            self.assertEqual(res.status_code, 413, path)
+            self.assertIn("upload limit", res.json()["detail"])
+
+        # The database restore streams to disk and is capped separately.
+        res = self.client.post(
+            "/api/inventory/database",
+            files={"file": ("big.db", oversized, "application/octet-stream")},
+        )
+        self.assertEqual(res.status_code, 413)
+
+    def test_24_security_headers_are_present(self):
+        """Baseline headers on both the page and the API."""
+        for path in ("/", "/api/health"):
+            res = self.client.get(path)
+            self.assertEqual(res.headers.get("X-Content-Type-Options"),
+                             "nosniff", path)
+            self.assertEqual(res.headers.get("X-Frame-Options"), "DENY", path)
+            self.assertEqual(res.headers.get("Referrer-Policy"),
+                             "no-referrer", path)
+            csp = res.headers.get("Content-Security-Policy-Report-Only", "")
+            self.assertIn("frame-ancestors 'none'", csp, path)
+            self.assertIn("object-src 'none'", csp, path)
+            # Google Identity Services must stay reachable or sign-in breaks.
+            self.assertIn("https://accounts.google.com", csp, path)
+
+    def test_25_health_check_does_not_leak_internals(self):
+        """
+        The probe is unauthenticated, so a failure must not hand back an
+        exception string containing absolute paths.
+        """
+        from unittest.mock import patch
+
+        with patch("app.main.db.get_stats",
+                   side_effect=RuntimeError(
+                       "unable to open database file /volume1/docker/secret.db")):
+            res = self.client.get("/api/health")
+        self.assertEqual(res.status_code, 503)
+        body = res.json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertNotIn("detail", body)
+        self.assertNotIn("/volume1", str(body))
+
+    def test_26_manifest_export_neutralises_spreadsheet_formulas(self):
+        """
+        The export exists to be opened in Excel, where a cell starting with =
+        is evaluated. The eBay files must NOT get this treatment, since eBay
+        parses them as data.
+        """
+        from app.main import _csv_safe
+
+        for dangerous in ("=1+1", "+1", "-1", "@SUM(A1)"):
+            self.assertTrue(_csv_safe(dangerous).startswith("'"), dangerous)
+        for safe in ("Ledyba", "004/198", "1.99", ""):
+            self.assertEqual(_csv_safe(safe), safe)
+        # Non-strings pass through untouched.
+        self.assertEqual(_csv_safe(3), 3)
+        self.assertIsNone(_csv_safe(None))
+
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.get("/api/export/manifest")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("text/csv", res.headers["content-type"])
+
+    def test_27_session_cookie_is_hardened(self):
+        """HttpOnly stops script theft; SameSite blocks cross-site writes."""
+        with mock.patch("app.main.verify_google_id_token",
+                        return_value=google_claims("google-sub-admin",
+                                                   "admin@example.com",
+                                                   "Admin User")):
+            res = self.client.post("/api/auth/google",
+                                   json={"id_token": "stub-token"})
+        raw = res.headers.get("set-cookie", "")
+        self.assertIn("session_token=", raw)
+        self.assertIn("HttpOnly", raw)
+        self.assertIn("SameSite=lax", raw.replace("samesite", "SameSite"))
+
+    def test_28_forged_and_tampered_session_tokens_are_rejected(self):
+        """The cookie is the only credential, so its signature must hold."""
+        import base64
+        import json as _json
+
+        from app.auth import create_jwt_token
+
+        good = create_jwt_token({"user_id": 1})
+        header_b64, payload_b64, sig = good.split(".")
+
+        # Same payload, no signature.
+        forged = f"{header_b64}.{payload_b64}."
+        # Payload swapped to another user id, original signature kept.
+        tampered_payload = base64.urlsafe_b64encode(
+            _json.dumps({"user_id": 999, "exp": 9999999999}).encode()
+        ).decode().rstrip("=")
+        tampered = f"{header_b64}.{tampered_payload}.{sig}"
+        # alg=none header, a classic JWT confusion attempt.
+        none_header = base64.urlsafe_b64encode(
+            _json.dumps({"alg": "none", "typ": "JWT"}).encode()
+        ).decode().rstrip("=")
+        alg_none = f"{none_header}.{payload_b64}."
+
+        for label, token in (("unsigned", forged), ("tampered", tampered),
+                             ("alg=none", alg_none), ("garbage", "a.b.c")):
+            client = TestClient(app)
+            client.cookies.set("session_token", token)
+            res = client.get("/api/inventory")
+            self.assertIn(res.status_code, (401, 403),
+                          f"{label} token was accepted")
 
 if __name__ == "__main__":
     unittest.main()

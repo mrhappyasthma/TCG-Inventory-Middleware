@@ -427,6 +427,64 @@ behaviour is exactly as before. It never guesses.
 
 ---
 
+## 🔒 Security posture
+
+What is in place, and what is deliberately not.
+
+**Authentication.** Google Sign-In only; there is no password to steal or
+brute-force. ID tokens are verified locally with `google-auth`, including a
+mandatory audience check, and `email_verified` must be true. Accounts are keyed
+on the immutable Google `sub`, so changing an email does not orphan or hijack an
+account.
+
+**Sessions.** An HMAC-SHA256 signed cookie, `HttpOnly` (so script cannot read
+it), `SameSite=Lax` (so a cross-site POST cannot carry it, which is what stands
+in for CSRF tokens here), and `Secure` in production via `COOKIE_SECURE`. The
+signature is compared with `hmac.compare_digest`, and the header's `alg` is
+never trusted — a token claiming `alg: none` still has to match an HMAC. Every
+request re-reads the user from the database, so disabling an account takes
+effect immediately rather than at token expiry.
+
+**Secrets.** No hardcoded fallback secret. `JWT_SECRET` from the environment
+wins; otherwise 32 random bytes are generated once and persisted to
+`data/.session_secret` at mode `0600`. `.env`, `*.db` and the secret file are
+all gitignored — the repository is public, and `GOOGLE_CLIENT_ID` is the only
+credential in it, which is a browser-side identifier and safe to expose.
+
+**Injection.** All SQL is parameterised. Sort columns resolve through a
+whitelist with a safe default, so `ORDER BY` cannot be influenced. Every value
+interpolated into `innerHTML` passes through `escapeHtml`; this matters because
+card names come from uploaded CSVs and usernames from Google display names, and
+both are shown to *other* users. `status` and `role` are closed sets, so a
+value cannot be smuggled through the database into the admin table.
+
+**Uploads.** Capped at `MAX_UPLOAD_MB` (default 25) on all four upload paths.
+A restore is validated as one of our own databases before anything is replaced,
+and the current database is copied aside first.
+
+**Headers.** `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+(clickjacking against the admin controls), `Referrer-Policy: no-referrer`, and
+a Content-Security-Policy in **Report-Only** mode.
+
+### Known gaps
+
+* **The CSP is report-only, not enforcing.** An enforcing policy has to allow
+  Google Identity Services and the vendored Tailwind build, which compiles
+  classes in the browser; getting either wrong renders a blank page. Check the
+  browser console for violations, then flip the header name to
+  `Content-Security-Policy` once it is clean.
+* **The container runs as root.** Adding a `USER` line is the right hardening,
+  but the bind-mounted `./data` is owned by a host account, so it needs a
+  matching `chown` on the NAS or the app cannot write its database. Worth doing
+  deliberately rather than as a surprise.
+* **No rate limiting.** There is no password to guess, and `/api/auth/google`
+  requires a token Google actually signed, so the value is low.
+* **Inline `onclick` handlers** pass `manifest_id` into a JS string literal.
+  Those ids are server-generated (`ID1001`), so they cannot break out, but the
+  pattern would be unsafe if it were ever fed free text.
+
+---
+
 ## 🔄 Asset caching
 
 `GET /` is sent `Cache-Control: no-store`, and the `app.js` / `style.css` URLs
