@@ -58,3 +58,27 @@ def find_column(row: Dict[str, str], candidate_names: List[str]) -> Optional[str
         if clean in normalized_row:
             return normalized_row[clean]
     return None
+
+
+def parse_price(value) -> float:
+    """
+    Parse a price cell to a float, tolerating report formatting.
+
+    Handles currency symbols, thousands separators, a trailing currency code
+    and the literal "N/A". Returns 0.0 rather than raising, because a single
+    unreadable price must not abort a whole report.
+    """
+    if value is None:
+        return 0.0
+    text = str(value).strip()
+    if not text or text.upper() == "N/A":
+        return 0.0
+    # Strip everything that is not part of a number, which covers "$1.99",
+    # "1,299.00", "GBP 4.50" and "4.50 USD" alike.
+    cleaned = "".join(ch for ch in text if ch.isdigit() or ch in ".-")
+    if cleaned in ("", "-", ".", "-."):
+        return 0.0
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0

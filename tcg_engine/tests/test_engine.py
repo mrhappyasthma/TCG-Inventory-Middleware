@@ -2431,6 +2431,145 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(res["delisted_count"], 0)
         self.assertEqual(self.db.get_stats()["total_on_hand"], 5,
                          "on-hand is Module A's and must be untouched")
+    # -- unchanged Revise rows are suppressed ------------------------------
+
+    def _synced_dump_fixture(self, price_column=True):
+        """
+        Catalogue the dump, link it, and let a sync teach us eBay's quantity
+        and price -- the two things an unchanged check needs.
+        """
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="seed.csv")
+        ids = {r["product_name"]: r["manifest_id"]
+               for r in self.db.export_all_manifest()}
+        for mid in ids.values():
+            self.db.upsert_variation(mid, "227511361186", 0,
+                                     custom_label=mid + "-C-1")
+
+        # The quantities the dump produces, and the prices the shared rules
+        # compute for its market prices.
+        live = (("Ledyba", 3, "2.49"), ("Heracross", 2, "2.49"))
+        if price_column:
+            header = ("Item number,Custom label,Available quantity,"
+                      "Current price,Title")
+            rows = ["227511361186," + ids[n] + "-C-1," + str(q) + ",$" + p + ",Pick"
+                    for n, q, p in live]
+        else:
+            header = "Item number,Custom label,Available quantity,Title"
+            rows = ["227511361186," + ids[n] + "-C-1," + str(q) + ",Pick"
+                    for n, q, _ in live]
+        sync_active_listings_csv(header + chr(10) + chr(10).join(rows) + chr(10),
+                                 self.db)
+        return ids
+
+    def test_unchanged_dump_produces_no_revise_rows(self):
+        """
+        A full dump with nothing changed must not ask eBay to rewrite every
+        listing. Emitting one row per catalogued card regardless made a no-op
+        upload look like dozens of pending changes.
+        """
+        self._synced_dump_fixture()
+        res = process_batch_csv(self.FULL_DUMP, self.db,
+                                source_name="again.csv", force=True)
+        self.assertEqual(res["revise_count"], 0)
+        self.assertEqual(res["unchanged_count"], 2)
+        self.assertEqual(list(csv.DictReader(io.StringIO(res["revise_csv"]))), [],
+                         "the file should carry only its header")
+        self.assertTrue(any("already match eBay" in lg["message"]
+                            for lg in res["logs"]))
+
+    def test_a_quantity_change_emits_and_keeps_emitting_until_confirmed(self):
+        """
+        Only the changed card appears, and it must keep appearing until a sync
+        confirms it -- otherwise the change would reach no file at all.
+        """
+        ids = self._synced_dump_fixture()
+        changed = self.FULL_DUMP.replace(
+            '"English","Normal",2,"Bin A-2"', '"English","Normal",5,"Bin A-2"'
+        )
+        self.assertNotEqual(changed, self.FULL_DUMP, "fixture must actually change")
+
+        first = process_batch_csv(changed, self.db, source_name="c1.csv")
+        self.assertEqual(first["revise_count"], 1)
+        self.assertEqual(first["unchanged_count"], 1)
+
+        again = process_batch_csv(changed, self.db, source_name="c2.csv",
+                                  force=True)
+        self.assertEqual(again["revise_count"], 1,
+                         "an unapplied change must not be suppressed")
+
+        # Once eBay confirms it, it goes quiet.
+        mid = ids["Heracross"]
+        self.db.upsert_variation(mid, "227511361186", 5,
+                                 custom_label=mid + "-C-1",
+                                 last_known_price=2.49)
+        settled = process_batch_csv(changed, self.db, source_name="c3.csv",
+                                    force=True)
+        self.assertEqual(settled["revise_count"], 0)
+
+    def test_a_price_rule_change_emits_even_though_quantities_match(self):
+        """Price is half the comparison; ignoring it would strand rule edits."""
+        self._synced_dump_fixture()
+        self.db.set_pricing_rules([
+            {"min_price": 0.0, "max_price": None, "rule_type": "fixed",
+             "rule_value": 3.49, "sort_order": 1}])
+        res = process_batch_csv(self.FULL_DUMP, self.db, source_name="p.csv",
+                                force=True)
+        self.assertEqual(res["unchanged_count"], 0)
+        self.assertEqual(res["revise_count"], 2)
+        for row in csv.DictReader(io.StringIO(res["revise_csv"])):
+            self.assertEqual(row["Price"], "3.49")
+
+    def test_nothing_is_suppressed_before_a_sync(self):
+        """Suppression may only act on what eBay is known to hold."""
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="s.csv")
+        ids = {r["product_name"]: r["manifest_id"]
+               for r in self.db.export_all_manifest()}
+        for mid in ids.values():
+            self.db.upsert_variation(mid, "227511361186", 0,
+                                     custom_label=mid + "-C-1")
+        res = process_batch_csv(self.FULL_DUMP, self.db, source_name="s2.csv",
+                                force=True)
+        self.assertEqual(res["unchanged_count"], 0,
+                         "no price known, so nothing may be ruled out")
+
+    def test_nothing_is_suppressed_when_the_report_has_no_price(self):
+        """
+        Some Active Listings layouts carry no price column. Unknown must mean
+        "emit", never "assume unchanged".
+        """
+        ids = self._synced_dump_fixture(price_column=False)
+        self.assertIsNone(
+            self.db.get_variation(ids["Ledyba"])["last_known_price"])
+        res = process_batch_csv(self.FULL_DUMP, self.db, source_name="np.csv",
+                                force=True)
+        self.assertEqual(res["unchanged_count"], 0)
+        self.assertGreater(res["revise_count"], 0)
+
+    def test_a_suppressed_row_records_no_pending_request(self):
+        """
+        Recording intent for a row no file contains would claim an outstanding
+        change forever, and would block every later suppression.
+        """
+        ids = self._synced_dump_fixture()
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="q1.csv",
+                          force=True)
+        self.assertIsNone(self.db.get_variation(ids["Ledyba"])["pending_qty"],
+                          "nothing was asked for, so nothing is pending")
+
+        again = process_batch_csv(self.FULL_DUMP, self.db, source_name="q2.csv",
+                                  force=True)
+        self.assertEqual(again["revise_count"], 0, "still suppressible")
+
+    def test_parse_price_tolerates_report_formatting(self):
+        """Report prices arrive with symbols, separators and currency codes."""
+        from tcg_engine.csvtools import parse_price
+        cases = [("$1.99", 1.99), ("1,299.00", 1299.00), ("4.50 USD", 4.50),
+                 ("GBP 4.50", 4.50), ("", 0.0), ("N/A", 0.0), (None, 0.0),
+                 ("2.49", 2.49), ("-", 0.0), ("  3.00  ", 3.00)]
+        for raw, want in cases:
+            self.assertAlmostEqual(parse_price(raw), want, places=2,
+                                   msg=repr(raw))
+
 
 if __name__ == "__main__":
     unittest.main()

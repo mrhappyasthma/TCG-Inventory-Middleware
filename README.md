@@ -387,6 +387,46 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ---
 
+## 🧮 Why a Revise file can be empty
+
+Module A only writes a Revise row when it would **change** something. A full
+dump where nothing moved produces a file with just its header, and the card
+reads *"Nothing to upload — all N card(s) already match eBay"*.
+
+Previously it emitted one row per catalogued card that was live on eBay,
+regardless. A no-op re-upload of a 35-card dump therefore looked like 35
+pending changes, and there was no way to see at a glance what had actually
+changed.
+
+A row is suppressed **only** when eBay is positively known to hold both the
+same quantity and the same price. Everything else counts as a change:
+
+| Situation | Row emitted? | Why |
+|---|---|---|
+| eBay has this exact quantity and price | no | nothing to do |
+| Quantity differs | yes | the point of the file |
+| Price differs (e.g. you edited a pricing rule) | yes | price is half the comparison |
+| Never synced with Module B | **yes** | eBay's figures are unknown, so nothing can be ruled out |
+| Active Listings report had no price column | **yes** | same reason |
+| A previous change is still unapplied | **yes** | it must keep appearing until a sync confirms it, or it would reach no file at all |
+
+That last row matters: suppression is based on what eBay is *known* to hold,
+never on what we last asked for. Otherwise a change you generated but never
+uploaded would silently vanish from every subsequent file.
+
+### It needs one sync first
+
+The price comparison depends on `ebay_variations.last_known_price`, which
+**Module B** fills in from the `Current price` column of the Active Listings
+report. Until you have run a sync since upgrading, every price is unknown and
+nothing is suppressed — so the first dump after this change still emits
+everything. Run Module B once and subsequent no-op dumps go quiet.
+
+If your report has no price column at all, suppression simply never engages and
+behaviour is exactly as before. It never guesses.
+
+---
+
 ## ⏳ While a module is working
 
 Each module card covers itself with its own overlay while it runs, rather than

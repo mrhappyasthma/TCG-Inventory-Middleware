@@ -372,6 +372,7 @@ def _empty_batch_result(
         "add_csv": ",".join(add_headers or ADD_HEADERS) + "\n",
         "revise_count": 0,
         "zeroed_count": 0,
+        "unchanged_count": 0,
         "add_count": 0,
         "new_catalog_count": 0,
         "skipped_count": 0,
@@ -469,6 +470,17 @@ def process_batch_csv(
     # otherwise emit two Revise rows whose CustomLabels differ by bin, and only
     # one of those labels exists on the listing.
     revise_by_manifest: Dict[str, Dict[str, Any]] = {}
+    # Add mode keeps one row per CSV row, paired with its manifest id so the
+    # unchanged check never has to guess which card a row belongs to.
+    revise_pairs: List[tuple] = []
+
+    # What eBay is believed to hold for each card we touched, so an unchanged
+    # Revise row can be recognised and dropped after the final total is known.
+    believed_state: Dict[str, Dict[str, Any]] = {}
+    # The quantity we intend to ask eBay for, written only for rows that
+    # survive; recording one for a suppressed row would claim an outstanding
+    # request that no file actually contains.
+    intended_qty: Dict[str, int] = {}
 
     # Load configuration settings
     single_threshold = float(
@@ -869,11 +881,13 @@ def process_batch_csv(
                 new_consolidated_qty = base_qty + file_totals[manifest_id]
                 qty_note = f"+{quantity} => Total {new_consolidated_qty}"
 
-            if not dry_run:
-                # Record what we are asking for -- NOT what eBay reports. Only
-                # a Module B sync may move last_known_qty, because until this
-                # file is uploaded eBay knows nothing about it.
-                db.set_pending_quantity(manifest_id, new_consolidated_qty)
+            # Deferred until the row is known to survive; see below.
+            intended_qty[manifest_id] = new_consolidated_qty
+            believed_state[manifest_id] = {
+                "last_known_qty": variation.get("last_known_qty"),
+                "last_known_price": variation.get("last_known_price"),
+                "pending_qty": variation.get("pending_qty"),
+            }
 
             revise_entry = {
                 "Action": "Revise",
@@ -887,7 +901,7 @@ def process_batch_csv(
                 # place, keeping one row per card.
                 revise_by_manifest[manifest_id] = revise_entry
             else:
-                revise_rows.append(revise_entry)
+                revise_pairs.append((manifest_id, revise_entry))
 
             logs.append({
                 "level": "SUCCESS",
@@ -1063,10 +1077,68 @@ def process_batch_csv(
     # -----------------------------------------------------------------
     # REPLACE MODE: RECONCILE AGAINST THE FULL DUMP
     # -----------------------------------------------------------------
+    def revise_row_changes_anything(manifest_id: str, row: Dict[str, Any]) -> bool:
+        """
+        Would this Revise row actually change the listing?
+
+        Only ever answers False when eBay is *known* to hold exactly these
+        values already. Anything unknown -- no sync yet, or a report with no
+        price column -- counts as a change, so a real update is never dropped
+        on a guess. That makes the check safe but conservative: it stays quiet
+        until a Module B sync has taught us both figures.
+        """
+        state = believed_state.get(manifest_id)
+        if state is None:
+            return True
+
+        known_qty = state["last_known_qty"]
+        known_price = state["last_known_price"]
+        pending = state["pending_qty"]
+
+        if known_qty is None or known_price is None:
+            return True
+
+        # An outstanding request eBay has not confirmed must keep appearing in
+        # the file, or the change would never reach eBay at all. A pending
+        # value equal to eBay's own figure is not outstanding -- it is what a
+        # previous no-op run recorded.
+        if pending is not None and int(pending) != int(known_qty):
+            return True
+
+        return not (
+            int(known_qty) == int(row["Quantity"])
+            and round(float(known_price), 2) == round(float(row["Price"]), 2)
+        )
+
+    from_file_rows = (
+        list(revise_by_manifest.items()) if replace_quantities else revise_pairs
+    )
+
+    unchanged_count = 0
+    surviving: List[Dict[str, Any]] = []
+    for manifest_key, row in from_file_rows:
+        if not revise_row_changes_anything(manifest_key, row):
+            unchanged_count += 1
+            continue
+        surviving.append(row)
+        if not dry_run:
+            # Record the request only now that it is really in the file. Only a
+            # Module B sync may move last_known_qty.
+            db.set_pending_quantity(manifest_key, intended_qty[manifest_key])
+
+    revise_rows = surviving
+
+    if unchanged_count:
+        logs.append({
+            "level": "INFO",
+            "message": (
+                f"{unchanged_count} card(s) already match eBay on both quantity "
+                f"and price, so no Revise row was written for them."
+            ),
+        })
+
     zeroed_count = 0
     if replace_quantities:
-        # One Revise row per card, carrying the file's total for that card.
-        revise_rows.extend(revise_by_manifest.values())
 
         # A full dump lists everything on hand, so a card that is live on eBay
         # and absent from the file has sold out. Left alone it would keep its
@@ -1144,7 +1216,7 @@ def process_batch_csv(
 
     logs.append({
         "level": "INFO",
-        "message": f"Batch routing finished: {len(revise_rows)} items to REVISE ({zeroed_count} of them zeroed as sold out), {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
+        "message": f"Batch routing finished: {len(revise_rows)} items to REVISE ({zeroed_count} of them zeroed as sold out, {unchanged_count} unchanged and skipped), {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
     })
 
     # Fingerprint only after the batch has actually been applied, so a failure
@@ -1161,6 +1233,7 @@ def process_batch_csv(
         "add_csv": add_csv,
         "revise_count": len(revise_rows),
         "zeroed_count": zeroed_count,
+        "unchanged_count": unchanged_count,
         "quantity_mode": mode,
         "add_count": total_added_cards,
         "new_catalog_count": new_catalog_count,

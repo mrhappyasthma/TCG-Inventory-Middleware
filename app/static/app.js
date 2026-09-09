@@ -994,15 +994,28 @@ async function handleBatchUpload(file, mode = "normal") {
         // Worth calling out separately: these are cards being pulled from
         // sale, not routine revisions.
         if (data.zeroed_count > 0) parts.push(`${data.zeroed_count} sold out → 0`);
+        if (data.unchanged_count > 0) parts.push(`${data.unchanged_count} unchanged`);
         const suffix = data.dry_run ? " (inventory unchanged)" : "";
-        document.getElementById("batchReadyText").innerText = parts.length
-            ? `Files ready \u2014 ${parts.join(", ")}${suffix}`
-            : `Nothing to upload${suffix}`;
+        // "Nothing to upload" on its own reads like a failure. When the
+        // reason is that everything already matches eBay, say so.
+        const nothingToSend = data.revise_count === 0 && data.add_count === 0;
+        document.getElementById("batchReadyText").innerText = nothingToSend
+            ? (data.unchanged_count > 0
+                ? `Nothing to upload \u2014 all ${data.unchanged_count} card(s) already match eBay${suffix}`
+                : `Nothing to upload${suffix}`)
+            : `Files ready \u2014 ${parts.join(", ")}${suffix}`;
 
         logToTerminal(
             "SUCCESS",
             `[MODULE A] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}${suffix}. Click to download.`
         );
+
+        if (data.unchanged_count > 0 && data.revise_count === 0) {
+            logToTerminal(
+                "INFO",
+                `[MODULE A] No Revise file needed: all ${data.unchanged_count} linked card(s) already match eBay on quantity and price.`
+            );
+        }
 
         if (data.zeroed_count > 0) {
             logToTerminal(

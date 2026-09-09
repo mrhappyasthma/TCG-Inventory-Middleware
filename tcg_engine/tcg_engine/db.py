@@ -180,6 +180,7 @@ class Database:
                     ebay_parent_id TEXT NOT NULL,
                     custom_label TEXT,
                     last_known_qty INTEGER DEFAULT 0,
+                    last_known_price REAL,
                     pending_qty INTEGER,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (manifest_id) REFERENCES manifest(manifest_id) ON DELETE CASCADE
@@ -299,6 +300,16 @@ class Database:
             if "pending_qty" not in {row["name"] for row in cursor.fetchall()}:
                 cursor.execute(
                     "ALTER TABLE ebay_variations ADD COLUMN pending_qty INTEGER"
+                )
+
+            # The price eBay reports for a variation. Without it there is no way
+            # to tell whether a Revise row would change anything, so a full
+            # inventory dump emitted a row for every card it had ever listed.
+            # NULL means "not known", and nothing is ever suppressed on a guess.
+            cursor.execute("PRAGMA table_info(ebay_variations)")
+            if "last_known_price" not in {row["name"] for row in cursor.fetchall()}:
+                cursor.execute(
+                    "ALTER TABLE ebay_variations ADD COLUMN last_known_price REAL"
                 )
 
             # Per-user scoping migration for databases created before pricing
@@ -794,7 +805,7 @@ class Database:
             cursor.execute(
                 """
                 SELECT manifest_id, ebay_parent_id, custom_label,
-                       last_known_qty, pending_qty
+                       last_known_qty, last_known_price, pending_qty
                 FROM ebay_variations
                 WHERE manifest_id = ?
                 """,
@@ -809,6 +820,7 @@ class Database:
         ebay_parent_id: str,
         last_known_qty: int,
         custom_label: Optional[str] = None,
+        last_known_price: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Insert or update an ebay_variations row.
@@ -826,6 +838,7 @@ class Database:
         p_id = str(ebay_parent_id).strip()
         qty = int(last_known_qty)
         label = str(custom_label).strip() if custom_label else None
+        price = None if last_known_price is None else round(float(last_known_price), 2)
 
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -833,16 +846,18 @@ class Database:
                 """
                 INSERT INTO ebay_variations
                     (manifest_id, ebay_parent_id, custom_label, last_known_qty,
-                     pending_qty, updated_at)
-                VALUES (?, ?, ?, ?, NULL, CURRENT_TIMESTAMP)
+                     last_known_price, pending_qty, updated_at)
+                VALUES (?, ?, ?, ?, ?, NULL, CURRENT_TIMESTAMP)
                 ON CONFLICT(manifest_id) DO UPDATE SET
                     ebay_parent_id = excluded.ebay_parent_id,
                     custom_label = COALESCE(excluded.custom_label, ebay_variations.custom_label),
                     last_known_qty = excluded.last_known_qty,
+                    last_known_price = COALESCE(excluded.last_known_price,
+                                                ebay_variations.last_known_price),
                     pending_qty = NULL,
                     updated_at = CURRENT_TIMESTAMP;
                 """,
-                (m_id, p_id, label, qty),
+                (m_id, p_id, label, qty, price),
             )
             conn.commit()
             return {
@@ -850,6 +865,7 @@ class Database:
                 "ebay_parent_id": p_id,
                 "custom_label": label,
                 "last_known_qty": qty,
+                "last_known_price": price,
             }
 
     def set_pending_quantity(self, manifest_id: str, quantity: int) -> None:
@@ -883,8 +899,8 @@ class Database:
             cursor.execute(
                 """
                 SELECT v.manifest_id, v.ebay_parent_id, v.custom_label,
-                       v.last_known_qty, v.pending_qty, m.product_name,
-                       m.set_name, m.condition, m.remarks
+                       v.last_known_qty, v.last_known_price, v.pending_qty,
+                       m.product_name, m.set_name, m.condition, m.remarks
                 FROM ebay_variations v
                 JOIN manifest m ON m.manifest_id = v.manifest_id
                 WHERE v.ebay_parent_id IS NOT NULL

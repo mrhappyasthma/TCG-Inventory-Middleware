@@ -2,7 +2,7 @@ import csv
 import io
 import re
 from typing import Dict, Any, List, Optional
-from .csvtools import find_column as _find_column, read_csv_text, strip_bom
+from .csvtools import find_column as _find_column, read_csv_text, strip_bom, parse_price
 from .db import Database
 
 
@@ -136,6 +136,26 @@ def sync_active_listings_csv(
         except (ValueError, AttributeError):
             quantity = 0
 
+        # eBay's price for this variation. Without it, Module A cannot tell
+        # whether a Revise row would change anything, and has to emit one for
+        # every card. Absent from some report layouts, which is why "unknown"
+        # is a distinct state from "zero".
+        price_cell = _find_column(
+            row,
+            [
+                "Current price",
+                "Current Price",
+                "Start price",
+                "Start Price",
+                "Buy It Now price",
+                "Buy It Now Price",
+                "Price",
+                "Fixed price",
+            ],
+        )
+        reported_price = parse_price(price_cell) if price_cell else 0.0
+        known_price = reported_price if reported_price > 0 else None
+
         # Determine effective eBay Item Number
         effective_item_id = current_parent_item_id or (item_id.strip() if item_id else "UNKNOWN")
 
@@ -145,6 +165,7 @@ def sync_active_listings_csv(
         db.upsert_variation(
             manifest_id, effective_item_id, quantity,
             custom_label=raw_custom_label,
+            last_known_price=known_price,
         )
         synced_count += 1
         linked_item_ids.add(effective_item_id)
