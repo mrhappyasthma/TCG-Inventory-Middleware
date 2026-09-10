@@ -2480,10 +2480,18 @@ async function fetchDraftPlan() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Failed to load drafts");
 
-        const draft = (data.plans || []).find(p => p.status === "draft");
+        const plans = data.plans || [];
+        // Rendered before the branch, so approved plans and their files stay
+        // on screen whether or not a draft is open. Rendering it inside the
+        // draft footer was the original mistake: approving moves the plan out
+        // of draft, and the no-open-draft state then hides the footer -- so
+        // the files appeared and vanished in the same instant.
+        renderPlanHistory(plans);
+
+        const draft = plans.find(p => p.status === "draft");
         if (!draft) {
             currentDraftPlan = null;
-            renderNoDraft(data.plans || []);
+            renderNoDraft(plans);
             return;
         }
 
@@ -2517,7 +2525,7 @@ function renderNoDraft(plans) {
                 known to hold. Rebuild one after a batch upload, a price refresh or a manual
                 edit. An empty draft means nothing needs changing.
             </p>
-            ${approved ? `<p class="text-[11px] text-slate-600">${approved} earlier plan(s) on record.</p>` : ""}
+            ${approved ? `<p class="text-[11px] text-slate-600">${approved} approved plan(s) below, with the files they authorised.</p>` : ""}
         </div>`;
 }
 
@@ -2920,7 +2928,7 @@ async function approveDraftPlan() {
         // An approved plan now yields the eBay files it authorised. Offered
         // rather than auto-downloaded, matching how Module A's files work,
         // and only the files that actually have rows in them.
-        await showApprovedPlanFiles(planId);
+        expandPlanFilesFor = planId;
         await fetchDraftPlan();
     } catch (err) {
         logToTerminal("ERROR", `Approval failed: ${err.message}`);
@@ -2928,9 +2936,66 @@ async function approveDraftPlan() {
     }
 }
 
-async function showApprovedPlanFiles(planId) {
-    const footer = document.getElementById("draftSummary");
-    if (!footer) return;
+// Set after approving, so that plan's files open by themselves rather than
+// needing a click straight after the action that produced them.
+let expandPlanFilesFor = null;
+
+function statusBadge(status) {
+    const styles = {
+        approved: "bg-emerald-950/80 text-emerald-400 border-emerald-800",
+        pushed: "bg-sky-950/80 text-sky-300 border-sky-800",
+        partial: "bg-amber-950/80 text-amber-300 border-amber-800",
+        failed: "bg-rose-950/80 text-rose-300 border-rose-800",
+        discarded: "bg-slate-900 text-slate-500 border-slate-800",
+    };
+    const cls = styles[status] || "bg-slate-900 text-slate-400 border-slate-800";
+    return `<span class="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded border ${cls}">${escapeHtml(status)}</span>`;
+}
+
+// Approved plans, newest first, each able to hand back the files it
+// authorised. Rendered whether or not a draft is open: a plan approved
+// yesterday is still the record of what was authorised, and the files may be
+// uploaded well after the approval.
+function renderPlanHistory(plans) {
+    const box = document.getElementById("draftHistory");
+    if (!box) return;
+    const history = (plans || []).filter(p => p.status !== "draft").slice(0, 8);
+    if (!history.length) {
+        box.innerHTML = "";
+        return;
+    }
+
+    box.innerHTML = `
+        <p class="text-[11px] font-semibold text-slate-400 mt-4">Approved plans</p>
+        ${history.map(p => `
+            <div class="glass-card rounded-xl border border-slate-800 bg-dark-800/40 px-3.5 py-2.5">
+                <div class="flex items-center gap-3">
+                    <span class="text-xs font-bold text-slate-200">Plan ${p.id}</span>
+                    ${statusBadge(p.status)}
+                    <span class="text-[11px] text-slate-500">
+                        ${p.item_count} change(s)${p.excluded_count ? `, ${p.excluded_count} left out` : ""}
+                        ${p.approved_at ? ` &middot; approved ${escapeHtml(String(p.approved_at).slice(0, 16))}` : ""}
+                    </span>
+                    <button type="button" onclick="loadPlanFiles(${p.id})"
+                        class="ml-auto text-[11px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all">
+                        Files
+                    </button>
+                </div>
+                <div id="planFiles${p.id}" class="hidden mt-2"></div>
+            </div>`).join("")}`;
+
+    if (expandPlanFilesFor) {
+        const planId = expandPlanFilesFor;
+        expandPlanFilesFor = null;
+        loadPlanFiles(planId);
+    }
+}
+
+async function loadPlanFiles(planId) {
+    const box = document.getElementById(`planFiles${planId}`);
+    if (!box) return;
+    box.classList.remove("hidden");
+    box.innerHTML = `<p class="text-[11px] text-slate-500">Building the files&hellip;</p>`;
     try {
         const res = await fetch(`/api/plans/${planId}/files`);
         const data = await res.json();
@@ -2939,48 +3004,39 @@ async function showApprovedPlanFiles(planId) {
         const links = [];
         if (data.add_card_count) {
             links.push(`<a href="/api/plans/${planId}/add.csv" download
-                class="text-accent-emerald underline decoration-dotted">Add file</a>
-                <span class="text-slate-500">(${data.listing_count} listing(s), ${data.add_card_count} card(s))</span>`);
+                class="text-accent-emerald underline decoration-dotted font-semibold">Add file</a>
+                <span class="text-slate-500">&mdash; creates ${data.listing_count} listing(s) from ${data.add_card_count} card(s)</span>`);
         }
         if (data.revise_count) {
             links.push(`<a href="/api/plans/${planId}/revise.csv" download
-                class="text-accent-cyan underline decoration-dotted">Revise file</a>
-                <span class="text-slate-500">(${data.revise_count} row(s))</span>`);
+                class="text-accent-cyan underline decoration-dotted font-semibold">Revise file</a>
+                <span class="text-slate-500">&mdash; updates ${data.revise_count} existing row(s)</span>`);
         }
         if (data.cover_count) {
             links.push(`<a href="/api/plans/${planId}/cover-revise.csv" download
-                class="text-accent-cyan underline decoration-dotted">Cover photos</a>
-                <span class="text-slate-500">(${data.cover_count} listing(s))</span>`);
+                class="text-accent-cyan underline decoration-dotted font-semibold">Cover photos</a>
+                <span class="text-slate-500">&mdash; ${data.cover_count} listing(s)</span>`);
         }
 
-        // Named individually because they are uploaded separately and an Add
-        // creates live listings while a Revise only changes existing ones --
-        // conflating them is how a mistake becomes 400 listings instead of a
-        // quantity correction.
-        footer.insertAdjacentHTML("afterend", `
-            <div class="mt-3 rounded-xl border border-slate-700 bg-dark-900/60 p-3 text-[11px] space-y-1.5">
-                <p class="font-semibold text-slate-200">Files ready to upload to Seller Hub</p>
+        // Named individually because they are uploaded separately, and an Add
+        // creates live listings while a Revise only changes existing ones.
+        // Conflating them is how a quantity correction becomes 400 listings.
+        box.innerHTML = `
+            <div class="rounded-lg border border-slate-700 bg-dark-900/60 p-2.5 text-[11px] space-y-1.5">
                 ${links.length
                     ? links.map(l => `<p>${l}</p>`).join("")
                     : `<p class="text-slate-500">This plan produced no uploadable rows.</p>`}
                 ${data.unlistable && data.unlistable.length
-                    ? `<p class="text-amber-300">${data.unlistable.length} card(s) could not be included &mdash; see the console.</p>`
+                    ? `<p class="text-amber-300">${data.unlistable.length} card(s) could not be included:</p>
+                       <ul class="ml-4 list-disc text-amber-200/80">${data.unlistable.slice(0, 5).map(u =>
+                           `<li><span class="font-mono">${escapeHtml(u.manifest_id)}</span> ${escapeHtml(u.reason)}</li>`).join("")}</ul>`
                     : ""}
                 ${data.add_card_count
-                    ? `<p class="text-slate-500">An Add file creates live listings. Upload a small slice first and check one resulting listing before committing the rest.</p>`
+                    ? `<p class="text-slate-500 pt-1">An Add file creates live listings. Upload a small slice first &mdash; a variation parent row plus its children &mdash; and check the result in Seller Hub before committing the rest.</p>`
                     : ""}
-            </div>`);
-
-        for (const entry of (data.unlistable || [])) {
-            logToTerminal("WARN", `[DRAFTS] ${entry.manifest_id}: ${entry.reason}`);
-        }
-        logToTerminal(
-            "SUCCESS",
-            `[DRAFTS] Plan ${planId} files ready: ${data.add_card_count} card(s) `
-            + `across ${data.listing_count} listing(s), ${data.revise_count} revise row(s)`
-        );
+            </div>`;
     } catch (err) {
-        logToTerminal("ERROR", `[DRAFTS] Could not build the plan's files: ${err.message}`);
+        box.innerHTML = `<p class="text-[11px] text-rose-400">${escapeHtml(err.message)}</p>`;
     }
 }
 
