@@ -1056,19 +1056,65 @@ already linked keeps its eBay item number and quantity.
 
 ## 🗂️ Workspace tabs
 
-The three working views share one tabbed area so the page stays a fixed height
+The working views share one tabbed area so the page stays a fixed height
 rather than growing with your catalog:
 
 | Tab | Shows |
 |---|---|
 | **Live Store Inventory** | The master catalog joined with live eBay links. Default view. |
 | **eBay Listings** | Your live listings as eBay sees them, rolled up per item number. |
+| **Drafts** | The listings and updates we plan to make, before anything reaches eBay. |
 | **Terminal Console** | The operational log. |
 
 Because the console can now be hidden, its tab carries an **unread counter** of
 log lines that arrived while you were elsewhere, and the badge turns red if any
 of them was an error — otherwise a failure could land on an invisible tab and go
 unnoticed. Opening the tab clears it.
+
+### Drafts
+
+Staging for everything eBay-bound. A **draft plan** is the difference between
+what your catalog says and what eBay is known to hold, computed from stored
+state rather than from an uploaded file — so it can be rebuilt at any time, and
+an empty draft is the correct outcome of a dump that changed nothing.
+
+Press **Rebuild draft** after a batch upload, a price refresh or a manual edit.
+The page then shows one block per eBay listing, grouped exactly the way eBay
+will publish it, with one row per card. On each row you can:
+
+* adjust the **quantity** or **price**;
+* **move the card into another variation listing**, or give it a single of its
+  own, from the Listing dropdown;
+* **leave it out** of the push entirely.
+
+The value eBay is currently known to hold appears struck through beside each
+proposal. An unknown reads as *new* rather than as a number, because nothing is
+suppressed against a value a sync has never told us — see
+[Why a Revise file can be empty](#-why-a-revise-file-can-be-empty) for the same
+rule on the CSV path.
+
+**Blockers gate the approve button.** eBay refuses an entire variation listing
+when any single one of its offers is invalid, and it only says so *after* you
+have approved — by which point whoever approved it has walked away. So the
+checks that can be made locally are made here: a missing price, no eBay
+category, no postal code (an Add without an item location is rejected with error
+10009), a missing Game value, an unset business policy, or a title over eBay's
+80-character limit. Fix the card or leave it out; leaving it out is eBay's own
+documented way to unblock the rest of a group.
+
+Approving records **who authorised the change and when**, which is the only
+thing that will authorise an eBay write. An approved plan can no longer be
+edited or discarded: editing it afterwards would change what gets pushed and
+leave the approval describing something that never happened. Plans are per-user
+for the same reason.
+
+Only one draft can be open per user, and rebuilding replaces it. Two drafts over
+the same cards would each be computed against state the other is about to
+change, and approving both would apply the older numbers second.
+
+> **Nothing on this page contacts eBay yet.** Approval is implemented; the push
+> that acts on it is the last step of the migration. See
+> [`docs/ebay-api-design.md`](docs/ebay-api-design.md).
 
 ### eBay Listings
 

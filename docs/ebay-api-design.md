@@ -1,8 +1,10 @@
 # Design: replacing the CSV hand-off with the eBay APIs
 
-**Status: proposal.** Nothing here is built yet. This file records the design
-and, more importantly, the constraints eBay imposes on it, so that the
-implementation does not rediscover them one failed push at a time.
+**Status: in progress.** The `ebay_client` library, the staging tables, the
+plan engine and the drafts page are built; nothing contacts eBay yet. See §9
+for what is done and what is not. This file records the design and, more
+importantly, the constraints eBay imposes on it, so that the implementation
+does not rediscover them one failed push at a time.
 
 ---
 
@@ -79,8 +81,13 @@ CREATE TABLE listing_plan_item (
     manifest_id    TEXT    NOT NULL REFERENCES manifest(manifest_id),
     group_key      TEXT,                 -- the (set, condition) listing this belongs to
     action         TEXT    NOT NULL,
-        -- create_listing | update_qty | update_price | update_images
-        -- | add_to_group | remove_from_group | end_listing
+        -- create_listing | update | zero_out | remove_from_group | end_listing
+        --
+        -- Refined during implementation: quantity and price were originally
+        -- separate actions, but eBay changes both in one
+        -- bulkUpdatePriceQuantity call. Splitting them would double the call
+        -- count and leave a listing briefly at a new price with an old
+        -- quantity, so one `update` carries both.
     proposed_qty   INTEGER,
     proposed_price REAL,
     observed_qty   INTEGER,              -- last_known_qty at plan time
@@ -252,6 +259,13 @@ Steps 1-4 cannot damage the storefront. Only step 5 can.
    webhook. The latter is mandatory for production keys anyway, and its
    signature verification (`X-EBAY-SIGNATURE`, `getPublicKey`, cache the key
    about an hour) is the same code the order webhook needs.
+   *Library done* — `ebay_client` implements both OAuth grants, the transport,
+   the endpoint challenge and signature verification, with 45 tests and no
+   network access. Not yet wired to an endpoint or a token store, and no eBay
+   credentials are configured.
+   *Staging done* — the `listing_plan` tables, `tcg_engine.plans` and the
+   Drafts tab are built and a plan can be built, edited and approved. Approval
+   authorises a push that does not exist yet.
 2. **Module B via API** — `getInventoryItems` / `getOffers` instead of the
    Active Listings CSV. Read-only, proves the auth end to end, and retires a
    manual report download.
