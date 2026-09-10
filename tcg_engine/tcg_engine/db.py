@@ -328,6 +328,72 @@ class Database:
                 );
                 """
             )
+            # Staging for eBay changes. Every producer of change -- a batch
+            # upload, a manual edit, a price refresh, a photo change, a
+            # regrouping -- writes a draft plan here instead of a CSV, and
+            # nothing reaches eBay until the plan is approved. The gate is
+            # therefore a predicate the push worker filters on rather than a
+            # property of a remote system we would have to trust.
+            #
+            # See docs/ebay-api-design.md for why staging is not done on eBay:
+            # createOrReplaceInventoryItemGroup updates a *live* listing when
+            # its membership changes, so the one operation most in need of
+            # staging is the one eBay cannot stage.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS listing_plan (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    source_ref TEXT,
+                    note TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    approved_at TIMESTAMP,
+                    approved_by INTEGER,
+                    pushed_at TIMESTAMP
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS listing_plan_item (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id INTEGER NOT NULL,
+                    manifest_id TEXT NOT NULL,
+                    group_key TEXT,
+                    action TEXT NOT NULL,
+                    proposed_qty INTEGER,
+                    proposed_price REAL,
+                    observed_qty INTEGER,
+                    observed_price REAL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    validation TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (plan_id) REFERENCES listing_plan(id) ON DELETE CASCADE,
+                    FOREIGN KEY (manifest_id) REFERENCES manifest(manifest_id)
+                        ON DELETE CASCADE
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_plan_item_plan
+                ON listing_plan_item(plan_id, group_key);
+                """
+            )
+            # Only one plan may be open at a time per user. Two concurrent
+            # drafts against the same cards would each be computed against
+            # state the other is about to change, and approving both would
+            # apply the older one's numbers second.
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_one_draft_per_user
+                ON listing_plan(user_id) WHERE status = 'draft';
+                """
+            )
             # Idempotent migration: catalogued quantity was added after the
             # first release.
             manifest_columns = {
@@ -1834,6 +1900,32 @@ class Database:
             )
             return [dict(r) for r in cursor.fetchall()]
 
+    def get_cards_for_planning(self) -> List[Dict[str, Any]]:
+        """
+        Every catalogued card with what eBay is known to hold for it.
+
+        A LEFT JOIN, unlike get_live_cards_for_repricing: a card that is not
+        on eBay yet is exactly the case that produces a create, so restricting
+        to live rows would make it impossible to plan a new listing.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
+                       m.printing, m.card_number, m.language, m.sku_id,
+                       m.tcgplayer_id, m.set_code, m.cdn_image, m.remarks,
+                       COALESCE(m.quantity, 0) AS quantity,
+                       m.price, m.market_price,
+                       v.ebay_parent_id, v.custom_label,
+                       v.last_known_qty, v.last_known_price, v.pending_qty
+                FROM manifest m
+                LEFT JOIN ebay_variations v ON v.manifest_id = m.manifest_id
+                ORDER BY m.manifest_id
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_listing_settings(self, user_id: int = SHARED_SCOPE) -> Dict[str, str]:
         """
         The settings that apply to this user: the shared baseline with this
@@ -2002,6 +2094,287 @@ class Database:
                 (sha256, source_name, int(row_count)),
             )
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Draft plans: staging for every eBay-bound change
+    # ------------------------------------------------------------------
+
+    def create_plan(
+        self,
+        user_id: int,
+        source: str = "manual",
+        source_ref: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> int:
+        """
+        Open a new draft plan and return its id.
+
+        Raises sqlite3.IntegrityError if this user already has an open draft,
+        which the unique partial index enforces. That is deliberate: the
+        caller must decide whether to extend the existing draft or discard it,
+        because two drafts computed against the same cards would each be built
+        from state the other is about to change.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO listing_plan (user_id, status, source, source_ref, note)
+                VALUES (?, 'draft', ?, ?, ?)
+                """,
+                (int(user_id), source, source_ref, note),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def get_open_plan_id(self, user_id: int) -> Optional[int]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id FROM listing_plan WHERE user_id = ? AND status = 'draft'",
+                (int(user_id),),
+            )
+            row = cursor.fetchone()
+            return int(row["id"]) if row else None
+
+    def get_plan(self, plan_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM listing_plan WHERE id = ?", (int(plan_id),)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_plans(
+        self, user_id: Optional[int] = None, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Recent plans, newest first, each with its item counts.
+
+        The counts are computed here rather than in the caller so the drafts
+        list costs one query instead of one per plan.
+        """
+        clauses = []
+        params: List[Any] = []
+        if user_id is not None:
+            clauses.append("p.user_id = ?")
+            params.append(int(user_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT p.*,
+                       COUNT(i.id) AS item_count,
+                       SUM(CASE WHEN i.status = 'excluded' THEN 1 ELSE 0 END)
+                           AS excluded_count,
+                       SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END)
+                           AS failed_count,
+                       SUM(CASE WHEN i.status = 'pushed' THEN 1 ELSE 0 END)
+                           AS pushed_count
+                FROM listing_plan p
+                LEFT JOIN listing_plan_item i ON i.plan_id = p.id
+                {where}
+                GROUP BY p.id
+                ORDER BY p.created_at DESC, p.id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def add_plan_items(self, plan_id: int, items: List[Dict[str, Any]]) -> int:
+        """
+        Append items to a plan. Returns how many were written.
+
+        Done in one executemany inside one connection: a plan built from a
+        full SortSwift dump can carry thousands of items, and a per-item
+        connection would spend minutes on setup alone.
+        """
+        if not items:
+            return 0
+        rows = [
+            (
+                int(plan_id),
+                item["manifest_id"],
+                item.get("group_key"),
+                item["action"],
+                item.get("proposed_qty"),
+                item.get("proposed_price"),
+                item.get("observed_qty"),
+                item.get("observed_price"),
+                item.get("status", "pending"),
+                item.get("validation"),
+            )
+            for item in items
+        ]
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                """
+                INSERT INTO listing_plan_item (
+                    plan_id, manifest_id, group_key, action,
+                    proposed_qty, proposed_price, observed_qty, observed_price,
+                    status, validation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+            return len(rows)
+
+    def get_plan_items(
+        self, plan_id: int, group_key: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        A plan's items, joined to the card each one describes.
+
+        Ordered by group then card so the drafts page can render listings as
+        contiguous blocks without sorting in the browser.
+        """
+        clauses = ["i.plan_id = ?"]
+        params: List[Any] = [int(plan_id)]
+        if group_key is not None:
+            clauses.append("COALESCE(i.group_key, '') = ?")
+            params.append(group_key)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT i.*,
+                       m.product_name, m.set_name, m.condition, m.printing,
+                       m.card_number, m.quantity AS catalogued_qty,
+                       m.price AS catalogued_price, m.market_price,
+                       m.cdn_image, m.remarks,
+                       v.ebay_parent_id, v.custom_label,
+                       v.last_known_qty, v.last_known_price
+                FROM listing_plan_item i
+                JOIN manifest m ON m.manifest_id = i.manifest_id
+                LEFT JOIN ebay_variations v ON v.manifest_id = i.manifest_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY COALESCE(i.group_key, ''), i.manifest_id
+                """,
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_plan_item(self, item_id: int, **fields) -> bool:
+        """
+        Change one item's proposal, grouping or status.
+
+        Restricted to a whitelist of columns rather than accepting arbitrary
+        keys: this is reached from an HTTP endpoint, and interpolating a
+        caller-supplied column name into SQL is how that becomes an injection
+        point.
+        """
+        allowed = {
+            "group_key",
+            "action",
+            "proposed_qty",
+            "proposed_price",
+            "status",
+            "validation",
+            "error_code",
+            "error_message",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        assignments = ", ".join(f"{k} = ?" for k in updates)
+        params = list(updates.values()) + [int(item_id)]
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                UPDATE listing_plan_item
+                SET {assignments}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                params,
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_plan_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM listing_plan_item WHERE id = ?", (int(item_id),)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def set_plan_status(
+        self,
+        plan_id: int,
+        status: str,
+        approved_by: Optional[int] = None,
+    ) -> bool:
+        """
+        Move a plan through its lifecycle, stamping the matching timestamp.
+
+        The timestamps are set here rather than by the caller so that an
+        approved plan can never lack an approval time -- which is the only
+        record of who authorised an eBay write and when.
+        """
+        sets = ["status = ?"]
+        params: List[Any] = [status]
+        if status == "approved":
+            sets.append("approved_at = CURRENT_TIMESTAMP")
+            if approved_by is not None:
+                sets.append("approved_by = ?")
+                params.append(int(approved_by))
+        elif status == "pushed":
+            sets.append("pushed_at = CURRENT_TIMESTAMP")
+        params.append(int(plan_id))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE listing_plan SET {', '.join(sets)} WHERE id = ?", params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_plan(self, plan_id: int) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM listing_plan WHERE id = ?", (int(plan_id),))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_plan_groups(self, plan_id: int) -> List[Dict[str, Any]]:
+        """
+        One row per listing the plan touches, for the drafts page's summary.
+
+        Grouped in SQL because eBay's unit of publication is the listing, not
+        the card: a validation failure on one card blocks its whole group, so
+        the group is the level at which the page has to report.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COALESCE(i.group_key, '') AS group_key,
+                       COUNT(*) AS item_count,
+                       SUM(CASE WHEN i.status = 'excluded' THEN 1 ELSE 0 END)
+                           AS excluded_count,
+                       SUM(CASE WHEN i.validation IS NOT NULL
+                                 AND TRIM(i.validation) != '' THEN 1 ELSE 0 END)
+                           AS invalid_count,
+                       SUM(COALESCE(i.proposed_qty, 0)) AS proposed_copies,
+                       MIN(m.set_name) AS set_name,
+                       MIN(m.condition) AS condition
+                FROM listing_plan_item i
+                JOIN manifest m ON m.manifest_id = i.manifest_id
+                WHERE i.plan_id = ?
+                GROUP BY COALESCE(i.group_key, '')
+                ORDER BY COALESCE(i.group_key, '')
+                """,
+                (int(plan_id),),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def export_all_manifest(self) -> List[Dict[str, Any]]:
         """Export all master manifest rows."""
