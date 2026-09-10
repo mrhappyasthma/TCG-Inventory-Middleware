@@ -199,6 +199,97 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _first_text(element, *names: str) -> str:
+    """The text of the first direct child matching one of ``names``."""
+    for name in names:
+        for child in element:
+            if _local_name(child.tag) == name and (child.text or "").strip():
+                return child.text.strip()
+    return ""
+
+
+def _records_from_sku_details(element) -> List[Dict[str, str]]:
+    """
+    One record per SKU inside a single SKUDetails block.
+
+    A multi-variation listing reports its quantity and price **per
+    variation**, nested inside the item's block, and the item level carries no
+    SKU at all -- a blank SKU there is how eBay identifies the parent. Reading
+    only the direct children therefore produced one blank-SKU row per listing:
+    54 rows for a store of 4 variation listings and 50 singles, none of them
+    matching anything. That is what a store mirror sync must never mistake for
+    an empty store.
+
+    Element names are matched loosely on purpose. The merchant-data schema
+    calls the price StartPrice in some places and Price in others, and pinning
+    one spelling is how a schema revision becomes a silent zero-match parse.
+    """
+    item_id = _first_text(element, "ItemID")
+
+    variations = [
+        node
+        for node in element.iter()
+        if _local_name(node.tag) == "Variation" and node is not element
+    ]
+    if variations:
+        records = []
+        for variation in variations:
+            records.append(
+                {
+                    "ItemID": item_id,
+                    "SKU": _first_text(variation, "SKU"),
+                    "Price": _first_text(variation, "StartPrice", "Price"),
+                    "Quantity": _first_text(
+                        variation, "Quantity", "QuantityAvailable"
+                    ),
+                }
+            )
+        return records
+
+    # A single-variation listing: everything is at the item level.
+    return [
+        {
+            "ItemID": item_id,
+            "SKU": _first_text(element, "SKU"),
+            "Price": _first_text(element, "Price", "StartPrice"),
+            "Quantity": _first_text(element, "Quantity", "QuantityAvailable"),
+        }
+    ]
+
+
+def report_outline(payload: bytes, limit: int = 40) -> List[str]:
+    """
+    The element paths in a report, with no values at all.
+
+    Purely diagnostic, and values are deliberately excluded so it is safe to
+    show and to paste. Two rounds of "the report is not the shape the parser
+    expects" were spent inferring structure from row counts; an outline settles
+    it in one look.
+    """
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError:
+        return []
+
+    seen: List[str] = []
+
+    def walk(element, prefix: str) -> None:
+        path = f"{prefix}/{_local_name(element.tag)}" if prefix else _local_name(
+            element.tag
+        )
+        if path not in seen:
+            seen.append(path)
+        if len(seen) >= limit:
+            return
+        for child in element:
+            walk(child, path)
+            if len(seen) >= limit:
+                return
+
+    walk(root, "")
+    return seen[:limit]
+
+
 def parse_active_inventory_report(payload: bytes) -> List[Dict[str, str]]:
     """
     Pull the SKU rows out of an ActiveInventoryReport XML document.
@@ -234,11 +325,7 @@ def parse_active_inventory_report(payload: bytes) -> List[Dict[str, str]]:
     for element in root.iter():
         if _local_name(element.tag) != "SKUDetails":
             continue
-        record = {}
-        for child in element:
-            record[_local_name(child.tag)] = (child.text or "").strip()
-        if record:
-            records.append(record)
+        records.extend(_records_from_sku_details(element))
 
     if not records:
         raise FeedError(

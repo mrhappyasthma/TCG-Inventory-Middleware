@@ -113,7 +113,11 @@ try:
         verify_signature,
     )
     from ebay_client.oauth import TokenStore
-    from ebay_client.feed import FeedError, download_active_inventory_report
+    from ebay_client.feed import (
+        FeedError,
+        download_active_inventory_report,
+        report_outline,
+    )
 
     EBAY_CLIENT_AVAILABLE = True
 except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
@@ -142,6 +146,7 @@ except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
     TokenStore = object
     FeedError = _EbayUnavailable
     download_active_inventory_report = None
+    report_outline = None
 
 try:
     from app.user_db import UserDatabase
@@ -1739,6 +1744,11 @@ async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)
             ),
             "headers": [h.strip() for h in first_line.split(",")][:40],
         }
+        # Only when nothing matched, and only element names -- never values.
+        # Inferring the report's structure from row counts cost two rounds of
+        # guessing; an outline settles it in one look and is safe to paste.
+        if result.get("synced_count", 0) == 0 and report.get("was_xml"):
+            result["report"]["outline"] = report_outline(report["content"])
         return result
 
     try:

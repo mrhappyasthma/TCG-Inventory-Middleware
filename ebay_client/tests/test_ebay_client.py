@@ -763,6 +763,79 @@ class FeedReportTests(unittest.TestCase):
 </ActiveInventoryReport>
 """
 
+    # A multi-variation listing. Quantity and price are reported per
+    # variation, nested inside the item's block, and the item level carries no
+    # SKU at all -- a blank SKU there is how eBay identifies the parent.
+    # Reading only the direct children yielded one blank-SKU row per listing,
+    # which matched nothing.
+    VARIATION_REPORT = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ActiveInventoryReport xmlns="urn:ebay:apis:eBLBaseComponents">
+  <Ack>Success</Ack>
+  <SKUDetails>
+    <ItemID>227511361186</ItemID>
+    <SKU></SKU>
+    <Variations>
+      <Variation>
+        <SKU>ID1050-Bin_A12</SKU>
+        <StartPrice>1.99</StartPrice>
+        <Quantity>1</Quantity>
+      </Variation>
+      <Variation>
+        <SKU>ID1048-Bin_A12</SKU>
+        <StartPrice>2.49</StartPrice>
+        <Quantity>2</Quantity>
+      </Variation>
+    </Variations>
+  </SKUDetails>
+  <SKUDetails>
+    <ItemID>227599999999</ItemID>
+    <SKU></SKU>
+    <Price>5.00</Price>
+    <Quantity>1</Quantity>
+  </SKUDetails>
+</ActiveInventoryReport>
+"""
+
+    def test_variations_are_flattened_one_record_per_variation(self):
+        records = feed.parse_active_inventory_report(self.VARIATION_REPORT)
+        # Two variations plus one single listing, not two listing-level rows.
+        self.assertEqual(len(records), 3)
+        variation_skus = [r["SKU"] for r in records if r["SKU"]]
+        self.assertEqual(variation_skus, ["ID1050-Bin_A12", "ID1048-Bin_A12"])
+
+    def test_a_variation_inherits_its_parents_item_id(self):
+        records = feed.parse_active_inventory_report(self.VARIATION_REPORT)
+        # The variation carries no ItemID of its own, and the mirror is keyed
+        # on the listing, so it must come from the enclosing block.
+        self.assertEqual(records[0]["ItemID"], "227511361186")
+        self.assertEqual(records[1]["ItemID"], "227511361186")
+
+    def test_start_price_is_accepted_where_price_is_absent(self):
+        # The merchant-data schema uses both spellings in different places.
+        records = feed.parse_active_inventory_report(self.VARIATION_REPORT)
+        self.assertEqual(records[0]["Price"], "1.99")
+        self.assertEqual(records[1]["Quantity"], "2")
+
+    def test_a_single_listing_still_reads_from_the_item_level(self):
+        records = feed.parse_active_inventory_report(self.VARIATION_REPORT)
+        single = records[2]
+        self.assertEqual(single["ItemID"], "227599999999")
+        self.assertEqual(single["Price"], "5.00")
+        # No SKU, so the reconciler will ignore it as unmanaged -- which is
+        # correct for a listing this tool did not create.
+        self.assertEqual(single["SKU"], "")
+
+    def test_the_outline_names_elements_and_no_values(self):
+        outline = feed.report_outline(self.VARIATION_REPORT)
+        self.assertIn("ActiveInventoryReport/SKUDetails/Variations/Variation/SKU", outline)
+        # Values must never appear: the outline exists to be pasted.
+        joined = " ".join(outline)
+        self.assertNotIn("ID1050", joined)
+        self.assertNotIn("1.99", joined)
+
+    def test_the_outline_of_unparseable_bytes_is_empty_rather_than_raising(self):
+        self.assertEqual(feed.report_outline(b"not xml"), [])
+
     def test_the_report_is_recognised_as_xml(self):
         self.assertTrue(feed.looks_like_xml(self.REAL_REPORT))
         self.assertFalse(feed.looks_like_xml(b"ItemID,SKU\n1,ID1001\n"))
