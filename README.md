@@ -259,12 +259,47 @@ an unverified notification is an anonymous request that merely resembles eBay.
 3. On your Synology NAS (via SSH or Container Manager Web UI):
    ```bash
    cd /volume1/docker/tcg-middleware
-   git pull origin main
-   docker-compose up -d --build
+   ./deploy.sh
    ```
 4. Access the dashboard at `https://cards.yourname.synology.me`.
 
 `docker-compose` will refuse to start if `GOOGLE_CLIENT_ID` is not set in the environment or `.env`.
+
+### `deploy.sh`
+
+Pulls, and rebuilds only when something that reaches the image changed. The
+equivalent by hand is `git pull origin main && docker compose up -d --build`,
+which rebuilds every time — including for a commit that only touched the
+README.
+
+What it does, and why each part is the way it is:
+
+* **Compares `HEAD` before and after the pull** rather than grepping for
+  "Already up to date." That string is human-facing text which varies by git
+  version and locale; a revision either changed or it did not.
+* **Pulls `--ff-only`.** This checkout is a consumer of `origin/main` and
+  nothing else. Without it, one stray local commit turns a deploy into a merge.
+* **Rebuilds only for paths that reach the image**: `app/`, `tcg_engine/`,
+  `ebay_client/`, `requirements.txt`, `Dockerfile`, `docker-compose.yml`. A
+  docs-only or tests-only commit needs no rebuild. Note that `app/static`
+  *does* count — the dashboard's HTML, JS and CSS are `COPY`ed into the image,
+  so a UI change needs a rebuild even though it feels like a static asset.
+* **Starts the stack if nothing is running**, even when nothing was pulled. A
+  previous run could have pulled successfully and then failed to build, and
+  without this every later deploy would decline to fix a site that is down.
+* **Prints `ps` afterwards.** A build can succeed and the container still exit
+  on startup — a missing dependency did exactly that once, and the symptom was
+  a 502 from the reverse proxy rather than anything Docker complained about.
+
+Two things it deliberately cannot detect:
+
+* **`.env` changes.** `.env` is gitignored, so a pull never sees it. After
+  editing it, run `docker compose up -d` yourself to recreate the container
+  with the new environment — no rebuild is needed, since environment variables
+  are not baked into the image.
+* **A change made directly on the NAS.** `--ff-only` will refuse to pull over
+  local edits rather than silently discarding them, which is the intended
+  behaviour; resolve it by hand.
 
 ### 3. Avoiding Port Conflicts on Synology
 If port `8080` is already used by another container on your NAS, set `HOST_PORT` in your `.env`:
