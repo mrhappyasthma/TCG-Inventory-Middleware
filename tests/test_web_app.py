@@ -1005,6 +1005,22 @@ class TestWebApp(unittest.TestCase):
             main._ebay_client = saved_client
             main.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
 
+    def test_39b_inventory_rows_carry_the_card_image(self):
+        """
+        The dashboard's hover preview needs cdn_image on every inventory row.
+
+        It comes from the SortSwift export and is often the only picture of
+        the actual card held. Absent from the query, the preview silently
+        never appears -- there is nothing to error on.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        rows = self.client.get("/api/inventory").json()["items"]
+        self.assertTrue(rows, "the batch tests should have left a card")
+        self.assertIn("cdn_image", rows[0])
+        # The batch fixture carries one, so this also proves it is populated
+        # rather than merely present.
+        self.assertEqual(rows[0]["cdn_image"], "https://cdn.example.com/deerling.jpg")
+
     # -- connecting the eBay account ---------------------------------------
 
     def signed_in_second_user(self):

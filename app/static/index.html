@@ -873,6 +873,16 @@
         </div>
     </div>
 
+    <!--
+        Card image preview, shown while hovering a card name or number in the
+        Live Store Inventory. One shared element, positioned near the cursor:
+        a hidden image per row would be one request per row for pictures
+        nobody asked to see.
+    -->
+    <div id="cardPreview" aria-hidden="true">
+        <img id="cardPreviewImage" src="" alt="">
+    </div>
+
     <!-- EBAY ACCOUNT PANEL (admin only) -->
     <div id="ebayModal" data-modal class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
         <div class="w-full max-w-lg bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
@@ -1084,7 +1094,14 @@
 
     <!-- PRICING RULES CONFIGURATION MODAL -->
     <div id="pricingModal" data-modal class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
-        <div class="w-full max-w-3xl bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] flex flex-col">
+        <!--
+            Scrolls as one column. It used to be a flex column with the rules
+            table as the only flex-1 child, which worked until the Condition
+            Multipliers and Market Prices sections were added below it: those
+            siblings took the space, flex-1 collapsed toward zero, and the
+            rules table vanished while the calculator above it stayed put.
+        -->
+        <div class="w-full max-w-3xl bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
             <button onclick="closePricingModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
                 <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
@@ -1122,41 +1139,61 @@
                 </div>
             </div>
 
-            <!-- Rules Table Editor -->
-            <div class="overflow-auto flex-1 min-h-0 mb-4">
-                <table class="w-full text-left text-xs border-collapse">
-                    <thead>
-                        <tr class="border-b border-slate-700 bg-dark-900 text-slate-400 uppercase text-[10px]">
-                            <th class="py-2.5 px-3">Min Market Price</th>
-                            <th class="py-2.5 px-3">Max Market Price</th>
-                            <th class="py-2.5 px-3">Rule Type</th>
-                            <th class="py-2.5 px-3">Value / Markup</th>
-                            <th class="py-2.5 px-3 text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="pricingRulesTableBody" class="divide-y divide-slate-700/60 text-slate-300 font-mono">
-                        <!-- Populated dynamically via JS -->
-                    </tbody>
-                </table>
-            </div>
+            <!--
+                Rules Table Editor, collapsed by default.
+
+                A <details> rather than a JS toggle: there is no id to rename
+                and no flag to desync, and "starts collapsed" is simply the
+                absence of the open attribute. The rules still render into the
+                tbody while collapsed, because the element is in the DOM.
+            -->
+            <details class="mb-4 group rounded-xl border border-slate-700 bg-dark-900/50">
+                <summary class="cursor-pointer list-none px-3.5 py-2.5 flex items-center gap-2 text-sm font-bold text-white hover:bg-dark-900/80 rounded-xl transition-colors">
+                    <svg class="caret w-4 h-4 shrink-0 text-slate-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5l7 7-7 7" />
+                    </svg>
+                    <span>Pricing Tiers</span>
+                    <span id="pricingRulesCount" class="ml-auto text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">0 rules</span>
+                </summary>
+                <div class="px-3.5 pb-3.5 max-h-[45vh] overflow-auto">
+                    <table class="w-full text-left text-xs border-collapse">
+                        <thead>
+                            <tr class="border-b border-slate-700 bg-dark-900 text-slate-400 uppercase text-[10px]">
+                                <th class="py-2.5 px-3">Min Market Price</th>
+                                <th class="py-2.5 px-3">Max Market Price</th>
+                                <th class="py-2.5 px-3">Rule Type</th>
+                                <th class="py-2.5 px-3">Value / Markup</th>
+                                <th class="py-2.5 px-3 text-right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="pricingRulesTableBody" class="divide-y divide-slate-700/60 text-slate-300 font-mono">
+                            <!-- Populated dynamically via JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </details>
 
             <!-- Condition multipliers. Separate from the tiers because they
                  answer a different question: the tiers say what a price band
                  is worth, this says what a grade is worth relative to mint. -->
-            <div class="mt-5 pt-4 border-t border-slate-700">
-                <div class="flex items-start justify-between gap-3 mb-2">
-                    <div>
-                        <h4 class="text-sm font-bold text-white flex items-center gap-2">
-                            Condition Multipliers
-                            <span id="conditionScopeBadge" class="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">Yours</span>
-                        </h4>
-                        <p class="text-[11px] text-slate-400 mt-1">Market price is <strong>product-level</strong> &mdash; neither TCGplayer&rsquo;s public data nor the SortSwift export breaks it down by grade. So the discount is yours to set. Applied <em>before</em> the tiers above, so a played card falls into a cheaper tier.</p>
+            <details class="mt-4 group rounded-xl border border-slate-700 bg-dark-900/50">
+                <summary class="cursor-pointer list-none px-3.5 py-2.5 flex items-center gap-2 text-sm font-bold text-white hover:bg-dark-900/80 rounded-xl transition-colors">
+                    <svg class="caret w-4 h-4 shrink-0 text-slate-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5l7 7-7 7" />
+                    </svg>
+                    <span>Condition Multipliers</span>
+                    <span id="conditionScopeBadge" class="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">Yours</span>
+                    <span id="conditionMultipliersCount" class="ml-auto text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">0 grades</span>
+                </summary>
+                <div class="px-3.5 pb-3.5">
+                    <div class="flex items-start justify-between gap-3 mb-2">
+                        <p class="text-[11px] text-slate-400">Market price is <strong>product-level</strong> &mdash; neither TCGplayer&rsquo;s public data nor the SortSwift export breaks it down by grade. So the discount is yours to set. Applied <em>before</em> the tiers above, so a played card falls into a cheaper tier.</p>
+                        <button type="button" onclick="resetConditionMultipliers()" class="text-xs text-slate-400 hover:text-slate-200 underline shrink-0">Reset</button>
                     </div>
-                    <button type="button" onclick="resetConditionMultipliers()" class="text-xs text-slate-400 hover:text-slate-200 underline shrink-0">Reset</button>
+                    <div id="conditionMultipliersRows" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
+                    <p class="text-[10px] text-slate-500 mt-2">A grade with no multiplier is priced at full market value and reported in the console &mdash; it is never silently treated as mint.</p>
                 </div>
-                <div id="conditionMultipliersRows" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
-                <p class="text-[10px] text-slate-500 mt-2">A grade with no multiplier is priced at full market value and reported in the console &mdash; it is never silently treated as mint.</p>
-            </div>
+            </details>
 
             <!-- Market price refresh -->
             <div class="mt-5 pt-4 border-t border-slate-700">

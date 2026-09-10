@@ -1485,6 +1485,10 @@ class Database:
                 COALESCE(m.quantity, 0) AS quantity,
                 COALESCE(m.remarks, '') AS remarks,
                 COALESCE(m.sku_id, '') AS sku_id,
+                -- The card face, for the dashboard's hover preview. Comes
+                -- from the SortSwift export and is often the only picture of
+                -- the actual card we hold.
+                COALESCE(m.cdn_image, '') AS cdn_image,
                 COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
                 COALESCE(v.last_known_qty, 0) AS last_known_qty,
                 v.pending_qty AS pending_qty

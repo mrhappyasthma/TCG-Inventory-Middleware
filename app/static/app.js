@@ -343,6 +343,13 @@ function setScopeBadge(elementId, isOwn) {
 
 function renderPricingRulesEditor() {
     const tbody = document.getElementById("pricingRulesTableBody");
+    // The section starts collapsed, so the count is how you know there is
+    // anything behind the caret without opening it.
+    const badge = document.getElementById("pricingRulesCount");
+    if (badge) {
+        const n = cachedPricingRules.length;
+        badge.innerText = `${n} rule${n === 1 ? "" : "s"}`;
+    }
     if (cachedPricingRules.length === 0) {
         tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-slate-500">No pricing rules defined. Click "Add Tier Rule" or "Reset Defaults".</td></tr>`;
         return;
@@ -463,6 +470,11 @@ async function loadConditionMultipliers() {
 
         cachedConditionMultipliers = data.multipliers || [];
         setScopeBadge("conditionScopeBadge", data.is_own);
+        const countBadge = document.getElementById("conditionMultipliersCount");
+        if (countBadge) {
+            const n = cachedConditionMultipliers.length;
+            countBadge.innerText = `${n} grade${n === 1 ? "" : "s"}`;
+        }
 
         target.innerHTML = cachedConditionMultipliers.map((m, idx) => `
             <label class="flex items-center gap-2 p-2 rounded-lg bg-dark-900/70 border border-slate-700/70">
@@ -1465,9 +1477,93 @@ async function fetchInventory() {
 // The quantity dialog needs the row it was opened from.
 let lastInventoryItems = [];
 
+// -------------------------------------------------------------------
+// Card image preview on hover
+// -------------------------------------------------------------------
+
+// How far from the cursor the preview sits, so it never lands under the
+// pointer and starts flickering between enter and leave.
+const CARD_PREVIEW_OFFSET = 18;
+
+function cardPreviewAttrs(item) {
+    // Nothing is emitted for a card with no picture, so the whole preview
+    // path is inert rather than showing an empty frame or a broken image.
+    if (!item.cdn_image) return "";
+    // The data attribute is both the payload and the CSS hook for the
+    // zoom-in cursor, so a cell without a picture gets neither.
+    return `data-card-image="${escapeHtml(item.cdn_image)}"`;
+}
+
+function positionCardPreview(event) {
+    const box = document.getElementById("cardPreview");
+    if (!box) return;
+    const rect = box.getBoundingClientRect();
+    // Flip to the other side of the cursor when there is not room, so a card
+    // near the right edge or the bottom of the window stays fully visible
+    // instead of being clipped.
+    let left = event.clientX + CARD_PREVIEW_OFFSET;
+    if (left + rect.width > window.innerWidth - 8) {
+        left = event.clientX - rect.width - CARD_PREVIEW_OFFSET;
+    }
+    let top = event.clientY + CARD_PREVIEW_OFFSET;
+    if (top + rect.height > window.innerHeight - 8) {
+        top = window.innerHeight - rect.height - 8;
+    }
+    box.style.left = `${Math.max(8, left)}px`;
+    box.style.top = `${Math.max(8, top)}px`;
+}
+
+function showCardPreview(url, event) {
+    const box = document.getElementById("cardPreview");
+    const img = document.getElementById("cardPreviewImage");
+    if (!box || !img || !url) return;
+    if (img.getAttribute("src") !== url) img.setAttribute("src", url);
+    box.classList.add("visible");
+    positionCardPreview(event);
+}
+
+function hideCardPreview() {
+    document.getElementById("cardPreview")?.classList.remove("visible");
+}
+
+// Delegated on the table body rather than bound per cell: the rows are
+// replaced wholesale on every render, and per-cell listeners would have to be
+// rebound each time -- or leak.
+function initCardPreview() {
+    const tbody = document.getElementById("inventoryTableBody");
+    if (!tbody || tbody.dataset.previewBound === "1") return;
+    tbody.dataset.previewBound = "1";
+
+    tbody.addEventListener("mouseover", (event) => {
+        const cell = event.target.closest("[data-card-image]");
+        if (!cell) return;
+        showCardPreview(cell.getAttribute("data-card-image"), event);
+    });
+    tbody.addEventListener("mousemove", (event) => {
+        if (event.target.closest("[data-card-image]")) positionCardPreview(event);
+    });
+    tbody.addEventListener("mouseout", (event) => {
+        const from = event.target.closest("[data-card-image]");
+        // relatedTarget is where the pointer went; staying inside the same
+        // cell must not hide the preview, or it flickers over the link.
+        if (from && from.contains(event.relatedTarget)) return;
+        if (from) hideCardPreview();
+    });
+    // A scroll moves the row out from under a preview that is positioned in
+    // viewport coordinates, which would leave it floating over nothing.
+    tbody.addEventListener("scroll", hideCardPreview, { passive: true });
+    window.addEventListener("scroll", hideCardPreview, { passive: true });
+}
+
 function renderInventoryTable(items, total, offset) {
     lastInventoryItems = items || [];
     const tbody = document.getElementById("inventoryTableBody");
+    // Idempotent, and done here because the tbody is guaranteed to exist by
+    // the time rows are being written into it.
+    initCardPreview();
+    // A re-render replaces the row the pointer was over, so a preview left
+    // showing would belong to a card that is no longer under the cursor.
+    hideCardPreview();
 
     if (!items || items.length === 0) {
         tbody.innerHTML = `
@@ -1512,12 +1608,12 @@ function renderInventoryTable(items, total, offset) {
         return `
             <tr class="hover:bg-dark-800/80 transition-colors">
                 <td class="py-3 px-4 font-mono font-bold text-accent-cyan">${escapeHtml(item.manifest_id)}</td>
-                <td class="py-3 px-4 font-medium text-white">${
+                <td class="py-3 px-4 font-medium text-white" ${cardPreviewAttrs(item)}>${
                     item.tcgplayer_id
                         ? `<a href="${TCGPLAYER_PRODUCT_URL}${encodeURIComponent(item.tcgplayer_id)}" target="_blank" rel="noopener noreferrer" class="hover:text-accent-cyan hover:underline transition-colors" title="View on TCGplayer">${escapeHtml(item.product_name)}</a>`
                         : escapeHtml(item.product_name)
                 }</td>
-                <td class="py-3 px-4 font-mono text-slate-300">${item.card_number ? escapeHtml(item.card_number) : '<span class="text-slate-600 italic">-</span>'}</td>
+                <td class="py-3 px-4 font-mono text-slate-300" ${cardPreviewAttrs(item)}>${item.card_number ? escapeHtml(item.card_number) : '<span class="text-slate-600 italic">-</span>'}</td>
                 <td class="py-3 px-4 text-slate-400">${escapeHtml(item.set_name)}</td>
                 <td class="py-3 px-4">
                     <span class="px-2 py-0.5 rounded text-[10px] font-medium ${conditionBadge}">

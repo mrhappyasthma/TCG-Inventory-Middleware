@@ -79,3 +79,62 @@ body {
 .log-entry {
     animation: fadeIn 0.15s ease-out forwards;
 }
+
+/*
+ * Collapsible sections (<details>/<summary>).
+ *
+ * Written in plain CSS rather than Tailwind's group-open: variant, because
+ * the Tailwind build here is the vendored in-browser one and an unsupported
+ * variant fails silently -- leaving a caret that never turns, which reads as
+ * "the control is broken" rather than "the stylesheet is old".
+ */
+summary {
+    list-style: none;
+}
+
+/* Safari draws its own triangle and ignores list-style. */
+summary::-webkit-details-marker {
+    display: none;
+}
+
+details[open] > summary .caret {
+    transform: rotate(90deg);
+}
+
+/*
+ * Card image preview on hover.
+ *
+ * One shared element positioned near the cursor rather than a node per row:
+ * the inventory table can hold fifty rows, and fifty hidden images would be
+ * fifty requests for pictures nobody asked to see.
+ */
+#cardPreview {
+    position: fixed;
+    z-index: 60;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.12s ease-out;
+}
+
+#cardPreview.visible {
+    opacity: 1;
+}
+
+#cardPreview img {
+    display: block;
+    /* A trading card is 2.5 x 3.5 inches, so height is the binding dimension
+     * on a wide screen. Capped against the viewport so a tall window does not
+     * produce a preview taller than the page. */
+    height: min(60vh, 30rem);
+    width: auto;
+    border-radius: 0.75rem;
+    border: 1px solid rgb(51 65 85);
+    background: rgb(2 6 23);
+    box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.8);
+}
+
+/* Cells that have a picture to show. The cursor is the only affordance the
+ * table gives, so it is worth having. */
+[data-card-image] {
+    cursor: zoom-in;
+}
