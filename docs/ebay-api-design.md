@@ -130,10 +130,21 @@ So the store divides in two, and the boundary is how a listing was created:
 | Read | Feed API `LMS_ACTIVE_INVENTORY_REPORT` | `getOffers`, or the same report |
 | Update | needs migration first | `bulkUpdatePriceQuantity` |
 
-**Reading is solved and needs no migration.** The Feed API's LMS reports live
-in the same world as File Exchange and see the listings as they are. That is
-what `/api/ebay/sync` uses, and it feeds the same parser the uploaded report
-does.
+**Reading is solved and needs no migration — and now verified against the
+real store.** The Feed API's LMS reports live in the same world as File
+Exchange and see the listings as they are. That is what `/api/ebay/sync` uses,
+and it feeds the same parser the uploaded report does.
+
+Confirmed equivalent to the manual download, card for card: 62 variations
+across 4 listings, split 35 / 21 / 4 / 2, with 50 unmanaged singles ignored.
+The Feed report yields 112 records where the Seller Hub report yields 116 rows
+for the same store, because Seller Hub emits a parent row *in addition* to its
+children while the Feed report nests the children inside the parent's block.
+Two shapes, same facts, same mirror.
+
+Two properties of that report cost real damage to learn, and are recorded in
+`AGENTS.md`: it is XML rather than CSV, and its variations are nested inside
+the item block with a blank SKU at the item level.
 
 `GetSellerList` would also read them, but it requires a start-time window of
 at most 120 days — so an older store means paging over several windows and
@@ -335,9 +346,10 @@ Steps 1-4 cannot damage the storefront. Only step 5 can.
    *Staging done* — the `listing_plan` tables, `tcg_engine.plans` and the
    Drafts tab are built and a plan can be built, edited and approved. Approval
    authorises a push that does not exist yet.
-2. **Module B via API** — `getInventoryItems` / `getOffers` instead of the
-   Active Listings CSV. Read-only, proves the auth end to end, and retires a
-   manual report download.
+2. **Module B via API** — **done and verified.** Not `getOffers`, which cannot
+   see these listings at all (§3a), but the Feed API's Active Inventory
+   report, reconciled by the same parser the uploaded report uses. Confirmed
+   card-for-card against a manual download of the same store.
 3. **Order ingest** — the poll, then the webhook as an accelerator. Still no
    writes to eBay.
 4. **Plan tables and the drafts page**, computing real plans with push
@@ -356,10 +368,10 @@ The drafts page therefore arrives at step 4, before any write risk exists.
   one, since the Inventory API cannot touch them without migration. Leaning
   toward the Feed API's `LMS_REVISE_INVENTORY_STATUS` for quantity and price,
   with the Inventory API for new listings only.
-* **The Feed report's exact column names** have not yet been seen against a
-  real store. The parser accepts both documented shapes and `/api/ebay/sync`
-  returns the headers it saw, so a mismatch is diagnosable on the first run
-  rather than silent.
+* ~~**The Feed report's exact column names**~~ — settled. It is XML with
+  nested variations; see §3a and `AGENTS.md`. `/api/ebay/sync` returns the
+  headers it saw and, when nothing matched, an element outline carrying no
+  values, so a future shape change is one look rather than an inference.
 
 * **Bin location in the SKU** (§7) — the recommendation moves it out of eBay
   entirely, which changes how orders are physically picked.
