@@ -1480,7 +1480,7 @@ async function fetchInventory() {
 
         renderInventoryTable(data.items, data.total, offset);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="11" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="12" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
 
@@ -1502,6 +1502,27 @@ function cardPreviewAttrs(item) {
     // The data attribute is both the payload and the CSS hook for the
     // zoom-in cursor, so a cell without a picture gets neither.
     return `data-card-image="${escapeHtml(item.cdn_image)}"`;
+}
+
+// A row-height thumbnail, shared by the inventory table and the drafts page.
+//
+// Hovering the thumbnail is what opens the full-size preview; the card name
+// and number deliberately no longer do. A link you want to click should not
+// also be a hover target, and putting the affordance on the picture makes it
+// obvious where to point.
+//
+// An absent picture still renders a placeholder of the same size, so the
+// column does not change width row to row and the table stays aligned.
+function cardThumbnailCell(item, cellClasses = "py-2 px-4") {
+    if (!item.cdn_image) {
+        return `<td class="${cellClasses}"><span class="block w-7 h-10 rounded border border-dashed border-slate-800" title="No image in the export"></span></td>`;
+    }
+    return `
+        <td class="${cellClasses}" ${cardPreviewAttrs(item)}>
+            <img src="${escapeHtml(item.cdn_image)}" alt="" loading="lazy"
+                class="block h-10 w-auto rounded border border-slate-700 bg-dark-900"
+                onerror="this.style.visibility='hidden'">
+        </td>`;
 }
 
 function positionCardPreview(event) {
@@ -1539,30 +1560,48 @@ function hideCardPreview() {
 // Delegated on the table body rather than bound per cell: the rows are
 // replaced wholesale on every render, and per-cell listeners would have to be
 // rebound each time -- or leak.
-function initCardPreview() {
-    const tbody = document.getElementById("inventoryTableBody");
-    if (!tbody || tbody.dataset.previewBound === "1") return;
-    tbody.dataset.previewBound = "1";
+let cardPreviewBound = false;
 
-    tbody.addEventListener("mouseover", (event) => {
+// Bound once on the document rather than per table. Both the inventory table
+// and the drafts page carry thumbnails, the drafts page rebuilds its whole
+// group list on every edit, and a per-container binding would have to be
+// re-attached after each render -- or leak one listener per render.
+function initCardPreview() {
+    if (cardPreviewBound) return;
+    cardPreviewBound = true;
+
+    document.addEventListener("mouseover", (event) => {
         const cell = event.target.closest("[data-card-image]");
         if (!cell) return;
         showCardPreview(cell.getAttribute("data-card-image"), event);
     });
-    tbody.addEventListener("mousemove", (event) => {
-        if (event.target.closest("[data-card-image]")) positionCardPreview(event);
+    document.addEventListener("mousemove", (event) => {
+        // Cheapest possible guard first: mousemove fires constantly, and
+        // there is nothing to reposition unless a preview is actually up.
+        const box = document.getElementById("cardPreview");
+        if (!box || !box.classList.contains("visible")) return;
+        if (event.target.closest("[data-card-image]")) {
+            positionCardPreview(event);
+        } else {
+            // Left the thumbnail without a mouseout firing -- happens when
+            // the row is re-rendered from under the pointer.
+            hideCardPreview();
+        }
     });
-    tbody.addEventListener("mouseout", (event) => {
+    document.addEventListener("mouseout", (event) => {
         const from = event.target.closest("[data-card-image]");
         // relatedTarget is where the pointer went; staying inside the same
-        // cell must not hide the preview, or it flickers over the link.
+        // cell must not hide the preview, or it flickers.
         if (from && from.contains(event.relatedTarget)) return;
         if (from) hideCardPreview();
     });
     // A scroll moves the row out from under a preview that is positioned in
     // viewport coordinates, which would leave it floating over nothing.
-    tbody.addEventListener("scroll", hideCardPreview, { passive: true });
-    window.addEventListener("scroll", hideCardPreview, { passive: true });
+    // Captured, so it catches scrolling inside any table wrapper too.
+    document.addEventListener("scroll", hideCardPreview, {
+        passive: true,
+        capture: true,
+    });
 }
 
 function renderInventoryTable(items, total, offset) {
@@ -1578,7 +1617,7 @@ function renderInventoryTable(items, total, offset) {
     if (!items || items.length === 0) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="11" class="py-8 text-center text-slate-500">
+                <td colspan="12" class="py-8 text-center text-slate-500">
                     No cards found. Process a SortSwift batch or add a card above.
                 </td>
             </tr>
@@ -1618,12 +1657,13 @@ function renderInventoryTable(items, total, offset) {
         return `
             <tr class="hover:bg-dark-800/80 transition-colors">
                 <td class="py-3 px-4 font-mono font-bold text-accent-cyan">${escapeHtml(item.manifest_id)}</td>
-                <td class="py-3 px-4 font-medium text-white" ${cardPreviewAttrs(item)}>${
+                <td class="py-3 px-4 font-medium text-white">${
                     item.tcgplayer_id
                         ? `<a href="${TCGPLAYER_PRODUCT_URL}${encodeURIComponent(item.tcgplayer_id)}" target="_blank" rel="noopener noreferrer" class="hover:text-accent-cyan hover:underline transition-colors" title="View on TCGplayer">${escapeHtml(item.product_name)}</a>`
                         : escapeHtml(item.product_name)
                 }</td>
-                <td class="py-3 px-4 font-mono text-slate-300" ${cardPreviewAttrs(item)}>${item.card_number ? escapeHtml(item.card_number) : '<span class="text-slate-600 italic">-</span>'}</td>
+                <td class="py-3 px-4 font-mono text-slate-300">${item.card_number ? escapeHtml(item.card_number) : '<span class="text-slate-600 italic">-</span>'}</td>
+                ${cardThumbnailCell(item, "py-2 px-4")}
                 <td class="py-3 px-4 text-slate-400">${escapeHtml(item.set_name)}</td>
                 <td class="py-3 px-4">
                     <span class="px-2 py-0.5 rounded text-[10px] font-medium ${conditionBadge}">
@@ -2466,6 +2506,11 @@ function renderNoDraft(plans) {
 
 function renderDraftPlan(detail) {
     const container = document.getElementById("draftGroups");
+    // Same two calls the inventory renderer makes: arm the (idempotent)
+    // delegation, and drop any preview belonging to a row about to be
+    // replaced.
+    initCardPreview();
+    hideCardPreview();
     const footer = document.getElementById("draftFooter");
     const discard = document.getElementById("btnDiscardPlan");
     const items = detail.items || [];
@@ -2533,6 +2578,7 @@ function renderDraftPlan(detail) {
                         <thead>
                             <tr class="border-b border-slate-800 text-slate-400 uppercase font-semibold text-[10px] tracking-wider">
                                 <th class="py-2 px-4">Card</th>
+                                <th class="py-2 px-4" title="Hover a thumbnail to see the card full size.">Image</th>
                                 <th class="py-2 px-4">Change</th>
                                 <th class="py-2 px-4 text-center">Quantity</th>
                                 <th class="py-2 px-4 text-center">Price</th>
@@ -2602,6 +2648,7 @@ function draftItemRow(item, moveTargets) {
                 <p class="text-[10px] text-slate-500 font-mono">${escapeHtml(item.manifest_id)}${item.card_number ? ` · #${escapeHtml(item.card_number)}` : ""}</p>
                 ${problems.length ? `<ul class="mt-1 space-y-0.5">${problems.map(p => `<li class="text-[10px] text-amber-300">⚠ ${escapeHtml(p)}</li>`).join("")}</ul>` : ""}
             </td>
+            ${cardThumbnailCell(item, "py-2 px-4")}
             <td class="py-2.5 px-4">${draftActionBadge(item.action)}</td>
             <td class="py-2.5 px-4 text-center whitespace-nowrap">
                 ${from(item.observed_qty, item.proposed_qty, false)}
