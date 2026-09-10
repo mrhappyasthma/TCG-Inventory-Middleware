@@ -1716,8 +1716,12 @@ async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)
         )
 
     def run():
+        # The library returns the report already normalised to CSV. It arrives
+        # as eBay XML, and reading that as a CSV does not fail -- every line
+        # becomes a row, none carries a SKU column, and the result is
+        # indistinguishable from a store that ended every listing.
         report = download_active_inventory_report(client)
-        csv_text = decode_csv_bytes(report["content"])
+        csv_text = report["csv_text"]
         # Captured before parsing: if the sync finds nothing, the headers are
         # the first thing worth looking at, and by then the reader is spent.
         first_line = next(
@@ -1728,6 +1732,7 @@ async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)
         result["report"] = {
             "task_id": report["task_id"],
             "status": report["status"],
+            "was_xml": report.get("was_xml", False),
             "bytes": len(report["content"]),
             "row_count": max(
                 0, len([l for l in csv_text.splitlines() if l.strip()]) - 1

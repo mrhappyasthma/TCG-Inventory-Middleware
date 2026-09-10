@@ -28,11 +28,13 @@ own schedule:
 3. ``getResultFile`` -- download it. Usually gzipped.
 """
 
+import csv
 import gzip
 import io
 import time
+import xml.etree.ElementTree as ElementTree
 import zipfile
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .errors import ApiError, EbayError
 
@@ -175,6 +177,103 @@ def decompress(payload: bytes) -> bytes:
     return payload
 
 
+# The report is XML, not CSV. That is not a detail: an LMS feed type returns
+# an eBay XML document, and reading it as a CSV "succeeds" -- every line
+# becomes a row, no row carries a recognisable SKU column, and the sync then
+# looks exactly like a store that has ended every listing. It cost a live
+# store mirror to learn.
+XML_PREAMBLE = b"<?xml"
+
+# The columns the existing report parser already understands. Emitting these
+# names is what lets the XML be reconciled by the same code the uploaded
+# Seller Hub report goes through.
+REPORT_COLUMNS = ("ItemID", "SKU", "Price", "Quantity")
+
+
+def looks_like_xml(payload: bytes) -> bool:
+    return payload.lstrip()[:5].lower() == XML_PREAMBLE
+
+
+def _local_name(tag: str) -> str:
+    """Strip the namespace eBay wraps every element in."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_active_inventory_report(payload: bytes) -> List[Dict[str, str]]:
+    """
+    Pull the SKU rows out of an ActiveInventoryReport XML document.
+
+    Namespace-agnostic on purpose: eBay declares
+    ``urn:ebay:apis:eBLBaseComponents`` today, and matching on it exactly
+    would turn a namespace revision into another silent zero-row parse.
+
+    An ``Ack`` of Failure, or any Errors block, is raised rather than returned
+    as an empty list -- because an empty list is indistinguishable from a
+    store with nothing listed, which is the confusion that caused the damage
+    in the first place.
+    """
+    if not payload:
+        raise FeedError("eBay returned an empty report")
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError as exc:
+        raise FeedError(f"the report was not parseable XML: {exc}") from exc
+
+    errors = []
+    ack = ""
+    for element in root.iter():
+        name = _local_name(element.tag)
+        if name == "Ack" and element.text:
+            ack = element.text.strip()
+        elif name in ("LongMessage", "ShortMessage") and element.text:
+            errors.append(element.text.strip())
+    if ack.lower() in ("failure", "partialfailure") and errors:
+        raise FeedError("eBay reported: " + "; ".join(dict.fromkeys(errors)))
+
+    records: List[Dict[str, str]] = []
+    for element in root.iter():
+        if _local_name(element.tag) != "SKUDetails":
+            continue
+        record = {}
+        for child in element:
+            record[_local_name(child.tag)] = (child.text or "").strip()
+        if record:
+            records.append(record)
+
+    if not records:
+        raise FeedError(
+            "the report parsed as XML but contained no SKUDetails entries. "
+            "Its root element is "
+            f"{_local_name(root.tag)!r}; the parser expected an "
+            "ActiveInventoryReport."
+        )
+    return records
+
+
+def records_to_csv(records: List[Dict[str, str]]) -> str:
+    """
+    Render parsed records as CSV for the existing report parser.
+
+    An adapter rather than a second reconciler. Every rule that matters --
+    carrying a variation parent's item id down to its children, skipping rows
+    with no label, resolving the manifest id out of a bin-suffixed SKU, and
+    above all the sweep that zeroes cards missing from the report -- lives in
+    that parser. A separate path for XML would have to reimplement all of it,
+    and a drift in the last rule either leaves sold-out cards on sale or
+    delists a live store.
+
+    Safe to round-trip through CSV because every field here is a machine
+    value: an item id, a SKU, a price and a quantity. No free text, no card
+    names, nothing a title could smuggle in.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(REPORT_COLUMNS)
+    for record in records:
+        writer.writerow([record.get(column, "") for column in REPORT_COLUMNS])
+    return buffer.getvalue()
+
+
 def download_active_inventory_report(
     client,
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
@@ -205,8 +304,18 @@ def download_active_inventory_report(
         raise FeedError(
             f"the report finished but could not be downloaded: {exc}"
         ) from exc
+    # Normalised here rather than by the caller, so there is one place that
+    # knows the report is XML and one place that converts it.
+    is_xml = looks_like_xml(content)
+    csv_text = (
+        records_to_csv(parse_active_inventory_report(content))
+        if is_xml
+        else content.decode("utf-8-sig", errors="replace")
+    )
     return {
         "task_id": task_id,
         "status": str(task.get("status") or "").upper(),
         "content": content,
+        "was_xml": is_xml,
+        "csv_text": csv_text,
     }

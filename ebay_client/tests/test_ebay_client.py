@@ -738,6 +738,85 @@ class FeedReportTests(unittest.TestCase):
             archive.writestr("report.csv", payload)
         self.assertEqual(feed.decompress(buffer.getvalue()), payload)
 
+    # The real report, in the shape that cost a live store mirror: an LMS feed
+    # type returns eBay XML, not CSV, and reading it as CSV does not fail --
+    # every line becomes a row, no row carries a SKU column, and the sync then
+    # looks exactly like a store that has ended every listing.
+    REAL_REPORT = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ActiveInventoryReport xmlns="urn:ebay:apis:eBLBaseComponents">
+  <Timestamp>2026-09-09T19:00:00.000Z</Timestamp>
+  <Ack>Success</Ack>
+  <SKUDetails>
+    <ItemID>227511361186</ItemID>
+    <SKU>ID1050-Bin_A12</SKU>
+    <Price>1.99</Price>
+    <Quantity>1</Quantity>
+    <SiteID>US</SiteID>
+  </SKUDetails>
+  <SKUDetails>
+    <ItemID>227511361186</ItemID>
+    <SKU>ID1048-Bin_A12</SKU>
+    <Price>2.49</Price>
+    <Quantity>2</Quantity>
+    <SiteID>US</SiteID>
+  </SKUDetails>
+</ActiveInventoryReport>
+"""
+
+    def test_the_report_is_recognised_as_xml(self):
+        self.assertTrue(feed.looks_like_xml(self.REAL_REPORT))
+        self.assertFalse(feed.looks_like_xml(b"ItemID,SKU\n1,ID1001\n"))
+
+    def test_the_xml_report_yields_one_record_per_sku(self):
+        records = feed.parse_active_inventory_report(self.REAL_REPORT)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["SKU"], "ID1050-Bin_A12")
+        self.assertEqual(records[0]["ItemID"], "227511361186")
+        self.assertEqual(records[1]["Quantity"], "2")
+
+    def test_records_render_as_csv_the_existing_parser_accepts(self):
+        csv_text = feed.records_to_csv(
+            feed.parse_active_inventory_report(self.REAL_REPORT)
+        )
+        lines = csv_text.strip().splitlines()
+        self.assertEqual(lines[0], "ItemID,SKU,Price,Quantity")
+        self.assertEqual(lines[1], "227511361186,ID1050-Bin_A12,1.99,1")
+
+    def test_a_namespace_change_does_not_silently_empty_the_report(self):
+        # Matching the namespace exactly would turn an eBay revision into
+        # another zero-row parse, which is the failure being fixed.
+        renamespaced = self.REAL_REPORT.replace(
+            b"urn:ebay:apis:eBLBaseComponents", b"urn:ebay:apis:v2"
+        )
+        self.assertEqual(len(feed.parse_active_inventory_report(renamespaced)), 2)
+
+    def test_a_report_with_no_sku_entries_raises_rather_than_returning_empty(self):
+        # An empty list is indistinguishable from "the store has nothing
+        # listed", and acting on that is what zeroed the mirror.
+        with self.assertRaises(feed.FeedError) as caught:
+            feed.parse_active_inventory_report(
+                b'<?xml version="1.0"?><SomethingElse><Ack>Success</Ack></SomethingElse>'
+            )
+        self.assertIn("SomethingElse", str(caught.exception))
+
+    def test_an_ebay_failure_document_raises_with_ebays_message(self):
+        payload = (
+            b'<?xml version="1.0"?><ActiveInventoryReport>'
+            b"<Ack>Failure</Ack><Errors><LongMessage>Not authorised"
+            b"</LongMessage></Errors></ActiveInventoryReport>"
+        )
+        with self.assertRaises(feed.FeedError) as caught:
+            feed.parse_active_inventory_report(payload)
+        self.assertIn("Not authorised", str(caught.exception))
+
+    def test_unparseable_bytes_raise(self):
+        with self.assertRaises(feed.FeedError):
+            feed.parse_active_inventory_report(b"<?xml version='1.0'?><broken")
+
+    def test_an_empty_report_raises(self):
+        with self.assertRaises(feed.FeedError):
+            feed.parse_active_inventory_report(b"")
+
     def test_a_plain_report_passes_through(self):
         self.assertEqual(feed.decompress(b"ItemID,SKU\n"), b"ItemID,SKU\n")
 

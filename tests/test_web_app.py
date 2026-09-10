@@ -1152,6 +1152,107 @@ class TestWebApp(unittest.TestCase):
         finally:
             client.oauth._opener = original_opener
 
+    def test_45b_the_api_sync_reconciles_the_real_xml_report(self):
+        """
+        The whole path, on the report shape eBay actually sends.
+
+        This is the test that was missing. The report is XML, not CSV, and
+        reading it as CSV does not fail: every line becomes a row, no row
+        carries a SKU column, synced_count stays 0, and the delisting sweep
+        then reads that as "the store ended every listing" and zeroes the
+        mirror. It did exactly that to a live store.
+        """
+        from ebay_client.feed import (
+            parse_active_inventory_report,
+            records_to_csv,
+        )
+
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        # A card to reconcile against, already linked to a live listing.
+        db.insert_manifest("ID4001", "Ledyba", "Chilling Reign", "NM", "Normal")
+        db.upsert_variation("ID4001", "227511361186", 1, custom_label="ID4001-Bin_A12")
+
+        report_xml = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<ActiveInventoryReport xmlns="urn:ebay:apis:eBLBaseComponents">'
+            b"<Ack>Success</Ack>"
+            b"<SKUDetails><ItemID>227511361186</ItemID>"
+            b"<SKU>ID4001-Bin_A12</SKU><Price>3.75</Price>"
+            b"<Quantity>5</Quantity><SiteID>US</SiteID></SKUDetails>"
+            b"</ActiveInventoryReport>"
+        )
+        # Converted by the real adapter, so the test exercises the conversion
+        # rather than a hand-written CSV that might not match it.
+        csv_text = records_to_csv(parse_active_inventory_report(report_xml))
+
+        user_db.save_ebay_token({"refresh_token": "rt"}, connected_by=1)
+        try:
+            with mock.patch.object(
+                main,
+                "download_active_inventory_report",
+                return_value={
+                    "task_id": "t-1",
+                    "status": "COMPLETED",
+                    "content": report_xml,
+                    "was_xml": True,
+                    "csv_text": csv_text,
+                },
+            ):
+                res = self.client.post("/api/ebay/sync")
+
+            self.assertEqual(res.status_code, 200, res.text)
+            body = res.json()
+            self.assertEqual(body["synced_count"], 1)
+            self.assertFalse(body["delisting_skipped"])
+            self.assertTrue(body["report"]["was_xml"])
+
+            variation = db.get_variation("ID4001")
+            self.assertEqual(variation["last_known_qty"], 5)
+            self.assertAlmostEqual(variation["last_known_price"], 3.75)
+        finally:
+            user_db.save_ebay_token(None)
+            db.delete_manifest("ID4001")
+
+    def test_45c_a_report_that_matches_nothing_never_zeroes_the_mirror(self):
+        """
+        The guard, exercised through the endpoint rather than the engine.
+
+        A report parsed into rows that match no card must not be read as an
+        emptied store. Without this the remedy for an absent card and the
+        symptom of an unreadable report are the same action, and one of them
+        delists everything.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        db.insert_manifest("ID4002", "Heracross", "Chilling Reign", "NM", "Normal")
+        db.upsert_variation("ID4002", "227511361186", 3, custom_label="ID4002-Bin_B01")
+
+        user_db.save_ebay_token({"refresh_token": "rt"}, connected_by=1)
+        try:
+            with mock.patch.object(
+                main,
+                "download_active_inventory_report",
+                return_value={
+                    "task_id": "t-2",
+                    "status": "COMPLETED",
+                    "content": b"<?xml version='1.0'?><x/>",
+                    "was_xml": True,
+                    # Columns nothing recognises, which is what an
+                    # unrecognised report degrades to.
+                    "csv_text": "listing_ref,stock_code,units\n1,ID4002,3\n",
+                },
+            ):
+                body = self.client.post("/api/ebay/sync").json()
+
+            self.assertEqual(body["synced_count"], 0)
+            self.assertTrue(body["delisting_skipped"])
+            self.assertEqual(body["delisted_count"], 0)
+            # Untouched, which is the entire point.
+            self.assertEqual(db.get_variation("ID4002")["last_known_qty"], 3)
+        finally:
+            user_db.save_ebay_token(None)
+            db.delete_manifest("ID4002")
+
     def test_46_disconnecting_forgets_the_token(self):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         res = self.client.post("/api/ebay/disconnect")
