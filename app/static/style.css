@@ -122,10 +122,18 @@ details[open] > summary .caret {
 
 #cardPreview img {
     display: block;
-    /* A trading card is 2.5 x 3.5 inches, so height is the binding dimension
-     * on a wide screen. Capped against the viewport so a tall window does not
-     * produce a preview taller than the page. */
-    height: min(60vh, 30rem);
+    /* Both dimensions are bounded rather than the height being set outright.
+     * A trading card is taller than it is wide, so height used to be treated
+     * as the only binding dimension -- but a listing cover photo can be any
+     * shape, and a wide one then overflowed sideways. max-* on both axes with
+     * auto sizing fits any aspect ratio inside the box.
+     *
+     * Sized to be readable rather than impressive: 18rem is about 290px, which
+     * shows a card's art and text clearly without covering the table it is
+     * meant to annotate. The vh/vw terms keep it sane on a small window. */
+    max-height: min(40vh, 18rem);
+    max-width: min(50vw, 18rem);
+    height: auto;
     width: auto;
     border-radius: 0.75rem;
     border: 1px solid rgb(51 65 85);

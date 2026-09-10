@@ -733,6 +733,21 @@ a Content-Security-Policy in **Report-Only** mode.
   Those ids are server-generated (`ID1001`), so they cannot break out, but the
   pattern would be unsafe if it were ever fed free text.
 
+  It *was* fed free text once, and the prediction came true in the less
+  dangerous of the two possible ways. A drafts button interpolated a group key
+  — built from a set name out of an uploaded CSV — through `JSON.stringify`,
+  whose own double quotes closed the `onclick="…"` attribute early. The
+  handler was truncated to `openDraftCoverPrompt(` and the button silently did
+  nothing. With a set name chosen by an attacker rather than by a card game,
+  the same mechanism ends the attribute and starts a new one.
+
+  The rule is therefore not "escape it" but **put the value in a `data-`
+  attribute and read it from the element**, which is what the drafts
+  move-target selects and the cover button now do. A test asserts no inline
+  handler contains `JSON.stringify`; note that neither `node --check` nor a
+  JavaScript linter can catch this, because the JavaScript is valid — the
+  breakage only exists once a browser parses the HTML around it.
+
 ---
 
 ## 🔄 Asset caching

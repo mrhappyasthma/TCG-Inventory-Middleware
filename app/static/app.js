@@ -2641,7 +2641,8 @@ function draftCoverControl(group) {
         : "Revising the cover replaces the listing's whole picture set on eBay.";
 
     return `
-        <button type="button" onclick="event.preventDefault();event.stopPropagation();openDraftCoverPrompt(${JSON.stringify(group.group_key)})"
+        <button type="button" data-group-key="${escapeHtml(group.group_key)}"
+            onclick="event.preventDefault();event.stopPropagation();openDraftCoverPrompt(this)"
             class="shrink-0 flex items-center gap-2 px-2 py-1 rounded-lg border ${staged ? "border-brand-500 bg-brand-600/15" : "border-slate-700 bg-dark-900/60"} hover:border-accent-cyan transition-colors"
             ${url ? `data-card-image="${escapeHtml(url)}"` : ""}
             title="${escapeHtml(title)}">
@@ -2654,7 +2655,16 @@ function draftCoverControl(group) {
         </button>`;
 }
 
-async function openDraftCoverPrompt(groupKey) {
+// Takes the button, not the key. A group key is built from a set name out of
+// an uploaded CSV, and interpolating it into an inline handler was broken: the
+// quotes JSON.stringify emits closed the onclick attribute early, so the
+// button silently did nothing. Reading it from a data attribute is the same
+// rule the move-target selects already follow.
+async function openDraftCoverPrompt(button) {
+    const groupKey = typeof button === "string"
+        ? button
+        : (button && button.getAttribute("data-group-key")) || "";
+    if (!groupKey) return;
     if (!currentDraftPlan || !currentDraftPlan.plan) return;
     const group = (currentDraftPlan.groups || []).find(g => g.group_key === groupKey);
     // Seeded with the staged or current cover, falling back to a card's own

@@ -118,6 +118,31 @@ class JavaScriptParsesTests(unittest.TestCase):
             + "\n  ".join(str(p) for p in problems),
         )
 
+    def test_no_inline_handler_interpolates_a_quoted_json_string(self):
+        """
+        An inline handler attribute must not contain JSON.stringify.
+
+        It emits its own double quotes, which close the ``onclick="..."``
+        attribute early -- so the handler is truncated and the control silently
+        does nothing. That is not a JavaScript error, so `node --check` passes
+        and the lexer passes; it is only wrong once a browser parses the HTML.
+        It shipped exactly once, on the drafts cover-photo button.
+
+        The fix is the rule the move-target selects already follow: put the
+        value in a data attribute and read it from the element.
+        """
+        source = self.source("app.js")
+        offenders = []
+        for match in re.finditer(r'on[a-z]+="([^"]*)"', source):
+            if "JSON.stringify" in match.group(1):
+                line = source.count("\n", 0, match.start()) + 1
+                offenders.append(f"line {line}: {match.group(0)[:90]}")
+        self.assertEqual(
+            offenders, [],
+            "inline handlers must not interpolate JSON.stringify; use a data "
+            "attribute:\n  " + "\n  ".join(offenders),
+        )
+
     def test_app_js_parses_if_a_javascript_runtime_is_installed(self):
         """
         Upgrade path: `node --check` is a real parser and catches everything
@@ -129,6 +154,24 @@ class JavaScriptParsesTests(unittest.TestCase):
         import subprocess
 
         node = shutil.which("node")
+        if not node:
+            # A shell that inherited its PATH before the install will not see
+            # node even though it is present, so the usual install locations
+            # are checked before giving up.
+            for candidate in (
+                os.path.join(os.environ.get("ProgramFiles", ""), "nodejs", "node.exe"),
+                os.path.join(
+                    os.environ.get("ProgramFiles(x86)", ""), "nodejs", "node.exe"
+                ),
+                os.path.join(
+                    os.environ.get("LOCALAPPDATA", ""), "Programs", "nodejs", "node.exe"
+                ),
+                "/usr/bin/node",
+                "/usr/local/bin/node",
+            ):
+                if candidate and os.path.isfile(candidate):
+                    node = candidate
+                    break
         if not node:
             self.skipTest("node is not installed; the lexical check ran instead")
 
