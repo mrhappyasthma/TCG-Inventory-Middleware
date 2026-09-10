@@ -3,6 +3,7 @@ import sys
 import io
 import csv
 import hashlib
+import json
 import mimetypes
 import shutil
 import tempfile
@@ -85,6 +86,19 @@ from tcg_engine.plans import (
     revalidate_item,
 )
 
+# Submodule imports, not the package root: the project root is on sys.path and
+# the outer ebay_client/ directory shadows the installed package there as an
+# empty namespace package. See AGENTS.md section 2.
+from ebay_client.client import EbayClient
+from ebay_client.config import EbayConfig
+from ebay_client.errors import EbayError, SignatureError
+from ebay_client.notifications import (
+    SIGNATURE_HEADER,
+    challenge_response,
+    payload_topic,
+    verify_signature,
+)
+
 try:
     from app.user_db import UserDatabase
     from app.auth import (
@@ -108,6 +122,28 @@ except ImportError:
 DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
 USER_DATABASE_URL = os.environ.get("USER_DATABASE_URL", "data/users.db")
 PORT = int(os.environ.get("PORT", 8080))
+
+# The eBay integration is optional: with these unset the app is exactly the
+# CSV tool it has always been, and every eBay control is simply absent. The
+# client is built lazily and cached, because its PublicKeyCache must outlive a
+# single request -- refetching eBay's verification key per notification is
+# what their documentation warns will exhaust the call quota.
+EBAY_NOTIFICATION_ENDPOINT = os.environ.get("EBAY_NOTIFICATION_ENDPOINT", "").strip()
+_ebay_client = None
+
+
+def get_ebay_client():
+    """
+    The shared eBay client, or None when the integration is not configured.
+
+    Returns None rather than raising so that an unconfigured deployment keeps
+    working. Callers that genuinely need eBay must check and answer 503
+    themselves, which reads better than a stack trace about a missing key.
+    """
+    global _ebay_client
+    if _ebay_client is None and EbayConfig.is_configured():
+        _ebay_client = EbayClient(EbayConfig.from_env())
+    return _ebay_client
 
 # Initialize databases & auth
 db = Database(db_path=DATABASE_URL)
@@ -1404,6 +1440,129 @@ def health_check():
 # ---------------------------------------------------------
 # FRONTEND HTML ROUTE
 # ---------------------------------------------------------
+
+# -------------------------------------------------------------------
+# eBay marketplace account deletion notifications
+# -------------------------------------------------------------------
+#
+# Required by eBay before a keyset will function at all: a developer must
+# either receive these notifications or hold an exemption. Two distinct
+# mechanisms live on the one URL, which is eBay's design, not ours.
+#
+#   GET  - a one-time challenge when eBay validates the endpoint. Answer with
+#          the SHA-256 of the challenge code, our verification token and the
+#          endpoint URL, in that order.
+#   POST - a real notification, signed. Verify it or answer 412.
+#
+# Both are necessarily unauthenticated: eBay has no session with us. The GET
+# discloses only a hash, and the POST is refused unless eBay signed it.
+
+
+@app.get("/api/ebay/notifications")
+def ebay_notification_challenge(challenge_code: str = ""):
+    """
+    Answer eBay's endpoint-validation challenge.
+
+    The endpoint URL is taken from configuration rather than reconstructed
+    from the request, because behind the DSM reverse proxy the URL this
+    process sees is not the URL eBay called -- and the URL is hashed, so a
+    mismatch fails validation with an error that never says why. This is the
+    single most common cause of failed endpoint validation.
+    """
+    config = get_ebay_client().config if get_ebay_client() else None
+    if config is None or not config.verification_token:
+        # Deliberately vague to an unauthenticated caller; the detail goes to
+        # the log, matching how /api/health handles its failures.
+        print(
+            "[ebay] notification challenge received but EBAY_CLIENT_ID/"
+            "EBAY_CLIENT_SECRET/EBAY_REDIRECT_URI/EBAY_VERIFICATION_TOKEN "
+            "are not all configured",
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=503, detail="eBay notifications are not configured."
+        )
+    if not EBAY_NOTIFICATION_ENDPOINT:
+        print(
+            "[ebay] notification challenge received but "
+            "EBAY_NOTIFICATION_ENDPOINT is unset; it must be the public URL "
+            "exactly as entered in eBay's console",
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=503, detail="eBay notifications are not configured."
+        )
+    if not challenge_code:
+        raise HTTPException(status_code=400, detail="challenge_code is required.")
+
+    return {
+        "challengeResponse": challenge_response(
+            challenge_code,
+            config.verification_token,
+            EBAY_NOTIFICATION_ENDPOINT,
+        )
+    }
+
+
+@app.post("/api/ebay/notifications")
+async def ebay_notification_receive(request: Request):
+    """
+    Receive a signed eBay notification.
+
+    The raw request body is verified, never a re-serialised copy: any
+    reformatting -- key order, whitespace, unicode escaping -- changes the
+    signed bytes and invalidates the signature.
+
+    Nothing is deleted in response to an account-deletion notification because
+    this application stores no eBay user personal data. Module C reads an order
+    export in memory and persists nothing from it; the store mirror holds only
+    our own listings' item numbers, labels, quantities and prices. Should that
+    ever change, this is the handler that has to grow a deletion path.
+    """
+    client = get_ebay_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503, detail="eBay notifications are not configured."
+        )
+
+    body = await request.body()
+    signature = request.headers.get(SIGNATURE_HEADER, "")
+
+    try:
+        await run_in_threadpool(
+            verify_signature, body, signature, client.public_keys
+        )
+    except SignatureError as exc:
+        # 412 is what eBay's own SDKs answer, and it must not be a 200: an
+        # unverified payload is an anonymous request that merely looks like
+        # eBay, since anyone who learns this URL can post to it.
+        print(f"[ebay] notification signature rejected: {exc}", flush=True)
+        return JSONResponse(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            content={"status": "signature not verified"},
+        )
+    except EbayError as exc:
+        # Could not reach eBay for the verification key. Answering 500 makes
+        # eBay retry, which is right -- silently accepting would defeat the
+        # verification entirely.
+        print(f"[ebay] could not verify notification: {exc}", flush=True)
+        raise HTTPException(status_code=500, detail="Verification unavailable.")
+
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+
+    # The topic only. An account-deletion payload carries the closing user's
+    # username and user id, and logging those would create a durable record of
+    # exactly the personal data this application is attesting it does not keep.
+    print(
+        f"[ebay] verified notification received: topic="
+        f"{payload_topic(payload) or 'unknown'}",
+        flush=True,
+    )
+    return {"status": "acknowledged"}
+
 
 # -------------------------------------------------------------------
 # Draft plans: staging for every eBay-bound change

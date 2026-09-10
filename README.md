@@ -165,6 +165,77 @@ any other reverse-proxied service on the NAS.
 
 ---
 
+## 🔔 eBay keyset and the account deletion endpoint
+
+The eBay integration is optional. With `EBAY_CLIENT_ID`, `EBAY_CLIENT_SECRET`
+and `EBAY_REDIRECT_URI` unset, this is exactly the CSV tool it has always been.
+
+### eBay disables a keyset until you comply
+
+Before a keyset works — you will see *"Your keyset is currently disabled"* —
+eBay requires every developer to either **receive marketplace account
+deletion/closure notifications** or **hold an exemption**. The exemption is
+only for applications that do not persist eBay data.
+
+This application qualifies for the exemption: it stores no eBay user personal
+data (see [the compliance
+invariant](docs/ebay-api-design.md#7a-compliance-no-ebay-user-personal-data-ever)).
+The endpoint is implemented anyway, because receiving the notification is a
+fact while an exemption is an attestation somebody has to keep true.
+
+### What to enter in eBay's console
+
+On **Alerts & Notifications → Marketplace account deletion**:
+
+| Field | Value |
+|---|---|
+| Notification endpoint | `https://<your-host>/api/ebay/notifications` |
+| Verification token | the value of `EBAY_VERIFICATION_TOKEN`, byte for byte |
+
+Then press eBay's **Send Test Notification** / save. eBay issues a one-time
+`GET` with a `challenge_code`, and the endpoint answers with the SHA-256 of
+the challenge code, the verification token and the endpoint URL, in that
+order.
+
+> ⚠️ **`EBAY_NOTIFICATION_ENDPOINT` must be the public URL exactly as typed
+> into eBay's console.** The challenge response hashes that string, and behind
+> the DSM reverse proxy the URL the container sees is not the URL eBay called.
+> A mismatch — even a trailing slash — fails validation with an error that
+> never explains itself. This is the single commonest cause of that failure,
+> which is why the URL is configuration rather than being read off the request.
+
+The endpoint must be deployed and publicly reachable over HTTPS *before* you
+save it, or validation fails and there is nothing to retry against.
+
+### Two mechanisms, one URL
+
+| Method | Purpose | Failure |
+|---|---|---|
+| `GET` | eBay's one-time endpoint validation challenge | `400` without a code, `503` if unconfigured |
+| `POST` | a real, signed notification | `412` if the signature does not verify |
+
+The `POST` verifies the **raw request bytes** against eBay's ECDSA signature,
+fetching the verification key by the key id in the `X-EBAY-SIGNATURE` header
+and caching it for an hour as eBay's documentation asks. A payload that does
+not verify is never acted upon: anyone who learns this URL can post to it, so
+an unverified notification is an anonymous request that merely resembles eBay.
+
+### Other constraints worth knowing before you start
+
+* **eBay rejects `localhost` and plain HTTP for the OAuth redirect**, with no
+  development carve-out — unlike Google, which exempts `localhost`. The
+  callback has to be your public HTTPS hostname even while testing.
+* **`EBAY_REDIRECT_URI` is a RuName, not a URL.** eBay generates it after you
+  register the redirect under *User Tokens → Get a Token from eBay via Your
+  Application*. It looks like `Mark_Klara-MarkKlar-abc12-xyzabcd`.
+* **Do not configure Platform Notifications until a receiver exists.** After
+  enough consecutive delivery failures eBay stops sending notifications for
+  your AppID and reinstating delivery requires contacting Developer Technical
+  Support. Order notifications are only a latency optimisation here anyway —
+  polling is the correctness mechanism.
+
+---
+
 ## 🐳 Synology NAS Deployment Guide
 
 ### 1. Requirements on Synology NAS

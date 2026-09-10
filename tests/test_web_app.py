@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import tempfile
@@ -19,7 +20,17 @@ os.environ["COOKIE_SECURE"] = "false"
 # The background price refresh makes outbound HTTP calls. Tests must
 # never depend on the network, and never poke a third-party service.
 os.environ["PRICE_REFRESH_ENABLED"] = "false"
+# eBay credentials, so the notification endpoints are exercisable. These are
+# not real and no test reaches the network: the client is replaced with one
+# holding a stubbed key fetcher wherever a signature has to be verified.
+os.environ["EBAY_CLIENT_ID"] = "test-ebay-client-id"
+os.environ["EBAY_CLIENT_SECRET"] = "test-ebay-client-secret"
+os.environ["EBAY_REDIRECT_URI"] = "Test-RuName-abc123"
+os.environ["EBAY_ENVIRONMENT"] = "sandbox"
+os.environ["EBAY_VERIFICATION_TOKEN"] = "t" * 40
+os.environ["EBAY_NOTIFICATION_ENDPOINT"] = "https://cards.example.com/api/ebay/notifications"
 
+from app import main  # noqa: E402
 from app.main import app, db, user_db  # noqa: E402
 
 # A SortSwift export row, reused so the duplicate-batch guard can be exercised.
@@ -822,6 +833,149 @@ class TestWebApp(unittest.TestCase):
                 f"{method.upper()} {path} was reachable without a session",
             )
 
+    # -- eBay account deletion notifications -------------------------------
+
+    def test_34_notification_challenge_hashes_the_configured_endpoint(self):
+        """
+        eBay validates the endpoint with a GET challenge. The URL hashed must
+        be the configured public one, not what this process sees: behind a
+        reverse proxy they differ, and the mismatch fails validation with an
+        error that never explains itself.
+        """
+        anonymous = TestClient(app)
+        res = anonymous.get(
+            "/api/ebay/notifications", params={"challenge_code": "CODE-123"}
+        )
+        self.assertEqual(res.status_code, 200)
+
+        expected = hashlib.sha256(
+            b"CODE-123"
+            + os.environ["EBAY_VERIFICATION_TOKEN"].encode()
+            + os.environ["EBAY_NOTIFICATION_ENDPOINT"].encode()
+        ).hexdigest()
+        self.assertEqual(res.json()["challengeResponse"], expected)
+
+    def test_35_challenge_requires_a_code(self):
+        self.assertEqual(
+            TestClient(app).get("/api/ebay/notifications").status_code, 400
+        )
+
+    def test_36_an_unsigned_notification_is_refused_with_412(self):
+        """
+        Anyone who learns this URL can post to it, so an unverified payload is
+        an anonymous request that merely looks like eBay. It must never be
+        acknowledged with a 200.
+        """
+        res = TestClient(app).post(
+            "/api/ebay/notifications", json={"metadata": {"topic": "X"}}
+        )
+        self.assertEqual(res.status_code, 412)
+
+    def test_37_a_genuinely_signed_notification_is_acknowledged(self):
+        """
+        Round-trips a real ECDSA signature against a locally generated key,
+        with the key fetch stubbed so nothing touches the network.
+        """
+        import base64
+        import json as _js
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        from ebay_client.notifications import PublicKeyCache
+
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("ascii")
+
+        body = b'{"metadata":{"topic":"MARKETPLACE_ACCOUNT_DELETION"}}'
+        signature = private_key.sign(body, ec.ECDSA(hashes.SHA1()))
+        header = base64.b64encode(
+            _js.dumps(
+                {
+                    "alg": "ECDSA",
+                    "kid": "key-1",
+                    "signature": base64.b64encode(signature).decode(),
+                    "digest": "SHA1",
+                }
+            ).encode()
+        ).decode()
+
+        client = main.get_ebay_client()
+        self.assertIsNotNone(client, "eBay env vars should make a client available")
+        original = client.public_keys
+        client.public_keys = PublicKeyCache(lambda _kid: pem)
+        try:
+            res = TestClient(app).post(
+                "/api/ebay/notifications",
+                content=body,
+                headers={
+                    "X-EBAY-SIGNATURE": header,
+                    "Content-Type": "application/json",
+                },
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertEqual(res.json()["status"], "acknowledged")
+
+            # A tampered body must not verify against the same signature.
+            tampered = TestClient(app).post(
+                "/api/ebay/notifications",
+                content=b'{"metadata":{"topic":"SOMETHING_ELSE"}}',
+                headers={
+                    "X-EBAY-SIGNATURE": header,
+                    "Content-Type": "application/json",
+                },
+            )
+            self.assertEqual(tampered.status_code, 412)
+        finally:
+            client.public_keys = original
+
+    def test_38_notification_endpoints_need_no_session(self):
+        """
+        eBay has no session with us, so these two must work unauthenticated --
+        and must be the only endpoints that do besides the health probe.
+        """
+        anonymous = TestClient(app)
+        self.assertNotIn(
+            anonymous.get(
+                "/api/ebay/notifications", params={"challenge_code": "C"}
+            ).status_code,
+            (401, 403),
+        )
+        self.assertNotIn(
+            anonymous.post("/api/ebay/notifications", json={}).status_code,
+            (401, 403),
+        )
+
+    def test_39_an_unconfigured_deployment_reports_503_not_a_crash(self):
+        """
+        The app must keep working as a CSV tool with no eBay credentials, and
+        say so plainly rather than raising.
+        """
+        saved_client = main._ebay_client
+        saved_endpoint = main.EBAY_NOTIFICATION_ENDPOINT
+        main._ebay_client = None
+        main.EBAY_NOTIFICATION_ENDPOINT = ""
+        try:
+            with mock.patch.object(
+                main.EbayConfig, "is_configured", return_value=False
+            ):
+                anonymous = TestClient(app)
+                self.assertEqual(
+                    anonymous.get(
+                        "/api/ebay/notifications", params={"challenge_code": "C"}
+                    ).status_code,
+                    503,
+                )
+                self.assertEqual(
+                    anonymous.post("/api/ebay/notifications", json={}).status_code,
+                    503,
+                )
+        finally:
+            main._ebay_client = saved_client
+            main.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
 
 if __name__ == "__main__":
     unittest.main()

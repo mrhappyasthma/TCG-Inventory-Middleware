@@ -222,6 +222,31 @@ and needs sign-off before it is built.**
 
 ---
 
+## 7a. Compliance: no eBay user personal data, ever
+
+eBay disables a keyset outright until the developer either receives
+marketplace account-deletion notifications or holds an exemption, and the
+exemption is available only to applications that do not persist eBay data.
+
+Today that claim is true by construction: `orders.py` reads an order export in
+memory and stores nothing from it, and the store mirror holds only our own
+listings' item numbers, labels, quantities and prices. No buyer name, address,
+email, phone or eBay username exists anywhere in either schema.
+
+**The order ingest must keep it true.** Deducting stock needs
+`(order_id, line_item_id, sku, quantity, timestamp)` and nothing else. The
+buyer is never required, because shipping happens through eBay's own
+interface. An `orders` table that acquires a `buyer_name` column would put the
+account out of compliance silently.
+
+The endpoint at `/api/ebay/notifications` is implemented regardless, because
+receiving the notification is unambiguous where the exemption is an attestation
+somebody has to keep true. It logs a notification's **topic only** — an
+account-deletion payload carries the closing user's username and id, so logging
+it verbatim would create a durable record of exactly the data being disclaimed.
+There is nothing to erase on receipt; if that ever changes, that handler is
+where the deletion path goes.
+
 ## 8. Orders: webhook for latency, poll for correctness
 
 Both paths funnel into one idempotent `ingest_order(order_id)`, deduplicating
