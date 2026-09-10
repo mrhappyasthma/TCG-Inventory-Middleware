@@ -1227,14 +1227,38 @@ suppressed against a value a sync has never told us — see
 [Why a Revise file can be empty](#-why-a-revise-file-can-be-empty) for the same
 rule on the CSV path.
 
+**Set cover** on a listing block stages that listing's gallery image. Where it
+ends up depends on whether the listing exists yet:
+
+| The plan would… | The cover travels in… |
+|---|---|
+| **create** the listing | the **Add file**, as the parent row's `PicURL` |
+| **update** an existing listing | the separate **Cover photos** Revise file |
+
+Both are listed under **Files** after approval, and the Add file's line says how
+many covers it carries. A cover cannot be revised onto a listing that does not
+exist, which is why the two paths differ — and the per-card pictures are
+untouched either way, since the cover is the listing's gallery image rather than
+a replacement for each variation's own photo.
+
 **Blockers gate the approve button.** eBay refuses an entire variation listing
 when any single one of its offers is invalid, and it only says so *after* you
 have approved — by which point whoever approved it has walked away. So the
 checks that can be made locally are made here: a missing price, no eBay
 category, no postal code (an Add without an item location is rejected with error
-10009), a missing Game value, an unset business policy, or a title over eBay's
-80-character limit. Fix the card or leave it out; leaving it out is eBay's own
+10009), a missing Game value, an unset business policy, a title over eBay's
+80-character limit, or **no item specifics on record for a card being listed for
+the first time**. Fix the card or leave it out; leaving it out is eBay's own
 documented way to unblock the rest of a group.
+
+The item-specifics blocker is the one whose remedy is not on this page: eBay
+marks around twenty specifics required on a card listing, and most of them —
+Card Type, Manufacturer, Graded, Card Size, Character, Stage, both Country
+fields, Age Level, Year Manufactured, Autographed, Material — exist nowhere but
+the SortSwift **eBay** export. Re-upload `export_eBay_<date>.csv` through Module
+A and rebuild the draft. The handful a card's own record can supply (Set, Card
+Name, Card Number, Language, Finish) are filled in automatically, but they are a
+floor, not a substitute.
 
 Approving records **who authorised the change and when**, which is the only
 thing that will authorise an eBay write. An approved plan can no longer be

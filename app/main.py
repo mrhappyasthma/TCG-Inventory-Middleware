@@ -2129,6 +2129,10 @@ def get_plan_file_summary(
         "revise_count": built["revise_count"],
         "unlistable": built["unlistable"],
         "cover_count": len(db.get_plan_cover_revisions(plan_id)),
+        # A cover staged for a listing that does not exist yet cannot be
+        # revised onto anything, so it rides in the Add file instead. Reported
+        # separately because otherwise it looks like the choice was dropped.
+        "add_cover_count": built["add_cover_count"],
     }
 
 

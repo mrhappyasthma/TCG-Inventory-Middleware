@@ -347,11 +347,24 @@ class ApprovalTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def add_card(self, manifest_id, name, quantity=3, price=2.50):
+    def add_card(self, manifest_id, name, quantity=3, price=2.50,
+                 with_specifics=True):
         self.db.insert_manifest(
             manifest_id, name, "Base Set", "Near Mint", "Holofoil"
         )
         self.db.set_manifest_quantity(manifest_id, quantity)
+        if with_specifics:
+            # What cataloguing an eBay-flavoured export leaves behind. Most of
+            # the specifics eBay marks required exist nowhere else, so a card
+            # without them cannot be listed -- see the test below.
+            self.db.set_manifest_ebay_fields(manifest_id, {
+                "item_specifics": {
+                    "C:Game": "Pokémon TCG",
+                    "C:Card Type": "Pokémon",
+                    "C:Manufacturer": "The Pokémon Company",
+                    "C:Graded": "No",
+                },
+            })
         with self.db.get_connection() as conn:
             conn.execute(
                 "UPDATE manifest SET price = ? WHERE manifest_id = ?",
@@ -390,6 +403,27 @@ class ApprovalTests(unittest.TestCase):
         blockers = plan_blockers(self.db, plan_id)
         self.assertEqual(len(blockers), 1)
         self.assertTrue(blockers[0]["problems"])
+        with self.assertRaises(PlanError):
+            approve_plan(self.db, plan_id, approved_by=1)
+
+    def test_a_card_with_no_export_specifics_cannot_be_approved(self):
+        # eBay marks around twenty item specifics required on a card listing,
+        # and most of them -- Card Type, Manufacturer, Graded, Card Size,
+        # Character, Stage, the Country fields -- come only from the eBay
+        # export. A card catalogued without it builds an Add file that looks
+        # plausible and is missing fields eBay demands, so the blocker names
+        # the re-upload rather than letting the file out.
+        self.complete_settings()
+        self.add_card("ID1001", "Charizard", with_specifics=False)
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+
+        blockers = plan_blockers(self.db, plan_id)
+        self.assertEqual(len(blockers), 1)
+        problems = [p["problem"] for p in blockers[0]["problems"]]
+        self.assertTrue(
+            any("item specifics" in p and "export_eBay_" in p for p in problems),
+            problems,
+        )
         with self.assertRaises(PlanError):
             approve_plan(self.db, plan_id, approved_by=1)
 

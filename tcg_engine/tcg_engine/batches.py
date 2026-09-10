@@ -485,6 +485,7 @@ def build_add_rows(
     title_template: str,
     cover_image_url: str,
     common_add_fields: Dict[str, str],
+    cover_images: Optional[Dict[Any, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Assemble the Add file's rows: variation parents, their children, singles.
@@ -494,7 +495,16 @@ def build_add_rows(
     the rules that are hardest to get right and least visible when wrong:
     the parent row leaving Relationship empty, the option list matching the
     child order, and a per-variation PicURL naming its option.
+
+    ``cover_images`` maps a ``(set, condition)`` group to the cover photo
+    chosen for that one listing on the drafts page, and wins over the
+    account-wide ``cover_image_url``. A single carries its own choice on the
+    entry as ``cover_image``. Without this, a cover staged for a listing that
+    does not exist yet had nowhere to go: it cannot be revised onto a listing
+    that has not been created, so it has to travel in the Add file that
+    creates it.
     """
+    covers = cover_images or {}
     # BUILD FINAL EBAY ADD CSV (PARENT CONTAINERS + CHILD VARIATIONS + SINGLES)
     # -----------------------------------------------------------------
     final_add_rows: List[Dict[str, Any]] = []
@@ -512,9 +522,12 @@ def build_add_rows(
         parent_title = generate_variation_title(
             set_title, condition=group_condition, template=title_template
         )
-        # An explicit cover image wins; otherwise fall back to the first card's.
-        cover_image = cover_image_url or next(
-            (c["cdn_image"] for c in cards if c["cdn_image"]), ""
+        # This listing's own cover wins, then the account-wide one; otherwise
+        # fall back to the first card's picture.
+        cover_image = (
+            covers.get((set_title, group_condition))
+            or cover_image_url
+            or next((c["cdn_image"] for c in cards if c["cdn_image"]), "")
         )
 
         # Declare the option list on the parent. eBay separates values within
@@ -592,7 +605,7 @@ def build_add_rows(
 
         # Single listings: include front, back, and stock images (pipe-delimited)
         single_pic_parts = [url for url in [
-            cover_image_url or s["cdn_image"],
+            s.get("cover_image") or cover_image_url or s["cdn_image"],
             s.get("cdn_back_image", ""),
             s.get("stock_image", ""),
         ] if url]
@@ -1268,6 +1281,15 @@ def process_batch_csv(
                     "item_specifics": row_specifics,
                     "condition_id": condition_id,
                     "condition_descriptor": condition_descriptor,
+                    # Whether that descriptor came from the upload or was
+                    # rendered here. A later export must re-render our own,
+                    # so that changing condition_descriptor_style in Listing
+                    # Rules actually reaches the file -- otherwise the style
+                    # in force the day a card was catalogued is frozen into
+                    # it. The upload's own value is never rewritten.
+                    "condition_descriptor_from_export": bool(
+                        explicit_descriptor and str(explicit_descriptor).strip()
+                    ),
                     "cdn_back_image": cdn_back_image or "",
                     "stock_image": stock_image or "",
                 })

@@ -174,6 +174,28 @@ def group_key_for(
     return variation_group_key(card.get("set_name", ""), card.get("condition", ""))
 
 
+def _has_export_specifics(card: Dict[str, Any]) -> bool:
+    """
+    Whether this card carries the item specifics its eBay export supplied.
+
+    ``manifest.ebay_fields_json`` is written while a batch is catalogued, from
+    the ``C:``-prefixed columns of the eBay-flavoured SortSwift export. A card
+    catalogued before that existed -- or from the wrong export -- has nothing
+    here, and the only remedy is to upload the export again.
+    """
+    raw = card.get("ebay_fields_json")
+    if not raw:
+        return False
+    try:
+        fields = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(fields, dict):
+        return False
+    specifics = fields.get("item_specifics")
+    return isinstance(specifics, dict) and bool(specifics)
+
+
 def validate_card(
     card: Dict[str, Any], settings: Dict[str, str], action: str
 ) -> List[str]:
@@ -203,6 +225,23 @@ def validate_card(
         problems.append("no card name")
 
     if action == ACTION_CREATE:
+        # eBay marks around twenty item specifics as required on a card
+        # listing, and most of them -- Card Type, Manufacturer, Graded, Card
+        # Size, Character, Stage, the two Country fields, Age Level, Year
+        # Manufactured, Autographed, Material -- exist nowhere but the eBay
+        # export. They cannot be derived from a card's identity.
+        #
+        # Without them the Add file is built, looks plausible and creates
+        # listings missing fields eBay demands. Blocking here is the
+        # difference between a clear "re-upload the export" and discovering
+        # it from a rejection report over hundreds of rows.
+        if not _has_export_specifics(card):
+            problems.append(
+                "no eBay item specifics on record for this card, so a listing "
+                "built from it would be missing fields eBay requires. Re-upload "
+                "the SortSwift eBay export (export_eBay_<date>.csv) to supply "
+                "them"
+            )
         if not str(settings.get("category_id") or "").strip():
             problems.append("no eBay category is configured")
         if not str(settings.get("seller_postal_code") or "").strip():

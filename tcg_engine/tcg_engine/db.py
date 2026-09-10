@@ -1959,6 +1959,7 @@ class Database:
                 SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
                        m.printing, m.card_number, m.language, m.sku_id,
                        m.tcgplayer_id, m.set_code, m.cdn_image, m.remarks,
+                       m.ebay_fields_json,
                        COALESCE(m.quantity, 0) AS quantity,
                        m.price, m.market_price,
                        v.ebay_parent_id, v.custom_label,
@@ -2289,7 +2290,7 @@ class Database:
                 f"""
                 SELECT i.*,
                        m.product_name, m.set_name, m.condition, m.printing,
-                       m.card_number, m.quantity AS catalogued_qty,
+                       m.card_number, m.language, m.quantity AS catalogued_qty,
                        m.price AS catalogued_price, m.market_price,
                        m.cdn_image, m.remarks, m.ebay_fields_json,
                        v.ebay_parent_id, v.custom_label,
@@ -2539,6 +2540,31 @@ class Database:
                     (int(plan_id), group_key, cleaned),
                 )
             conn.commit()
+
+    def get_plan_group_covers(self, plan_id: int) -> Dict[str, str]:
+        """
+        Every cover photo staged in a plan, keyed by group.
+
+        Deliberately unfiltered, unlike ``get_plan_cover_revisions``: a cover
+        for a listing that does not exist yet cannot be revised onto anything,
+        but it is exactly what the Add file's parent row has to carry. Both
+        halves are needed, and each one alone loses covers silently.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT group_key, cover_image_url
+                FROM listing_plan_group
+                WHERE plan_id = ?
+                  AND TRIM(COALESCE(cover_image_url, '')) != ''
+                """,
+                (int(plan_id),),
+            )
+            return {
+                row["group_key"]: row["cover_image_url"].strip()
+                for row in cursor.fetchall()
+            }
 
     def get_plan_cover_revisions(self, plan_id: int) -> List[Dict[str, Any]]:
         """

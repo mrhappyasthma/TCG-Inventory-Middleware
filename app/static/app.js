@@ -3003,9 +3003,15 @@ async function loadPlanFiles(planId) {
 
         const links = [];
         if (data.add_card_count) {
+            // A cover for a listing that does not exist yet has nothing to be
+            // revised onto, so it travels in this file. Said here because
+            // otherwise the choice looks like it was dropped.
+            const coversInAdd = data.add_cover_count
+                ? `, including ${data.add_cover_count} cover photo(s)`
+                : "";
             links.push(`<a href="/api/plans/${planId}/add.csv" download
                 class="text-accent-emerald underline decoration-dotted font-semibold">Add file</a>
-                <span class="text-slate-500">&mdash; creates ${data.listing_count} listing(s) from ${data.add_card_count} card(s)</span>`);
+                <span class="text-slate-500">&mdash; creates ${data.listing_count} listing(s) from ${data.add_card_count} card(s)${coversInAdd}</span>`);
         }
         if (data.revise_count) {
             links.push(`<a href="/api/plans/${planId}/revise.csv" download

@@ -53,6 +53,36 @@ from .plans import (
 
 DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
 
+# Item specifics that can be read off the card itself, for the cards that were
+# catalogued before the export's own "C:" columns were persisted. This mirrors
+# ``batches.DERIVED_ITEM_SPECIFICS`` -- the same idea against stored columns
+# rather than CSV headers -- and, like it, translates nothing: each value is
+# the column, passed through.
+#
+# It is a floor, not a substitute. Around thirteen of the specifics eBay marks
+# required on a card listing (Card Type, Manufacturer, Graded, Card Size,
+# Character, Stage, both Country fields, Age Level, Year Manufactured,
+# Autographed, Material, Attribute) exist nowhere but the export, which is why
+# a card with no persisted specifics is a blocker in ``plans.validate_card``
+# rather than something this quietly papers over.
+DERIVED_PLAN_SPECIFICS = (
+    ("C:Set", "set_name"),
+    ("C:Card Name", "product_name"),
+    ("C:Card Number", "card_number"),
+    ("C:Language", "language"),
+    ("C:Finish", "printing"),
+)
+
+
+def _derived_specifics(item: Dict[str, Any]) -> Dict[str, str]:
+    """The specifics readable from the card's own stored columns."""
+    derived: Dict[str, str] = {}
+    for column, source in DERIVED_PLAN_SPECIFICS:
+        value = str(item.get(source) or "").strip()
+        if value:
+            derived[column] = value
+    return derived
+
 
 def _card_entry(item: Dict[str, Any], option_template: str,
                 category_id: str, descriptor_style: str) -> Dict[str, Any]:
@@ -75,9 +105,16 @@ def _card_entry(item: Dict[str, Any], option_template: str,
     # derivable from the condition, and ConditionID is 4000 for every ungraded
     # card, so neither is a guess about the card itself.
     condition_id = str(fields.get("condition_id") or UNGRADED_CONDITION_ID)
-    descriptor = fields.get("condition_descriptor") or resolve_condition_descriptor(
-        condition_name, category_id=category_id, style=descriptor_style
-    )
+    # A descriptor the upload supplied is passed through untouched. One we
+    # rendered ourselves is re-rendered now, so that changing
+    # condition_descriptor_style in Listing Rules reaches the file rather than
+    # leaving whatever style was in force the day the card was catalogued.
+    if fields.get("condition_descriptor_from_export"):
+        descriptor = fields.get("condition_descriptor") or ""
+    else:
+        descriptor = resolve_condition_descriptor(
+            condition_name, category_id=category_id, style=descriptor_style
+        ) or fields.get("condition_descriptor") or ""
 
     price = item.get("proposed_price")
     return {
@@ -91,7 +128,15 @@ def _card_entry(item: Dict[str, Any], option_template: str,
         "condition_name": condition_name,
         "condition_id": condition_id,
         "condition_descriptor": descriptor or "",
-        "item_specifics": dict(fields.get("item_specifics") or {}),
+        # The export's own specifics win; the derived ones only fill gaps.
+        "item_specifics": {
+            **_derived_specifics(item),
+            **{
+                key: value
+                for key, value in (fields.get("item_specifics") or {}).items()
+                if str(value or "").strip()
+            },
+        },
         "printing": item.get("printing") or "",
         "quantity": int(item.get("proposed_qty") or 0),
         "price": float(price) if price is not None else 0.0,
@@ -149,7 +194,7 @@ def build_plan_exports(
         settings.get("variation_option_template")
         or DEFAULT_VARIATION_OPTION_TEMPLATE
     )
-    descriptor_style = settings.get("condition_descriptor_style", "")
+    descriptor_style = settings.get("condition_descriptor_style") or "label_id"
     cover_image_url = settings.get("cover_image_url") or ""
 
     common_add_fields = {"PostalCode": settings.get("seller_postal_code") or ""}
@@ -166,6 +211,16 @@ def build_plan_exports(
         for item in db.get_plan_items(plan_id)
         if item["status"] != STATUS_EXCLUDED
     ]
+
+    # Covers staged per listing on the drafts page. For a listing that already
+    # exists these also produce a Revise file, but a new listing has nothing to
+    # revise, so its cover has to ride along in the Add file that creates it.
+    staged_covers = db.get_plan_group_covers(plan_id)
+    cover_images: Dict[tuple, str] = {}
+    for group_key, url in staged_covers.items():
+        if not is_single(group_key) and group_key:
+            set_name, _, condition = group_key.partition("|")
+            cover_images[(set_name, condition)] = url
 
     staged_variations: Dict[tuple, List[Dict[str, Any]]] = {}
     staged_singles: List[Dict[str, Any]] = []
@@ -228,6 +283,8 @@ def build_plan_exports(
 
         group_key = item.get("group_key") or ""
         if is_single(group_key) or not group_key:
+            if staged_covers.get(group_key):
+                entry["cover_image"] = staged_covers[group_key]
             staged_singles.append(entry)
         else:
             # The plan's own grouping, split back into (set, condition). Not
@@ -244,6 +301,7 @@ def build_plan_exports(
         title_template=title_template,
         cover_image_url=cover_image_url,
         common_add_fields=common_add_fields,
+        cover_images=cover_images,
     )
 
     add_headers = (
@@ -258,6 +316,12 @@ def build_plan_exports(
         "add_card_count": sum(len(c) for c in staged_variations.values())
         + len(staged_singles),
         "revise_count": len(revise_rows),
+        # Covers that travelled in the Add file rather than in the cover-photo
+        # Revise file, so the page can say where a staged cover went instead of
+        # leaving it looking dropped.
+        "add_cover_count": sum(
+            1 for key in cover_images if key in staged_variations
+        ) + sum(1 for entry in staged_singles if entry.get("cover_image")),
         "unlistable": unlistable,
     }
 
