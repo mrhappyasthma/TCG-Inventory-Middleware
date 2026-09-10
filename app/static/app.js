@@ -2917,34 +2917,70 @@ async function approveDraftPlan() {
             `Draft ${planId} approved: ${data.approved_items} change(s) cleared to push`
         );
 
-        // Cover photos are the one part of an approved plan that can already
-        // be applied today, via a File Exchange Revise file. Offered rather
-        // than auto-downloaded, matching how the other generated files work.
-        const stagedCovers = (currentDraftPlan.groups || []).filter(
-            g => g.cover_is_staged && g.ebay_parent_id
-        );
-        if (stagedCovers.length) {
-            logToTerminal(
-                "SUCCESS",
-                `[DRAFTS] ${stagedCovers.length} cover photo change(s) ready: `
-                + `download /api/plans/${planId}/cover-revise.csv and upload it `
-                + `to Seller Hub. Revising a cover replaces the listing's whole `
-                + `picture set.`
-            );
-            const footer = document.getElementById("draftSummary");
-            if (footer) {
-                footer.insertAdjacentHTML(
-                    "afterend",
-                    `<p class="mt-2"><a href="/api/plans/${planId}/cover-revise.csv"
-                        class="text-accent-cyan underline decoration-dotted text-[11px]"
-                        download>Download cover photo Revise file (${stagedCovers.length})</a></p>`
-                );
-            }
-        }
+        // An approved plan now yields the eBay files it authorised. Offered
+        // rather than auto-downloaded, matching how Module A's files work,
+        // and only the files that actually have rows in them.
+        await showApprovedPlanFiles(planId);
         await fetchDraftPlan();
     } catch (err) {
         logToTerminal("ERROR", `Approval failed: ${err.message}`);
         if (button) button.disabled = false;
+    }
+}
+
+async function showApprovedPlanFiles(planId) {
+    const footer = document.getElementById("draftSummary");
+    if (!footer) return;
+    try {
+        const res = await fetch(`/api/plans/${planId}/files`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not read the plan's files");
+
+        const links = [];
+        if (data.add_card_count) {
+            links.push(`<a href="/api/plans/${planId}/add.csv" download
+                class="text-accent-emerald underline decoration-dotted">Add file</a>
+                <span class="text-slate-500">(${data.listing_count} listing(s), ${data.add_card_count} card(s))</span>`);
+        }
+        if (data.revise_count) {
+            links.push(`<a href="/api/plans/${planId}/revise.csv" download
+                class="text-accent-cyan underline decoration-dotted">Revise file</a>
+                <span class="text-slate-500">(${data.revise_count} row(s))</span>`);
+        }
+        if (data.cover_count) {
+            links.push(`<a href="/api/plans/${planId}/cover-revise.csv" download
+                class="text-accent-cyan underline decoration-dotted">Cover photos</a>
+                <span class="text-slate-500">(${data.cover_count} listing(s))</span>`);
+        }
+
+        // Named individually because they are uploaded separately and an Add
+        // creates live listings while a Revise only changes existing ones --
+        // conflating them is how a mistake becomes 400 listings instead of a
+        // quantity correction.
+        footer.insertAdjacentHTML("afterend", `
+            <div class="mt-3 rounded-xl border border-slate-700 bg-dark-900/60 p-3 text-[11px] space-y-1.5">
+                <p class="font-semibold text-slate-200">Files ready to upload to Seller Hub</p>
+                ${links.length
+                    ? links.map(l => `<p>${l}</p>`).join("")
+                    : `<p class="text-slate-500">This plan produced no uploadable rows.</p>`}
+                ${data.unlistable && data.unlistable.length
+                    ? `<p class="text-amber-300">${data.unlistable.length} card(s) could not be included &mdash; see the console.</p>`
+                    : ""}
+                ${data.add_card_count
+                    ? `<p class="text-slate-500">An Add file creates live listings. Upload a small slice first and check one resulting listing before committing the rest.</p>`
+                    : ""}
+            </div>`);
+
+        for (const entry of (data.unlistable || [])) {
+            logToTerminal("WARN", `[DRAFTS] ${entry.manifest_id}: ${entry.reason}`);
+        }
+        logToTerminal(
+            "SUCCESS",
+            `[DRAFTS] Plan ${planId} files ready: ${data.add_card_count} card(s) `
+            + `across ${data.listing_count} listing(s), ${data.revise_count} revise row(s)`
+        );
+    } catch (err) {
+        logToTerminal("ERROR", `[DRAFTS] Could not build the plan's files: ${err.message}`);
     }
 }
 

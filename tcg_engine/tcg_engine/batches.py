@@ -36,10 +36,6 @@ def build_cover_photo_revise_csv(item_id: str, cover_image_url: str) -> str:
     replacement, not an addition. It also ignores an image whose URL matches one
     already uploaded to that listing, so re-sending the same URL is a no-op.
     """
-    output = io.StringIO()
-    writer = csv.DictWriter(
-        output, fieldnames=COVER_REVISE_HEADERS, lineterminator="\n"
-    )
     return build_cover_photo_revise_rows([
         {"ebay_parent_id": item_id, "cover_image_url": cover_image_url}
     ])
@@ -479,6 +475,150 @@ def _parse_price(val: Optional[str]) -> float:
         return float(clean) if clean and clean.upper() != "N/A" else 0.0
     except (ValueError, TypeError):
         return 0.0
+
+
+def build_add_rows(
+    staged_variations: Dict[tuple, List[Dict[str, Any]]],
+    staged_singles: List[Dict[str, Any]],
+    *,
+    category_id: str,
+    title_template: str,
+    cover_image_url: str,
+    common_add_fields: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    Assemble the Add file's rows: variation parents, their children, singles.
+
+    Extracted so that both callers share it -- a SortSwift batch, and an
+    approved draft plan. A second copy would be free to drift in exactly
+    the rules that are hardest to get right and least visible when wrong:
+    the parent row leaving Relationship empty, the option list matching the
+    child order, and a per-variation PicURL naming its option.
+    """
+    # BUILD FINAL EBAY ADD CSV (PARENT CONTAINERS + CHILD VARIATIONS + SINGLES)
+    # -----------------------------------------------------------------
+    final_add_rows: List[Dict[str, Any]] = []
+
+    # 1. Multi-Item Variation Listings (one per set + condition)
+    for (set_title, group_condition), cards in staged_variations.items():
+        if not cards:
+            continue
+
+        # Order the dropdown by card number. The parent's option list and the
+        # child rows must agree, so sort once and use it for both.
+        cards = sorted(cards, key=variation_sort_key)
+
+        # Generate Parent Container Row
+        parent_title = generate_variation_title(
+            set_title, condition=group_condition, template=title_template
+        )
+        # An explicit cover image wins; otherwise fall back to the first card's.
+        cover_image = cover_image_url or next(
+            (c["cdn_image"] for c in cards if c["cdn_image"]), ""
+        )
+
+        # Declare the option list on the parent. eBay separates values within
+        # one attribute by semicolons; a pipe would be read as the start of a
+        # second attribute and rejected.
+        option_names = [c["option_name"] for c in cards]
+        parent_rel_details = (
+            f"{VARIATION_ATTRIBUTE_NAME}="
+            + VARIATION_VALUE_SEPARATOR.join(option_names)
+        )
+
+        # Append Parent Container Row. The parent leaves Relationship EMPTY;
+        # only the child rows are marked "Variation". Marking the parent too
+        # leaves eBay unable to tell which row is the container.
+        final_add_rows.append({
+            "Action": "Add",
+            "Category": category_id,
+            "Title": parent_title,
+            "Relationship": "",
+            "RelationshipDetails": parent_rel_details,
+            "Description": (
+                f"Pick Your Card from {set_title}! "
+                f"Condition: {group_condition}. Complete your collection."
+            ),
+            "ConditionID": cards[0]["condition_id"],
+            "StartPrice": "",
+            "Quantity": "",
+            "CustomLabel": "",
+            "PicURL": cover_image,
+            "Format": "FixedPrice",
+            "Duration": "GTC",
+            "Price": "",
+            CONDITION_DESCRIPTOR_COLUMN: cards[0]["condition_descriptor"],
+            **common_add_fields,
+            **_uniform_item_specifics(cards),
+        })
+
+        # Append Child Variation Rows
+        for c in cards:
+            final_add_rows.append({
+                "Action": "Add",
+                "Category": category_id,
+                "Title": "",
+                "Relationship": "Variation",
+                "RelationshipDetails": (
+                    f"{VARIATION_ATTRIBUTE_NAME}={c['option_name']}"
+                ),
+                "Description": "",
+                "ConditionID": c["condition_id"],
+                "StartPrice": f"{c['price']:.2f}",
+                "Quantity": c["quantity"],
+                "CustomLabel": c["custom_label"],
+                # A per-variation image must name the option it belongs to:
+                # "<option value>=<url>". A bare URL here is ignored by eBay,
+                # which is why only the parent's picture used to appear.
+                "PicURL": (
+                    f"{c['option_name']}{VARIATION_PICTURE_SEPARATOR}{c['cdn_image']}"
+                    if c["cdn_image"]
+                    else ""
+                ),
+                "Format": "FixedPrice",
+                "Duration": "GTC",
+                "Price": f"{c['price']:.2f}",
+                CONDITION_DESCRIPTOR_COLUMN: c["condition_descriptor"],
+                **common_add_fields,
+            })
+
+    # 2. Standalone Single Listings (Cards >= threshold)
+    for s in staged_singles:
+        single_title = f"{s['product_name']} - {s['set_name']} - {s['condition_name']}"
+        if len(single_title) > 80:
+            single_title = f"{s['product_name']} - {s['set_name']}"
+        if len(single_title) > 80:
+            single_title = single_title[:80]
+
+        # Single listings: include front, back, and stock images (pipe-delimited)
+        single_pic_parts = [url for url in [
+            cover_image_url or s["cdn_image"],
+            s.get("cdn_back_image", ""),
+            s.get("stock_image", ""),
+        ] if url]
+        single_pic_url = "|".join(single_pic_parts)
+
+        final_add_rows.append({
+            "Action": "Add",
+            "Category": category_id,
+            "Title": single_title,
+            "Relationship": "",
+            "RelationshipDetails": "",
+            "Description": f"{s['product_name']} from {s['set_name']}. Condition: {s['condition_name']}, Printing: {s['printing']}.",
+            "ConditionID": s["condition_id"],
+            "StartPrice": f"{s['price']:.2f}",
+            "Quantity": s["quantity"],
+            "CustomLabel": s["custom_label"],
+            "PicURL": single_pic_url,
+            "Format": "FixedPrice",
+            "Duration": "GTC",
+            "Price": f"{s['price']:.2f}",
+            CONDITION_DESCRIPTOR_COLUMN: s["condition_descriptor"],
+            **common_add_fields,
+            **s.get("item_specifics", {}),
+        })
+
+    return final_add_rows
 
 
 def _empty_batch_result(
@@ -1118,6 +1258,20 @@ def process_batch_csv(
                 ),
             }
 
+            # Keep the export-derived fields, so an approved draft plan can
+            # rebuild this card's Add row later. Without them a plan could
+            # record a decision but never produce a listing file, because
+            # these values exist only in the uploaded CSV and eBay requires
+            # them. Skipped on a dry run, which must write nothing.
+            if not dry_run:
+                db.set_manifest_ebay_fields(manifest_id, {
+                    "item_specifics": row_specifics,
+                    "condition_id": condition_id,
+                    "condition_descriptor": condition_descriptor,
+                    "cdn_back_image": cdn_back_image or "",
+                    "stock_image": stock_image or "",
+                })
+
             if not group_by_set:
                 staged_singles.append(card_entry)
                 _log_once(logs, log_tallies, "ADD SINGLE",
@@ -1138,128 +1292,14 @@ def process_batch_csv(
                           f"{condition_name} (Price: ${effective_price:.2f})")
 
     # -----------------------------------------------------------------
-    # BUILD FINAL EBAY ADD CSV (PARENT CONTAINERS + CHILD VARIATIONS + SINGLES)
-    # -----------------------------------------------------------------
-    final_add_rows: List[Dict[str, Any]] = []
-
-    # 1. Multi-Item Variation Listings (one per set + condition)
-    for (set_title, group_condition), cards in staged_variations.items():
-        if not cards:
-            continue
-
-        # Order the dropdown by card number. The parent's option list and the
-        # child rows must agree, so sort once and use it for both.
-        cards = sorted(cards, key=variation_sort_key)
-
-        # Generate Parent Container Row
-        parent_title = generate_variation_title(
-            set_title, condition=group_condition, template=title_template
-        )
-        # An explicit cover image wins; otherwise fall back to the first card's.
-        cover_image = cover_image_url or next(
-            (c["cdn_image"] for c in cards if c["cdn_image"]), ""
-        )
-
-        # Declare the option list on the parent. eBay separates values within
-        # one attribute by semicolons; a pipe would be read as the start of a
-        # second attribute and rejected.
-        option_names = [c["option_name"] for c in cards]
-        parent_rel_details = (
-            f"{VARIATION_ATTRIBUTE_NAME}="
-            + VARIATION_VALUE_SEPARATOR.join(option_names)
-        )
-
-        # Append Parent Container Row. The parent leaves Relationship EMPTY;
-        # only the child rows are marked "Variation". Marking the parent too
-        # leaves eBay unable to tell which row is the container.
-        final_add_rows.append({
-            "Action": "Add",
-            "Category": category_id,
-            "Title": parent_title,
-            "Relationship": "",
-            "RelationshipDetails": parent_rel_details,
-            "Description": (
-                f"Pick Your Card from {set_title}! "
-                f"Condition: {group_condition}. Complete your collection."
-            ),
-            "ConditionID": cards[0]["condition_id"],
-            "StartPrice": "",
-            "Quantity": "",
-            "CustomLabel": "",
-            "PicURL": cover_image,
-            "Format": "FixedPrice",
-            "Duration": "GTC",
-            "Price": "",
-            CONDITION_DESCRIPTOR_COLUMN: cards[0]["condition_descriptor"],
-            **common_add_fields,
-            **_uniform_item_specifics(cards),
-        })
-
-        # Append Child Variation Rows
-        for c in cards:
-            final_add_rows.append({
-                "Action": "Add",
-                "Category": category_id,
-                "Title": "",
-                "Relationship": "Variation",
-                "RelationshipDetails": (
-                    f"{VARIATION_ATTRIBUTE_NAME}={c['option_name']}"
-                ),
-                "Description": "",
-                "ConditionID": c["condition_id"],
-                "StartPrice": f"{c['price']:.2f}",
-                "Quantity": c["quantity"],
-                "CustomLabel": c["custom_label"],
-                # A per-variation image must name the option it belongs to:
-                # "<option value>=<url>". A bare URL here is ignored by eBay,
-                # which is why only the parent's picture used to appear.
-                "PicURL": (
-                    f"{c['option_name']}{VARIATION_PICTURE_SEPARATOR}{c['cdn_image']}"
-                    if c["cdn_image"]
-                    else ""
-                ),
-                "Format": "FixedPrice",
-                "Duration": "GTC",
-                "Price": f"{c['price']:.2f}",
-                CONDITION_DESCRIPTOR_COLUMN: c["condition_descriptor"],
-                **common_add_fields,
-            })
-
-    # 2. Standalone Single Listings (Cards >= threshold)
-    for s in staged_singles:
-        single_title = f"{s['product_name']} - {s['set_name']} - {s['condition_name']}"
-        if len(single_title) > 80:
-            single_title = f"{s['product_name']} - {s['set_name']}"
-        if len(single_title) > 80:
-            single_title = single_title[:80]
-
-        # Single listings: include front, back, and stock images (pipe-delimited)
-        single_pic_parts = [url for url in [
-            cover_image_url or s["cdn_image"],
-            s.get("cdn_back_image", ""),
-            s.get("stock_image", ""),
-        ] if url]
-        single_pic_url = "|".join(single_pic_parts)
-
-        final_add_rows.append({
-            "Action": "Add",
-            "Category": category_id,
-            "Title": single_title,
-            "Relationship": "",
-            "RelationshipDetails": "",
-            "Description": f"{s['product_name']} from {s['set_name']}. Condition: {s['condition_name']}, Printing: {s['printing']}.",
-            "ConditionID": s["condition_id"],
-            "StartPrice": f"{s['price']:.2f}",
-            "Quantity": s["quantity"],
-            "CustomLabel": s["custom_label"],
-            "PicURL": single_pic_url,
-            "Format": "FixedPrice",
-            "Duration": "GTC",
-            "Price": f"{s['price']:.2f}",
-            CONDITION_DESCRIPTOR_COLUMN: s["condition_descriptor"],
-            **common_add_fields,
-            **s.get("item_specifics", {}),
-        })
+    final_add_rows = build_add_rows(
+        staged_variations,
+        staged_singles,
+        category_id=category_id,
+        title_template=title_template,
+        cover_image_url=cover_image_url,
+        common_add_fields=common_add_fields,
+    )
 
     # -----------------------------------------------------------------
     # REPLACE MODE: RECONCILE AGAINST THE FULL DUMP

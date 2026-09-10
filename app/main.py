@@ -83,6 +83,7 @@ from tcg_engine.pricing_feed import (
     build_reprice_csv,
     PriceFeedError,
 )
+from tcg_engine.plan_exports import build_plan_exports
 from tcg_engine.plans import (
     PlanError,
     approve_plan,
@@ -2091,6 +2092,100 @@ def set_plan_cover(
         "success": True,
         "groups": db.get_plan_groups(plan_id),
     }
+
+
+def _plan_for_download(plan_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
+    plan = db.get_plan(plan_id)
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan["status"] == "draft":
+        raise HTTPException(
+            status_code=409,
+            detail="Approve the draft before downloading its files.",
+        )
+    return plan
+
+
+@app.get("/api/plans/{plan_id}/files")
+def get_plan_file_summary(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """
+    What an approved plan's files contain, without downloading them.
+
+    Lets the dashboard offer only the files that have rows in them, and show
+    the listing count so it can be checked against what was on screen.
+    """
+    _plan_for_download(plan_id, user)
+    try:
+        built = build_plan_exports(db, plan_id, user_id=user["id"])
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {
+        "listing_count": built["listing_count"],
+        "variation_listing_count": built["variation_listing_count"],
+        "single_listing_count": built["single_listing_count"],
+        "add_card_count": built["add_card_count"],
+        "revise_count": built["revise_count"],
+        "unlistable": built["unlistable"],
+        "cover_count": len(db.get_plan_cover_revisions(plan_id)),
+    }
+
+
+@app.get("/api/plans/{plan_id}/add.csv")
+def download_plan_add_csv(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """
+    The Add file an approved plan authorised: one listing per group.
+
+    Built from the plan rather than from the original upload, so a regrouped
+    card, an edited price and an excluded card all land in the file. Module A's
+    own download predates every one of those edits.
+    """
+    _plan_for_download(plan_id, user)
+    try:
+        built = build_plan_exports(db, plan_id, user_id=user["id"])
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if not built["add_card_count"]:
+        raise HTTPException(
+            status_code=404, detail="This plan creates no new listings."
+        )
+    return StreamingResponse(
+        io.StringIO(built["add_csv"]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="ebay_new_additions_plan_{plan_id}.csv"'
+            )
+        },
+    )
+
+
+@app.get("/api/plans/{plan_id}/revise.csv")
+def download_plan_revise_csv(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """The Revise file: quantity and price changes to existing listings."""
+    _plan_for_download(plan_id, user)
+    try:
+        built = build_plan_exports(db, plan_id, user_id=user["id"])
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if not built["revise_count"]:
+        raise HTTPException(
+            status_code=404, detail="This plan revises no existing listings."
+        )
+    return StreamingResponse(
+        io.StringIO(built["revise_csv"]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="ebay_inventory_updates_plan_{plan_id}.csv"'
+            )
+        },
+    )
 
 
 @app.get("/api/plans/{plan_id}/cover-revise.csv")

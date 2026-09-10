@@ -423,6 +423,26 @@ class Database:
                 cursor.execute(
                     "ALTER TABLE manifest ADD COLUMN quantity INTEGER DEFAULT 0"
                 )
+            # Everything an Add row needs that comes verbatim from the eBay
+            # export and cannot be derived from a card's identity: the "C:"
+            # item specifics, the ConditionID and Condition Descriptor, and
+            # the back/stock image URLs.
+            #
+            # Stored as one JSON blob rather than a column each, deliberately.
+            # It is opaque pass-through data that is never queried or filtered
+            # on -- only written whole and read whole -- and eBay's templates
+            # gain and lose fields, so a column per field would mean a
+            # migration every time the export changes shape.
+            #
+            # Persisted because an approved plan has to be able to rebuild the
+            # Add file. Previously these were read off the uploaded CSV row,
+            # used in memory and discarded, which meant a draft's edits could
+            # never reach eBay: only the original upload could produce a
+            # listing file, and it predated any editing.
+            if "ebay_fields_json" not in manifest_columns:
+                cursor.execute(
+                    "ALTER TABLE manifest ADD COLUMN ebay_fields_json TEXT"
+                )
 
             # Create indexes for fast lookups
             cursor.execute(
@@ -2271,7 +2291,7 @@ class Database:
                        m.product_name, m.set_name, m.condition, m.printing,
                        m.card_number, m.quantity AS catalogued_qty,
                        m.price AS catalogued_price, m.market_price,
-                       m.cdn_image, m.remarks,
+                       m.cdn_image, m.remarks, m.ebay_fields_json,
                        v.ebay_parent_id, v.custom_label,
                        v.last_known_qty, v.last_known_price
                 FROM listing_plan_item i
@@ -2425,6 +2445,67 @@ class Database:
                 (int(plan_id),),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def set_manifest_ebay_fields(
+        self, manifest_id: str, fields: Optional[Dict[str, Any]]
+    ) -> None:
+        """
+        Store the export-derived fields an Add row needs for one card.
+
+        Merged rather than replaced: a later batch may omit a column the
+        earlier one supplied -- SortSwift's templates differ -- and dropping a
+        previously known item specific would silently degrade the listing that
+        card ends up in.
+        """
+        import json as _json
+
+        if not fields:
+            return
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT ebay_fields_json FROM manifest WHERE manifest_id = ?",
+                (manifest_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                existing = _json.loads(row["ebay_fields_json"] or "{}")
+            except (ValueError, TypeError):
+                existing = {}
+            if not isinstance(existing, dict):
+                existing = {}
+
+            merged = dict(existing)
+            for key, value in fields.items():
+                if key == "item_specifics" and isinstance(value, dict):
+                    specifics = dict(existing.get("item_specifics") or {})
+                    specifics.update({k: v for k, v in value.items() if v})
+                    merged["item_specifics"] = specifics
+                elif value not in (None, ""):
+                    merged[key] = value
+
+            cursor.execute(
+                "UPDATE manifest SET ebay_fields_json = ? WHERE manifest_id = ?",
+                (_json.dumps(merged), manifest_id),
+            )
+            conn.commit()
+
+    def get_manifest_ebay_fields(self, manifest_id: str) -> Dict[str, Any]:
+        import json as _json
+
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT ebay_fields_json FROM manifest WHERE manifest_id = ?",
+                (manifest_id,),
+            ).fetchone()
+        if row is None or not row["ebay_fields_json"]:
+            return {}
+        try:
+            parsed = _json.loads(row["ebay_fields_json"])
+        except (ValueError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def set_plan_group_cover(
         self, plan_id: int, group_key: str, cover_image_url: Optional[str]
