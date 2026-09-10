@@ -176,6 +176,62 @@ DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
 # and need a different descriptor, which this engine does not yet emit.
 UNGRADED_CONDITION_ID = "4000"
 
+# SortSwift offers two exports and only one of them is usable here. The eBay
+# template (export_eBay_*.csv) carries the File Exchange columns -- *Action,
+# *Category, *Title, *ConditionID, CD:Card Condition, the *C: item specifics,
+# PostalCode and the policy names. The inventory export (export_SortSwift_*.csv)
+# carries none of them, and uploading it produces one skip per row: 426
+# identical warnings with the real cause never stated.
+#
+# Detected by columns rather than by filename, because a file can be renamed
+# and because the columns are what actually matter. ConditionID is the marker
+# used: it is the one column whose absence stops every single row, and it is
+# absent from the inventory export and present in the eBay one. Matched
+# tolerantly for the same reasons find_column is -- the eBay template writes
+# "*ConditionID" with the asterisk that marks a required field.
+CONDITION_ID_COLUMNS = ("*ConditionID", "ConditionID", "Condition ID")
+
+
+def _has_condition_id_column(fieldnames) -> bool:
+    wanted = {c.replace("*", "").replace(" ", "").lower() for c in CONDITION_ID_COLUMNS}
+    for name in fieldnames or []:
+        if not name:
+            continue
+        if str(name).strip().replace("*", "").replace(" ", "").lower() in wanted:
+            return True
+    return False
+
+# A batch can be several hundred rows, and one broken column produces one
+# warning per row -- 426 identical lines that bury the summary telling you what
+# actually happened. Warnings of the same kind are logged once with a tally
+# instead.
+WARN_SAMPLE_LIMIT = 3
+
+
+def _warn_once(logs: List[Dict[str, str]], tallies: Dict[str, int], kind: str,
+               message: str) -> None:
+    """
+    Log a warning, but only the first few of each kind.
+
+    The tally is reported by :func:`_flush_warn_tallies` once the pass is done,
+    so nothing is hidden -- it is summarised rather than repeated.
+    """
+    tallies[kind] = tallies.get(kind, 0) + 1
+    if tallies[kind] <= WARN_SAMPLE_LIMIT:
+        logs.append({"level": "WARN", "message": message})
+
+
+def _flush_warn_tallies(logs: List[Dict[str, str]], tallies: Dict[str, int]) -> None:
+    for kind, count in sorted(tallies.items()):
+        if count > WARN_SAMPLE_LIMIT:
+            logs.append({
+                "level": "WARN",
+                "message": (
+                    f"{count} row(s) hit the '{kind}' problem above; only the "
+                    f"first {WARN_SAMPLE_LIMIT} are listed individually."
+                ),
+            })
+
 # eBay accepts exactly four ungraded grades, and SortSwift does not supply them,
 # so a translation is genuinely required here rather than being an invented
 # vocabulary. The numeric value IDs differ by card family: game/CCG cards and
@@ -457,6 +513,9 @@ def process_batch_csv(
 
     new_catalog_count = 0
     skipped_count = 0
+    # Repeated per-row warnings are sampled and tallied rather than
+    # logged once each; a few hundred identical lines bury the summary.
+    warn_tallies: Dict[str, int] = {}
 
     mode = str(quantity_mode or QUANTITY_MODE_SET).strip().lower()
     if mode not in QUANTITY_MODES:
@@ -561,6 +620,31 @@ def process_batch_csv(
             [{
                 "level": "ERROR",
                 "message": "Unable to parse CSV headers in SortSwift batch file.",
+            }],
+            add_headers=add_headers,
+        )
+
+    # Fail fast, and with the actual diagnosis, when the wrong SortSwift export
+    # has been uploaded. Without this the run reaches the per-row checks and
+    # produces one skip per row -- hundreds of identical warnings about a
+    # missing ConditionID, with the real cause (wrong export template) never
+    # stated anywhere.
+    if not _has_condition_id_column(reader.fieldnames):
+        return _empty_batch_result(
+            [{
+                "level": "ERROR",
+                "message": (
+                    "This export has no ConditionID column at all, which means "
+                    "it is SortSwift's inventory export rather than its eBay "
+                    "export. Every row would be skipped for the same reason, "
+                    "and the file is also missing Category, Title, C:Game, "
+                    "PostalCode and the business policy names -- so accepting "
+                    "it would produce a listing file that is wrong in several "
+                    "ways at once. In SortSwift, export using the eBay "
+                    "template: the file is named export_eBay_<date>.csv rather "
+                    "than export_SortSwift_<date>.csv. Nothing was catalogued "
+                    "and no eBay file was built, so nothing has changed."
+                ),
             }],
             add_headers=add_headers,
         )
@@ -753,18 +837,27 @@ def process_batch_csv(
 
         # eBay requires a numeric ConditionID for category 183454. It must come
         # from the input; we will not infer one.
+        #
+        # Deliberately not defaulted to UNGRADED_CONDITION_ID even though it is
+        # 4000 for every ungraded card. The only file that omits this column is
+        # SortSwift's *inventory* export, which is also missing Category,
+        # Title, C:Game, PostalCode and the policy names -- so accepting it
+        # would trade one loud failure for an Add file that is quietly wrong in
+        # five other ways. The template check above catches that case and says
+        # so; this stays strict.
         condition_id = str(raw_condition_id or "").strip()
         if not condition_id.isdigit():
             skipped_count += 1
-            logs.append({
-                "level": "WARN",
-                "message": (
-                    f"Row {row_idx}: No numeric ConditionID column for "
-                    f"'{product_name}' (Condition: {condition_name}). Skipped rather "
-                    f"than guessing. Re-export from SortSwift including the "
-                    f"ConditionID column."
+            _warn_once(
+                logs,
+                warn_tallies,
+                "no ConditionID",
+                (
+                    f"Row {row_idx}: No numeric ConditionID for "
+                    f"'{product_name}' (Condition: {condition_name}). Skipped "
+                    f"rather than guessing."
                 ),
-            })
+            )
             continue
 
         # Resolve the eBay Condition Descriptor, required for card categories.
@@ -1183,6 +1276,7 @@ def process_batch_csv(
     reconcile = replace_quantities and skipped_count == 0
 
     if replace_quantities and skipped_count:
+        _flush_warn_tallies(logs, warn_tallies)
         logs.append({
             "level": "WARN",
             "message": (

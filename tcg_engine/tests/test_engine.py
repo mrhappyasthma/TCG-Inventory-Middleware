@@ -431,14 +431,40 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         conditions = {c["condition"] for c in self.db.export_all_manifest()}
         self.assertEqual(conditions, {"NM", "LP"})
 
-    def test_row_without_condition_id_is_skipped(self):
+    def test_an_export_with_no_condition_id_column_is_refused_outright(self):
+        """
+        No ConditionID column means the wrong SortSwift export.
+
+        Previously this was handled per row, which produced one identical
+        warning per card -- 426 of them on a real file -- and never stated the
+        actual cause. The inventory export is also missing Category, Title,
+        C:Game, PostalCode and the policy names, so there is nothing to salvage
+        row by row.
+        """
         res = process_batch_csv(self.BATCH_WITHOUT_CONDITION_ID, self.db)
         self.assertEqual(res["add_count"], 0)
-        self.assertEqual(res["skipped_count"], 1)
         self.assertEqual(self.db.get_stats()["total_cards"], 0)
+        message = " ".join(log["message"] for log in res["logs"])
+        self.assertIn("ConditionID", message)
+        # The diagnosis has to name the fix, not just the symptom.
+        self.assertIn("export_eBay_", message)
+
+    def test_a_blank_condition_id_in_a_present_column_skips_that_row(self):
+        """
+        The column exists but a row's value is missing: that is a per-row
+        problem, and the rest of the file is still usable.
+        """
+        batch = (
+            '"Set","Name","Market Price","Condition","Printing","Quantity","*ConditionID"\n'
+            '"Chilling Reign","Deerling","0.17","NM","Normal",1,""\n'
+            '"Chilling Reign","Snover","0.17","NM","Normal",1,"4000"\n'
+        )
+        res = process_batch_csv(batch, self.db)
+        self.assertEqual(res["skipped_count"], 1)
+        self.assertEqual(res["add_count"], 1)
         self.assertTrue(
             any("ConditionID" in log["message"] for log in res["logs"]),
-            "the skip reason should name the missing column",
+            "the skip reason should name the missing value",
         )
 
     def test_row_without_condition_is_skipped(self):
@@ -2577,13 +2603,17 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 
     # -- skipped rows must never look like sold-out cards -------------------
 
+    # The ConditionID column is present but empty on every row. That keeps
+    # this exercising the reconciliation guard: an export missing the column
+    # entirely is now refused up front as the wrong SortSwift export, which
+    # would never reach the per-row skips this test is about.
     NO_CONDITION_ID_DUMP = (
         '"Game","Set","Card Number","Name","Market Price","Condition",'
-        '"Language","Printing","Quantity","Remarks"' + chr(10)
+        '"Language","Printing","Quantity","Remarks","*ConditionID"' + chr(10)
         + '"Pokemon","Chilling Reign","004/198","Ledyba","0.30","NM",'
-          '"English","Normal",2,"Bin A-1"' + chr(10)
+          '"English","Normal",2,"Bin A-1",""' + chr(10)
         + '"Pokemon","Chilling Reign","006/198","Heracross","0.40","NM",'
-          '"English","Normal",2,"Bin A-2"' + chr(10)
+          '"English","Normal",2,"Bin A-2",""' + chr(10)
     )
 
     def test_an_unparseable_dump_never_zeroes_live_listings(self):
