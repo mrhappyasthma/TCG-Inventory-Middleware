@@ -2986,7 +2986,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 
         second = refresh_market_prices(self.db, fetcher=self._fake_feed(prices))
         self.assertTrue(second["skipped"])
-        self.assertEqual(self.feed_calls, ["../last-updated.txt"])
+        self.assertEqual(self.feed_calls, ["/last-updated.txt"])
 
         # force overrides the gate, for when a price looks wrong.
         third = refresh_market_prices(self.db, fetcher=self._fake_feed(prices),

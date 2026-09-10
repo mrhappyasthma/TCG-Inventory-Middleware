@@ -2339,6 +2339,10 @@ async function fetchEbayListings() {
     const tbody = document.getElementById("ebayListingsTableBody");
     const summary = document.getElementById("ebayListingsSummary");
     if (!tbody) return;
+    // Cover photos here are hover targets too, and this table has its own
+    // render path. initCardPreview is idempotent.
+    initCardPreview();
+    hideCardPreview();
 
     try {
         const res = await fetch("/api/ebay-listings");
@@ -2392,7 +2396,9 @@ async function fetchEbayListings() {
                         <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${liveBadge}">${l.live_quantity}</span>
                     </td>
                     <td class="py-3 px-4">
-                        <button onclick="openCoverModal('${escapeHtml(l.ebay_parent_id)}')" class="flex items-center gap-2 text-left group/cover" title="${l.cover_image_url ? escapeHtml(l.cover_image_url) : "No cover photo recorded. Click to set one."}">
+                        <button onclick="openCoverModal('${escapeHtml(l.ebay_parent_id)}')" class="flex items-center gap-2 text-left group/cover"
+                            ${l.cover_image_url ? `data-card-image="${escapeHtml(l.cover_image_url)}"` : ""}
+                            title="${l.cover_image_url ? escapeHtml(l.cover_image_url) : "No cover photo recorded. Click to set one."}">
                             ${l.cover_image_url
                                 ? `<img src="${escapeHtml(l.cover_image_url)}" alt="" class="w-8 h-8 rounded object-cover border border-slate-700 bg-dark-900" onerror="this.style.display='none'">`
                                 : `<span class="w-8 h-8 rounded border border-dashed border-slate-700 flex items-center justify-center text-slate-600 text-[10px]">?</span>`}
@@ -2637,6 +2643,7 @@ function draftCoverControl(group) {
     return `
         <button type="button" onclick="event.preventDefault();event.stopPropagation();openDraftCoverPrompt(${JSON.stringify(group.group_key)})"
             class="shrink-0 flex items-center gap-2 px-2 py-1 rounded-lg border ${staged ? "border-brand-500 bg-brand-600/15" : "border-slate-700 bg-dark-900/60"} hover:border-accent-cyan transition-colors"
+            ${url ? `data-card-image="${escapeHtml(url)}"` : ""}
             title="${escapeHtml(title)}">
             ${url
                 ? `<img src="${escapeHtml(url)}" alt="" class="block h-8 w-auto rounded border border-slate-700 bg-dark-900" onerror="this.style.visibility='hidden'">`

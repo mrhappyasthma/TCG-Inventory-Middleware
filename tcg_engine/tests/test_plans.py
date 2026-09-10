@@ -466,5 +466,52 @@ class ApprovalTests(unittest.TestCase):
             plan_blockers(self.db, 999)
 
 
+class TcgcsvUrlTests(unittest.TestCase):
+    """
+    The URLs the price feed builds.
+
+    ``last-updated.txt`` lives at the site root while everything else sits
+    under ``/tcgplayer``. Expressing that as a relative "../last-updated.txt"
+    did not work: urllib sends "..", it is not normalised, and TCGCSV answered
+    404 -- so the gate that makes a same-day refresh cost one request instead
+    of one per set was failing on every run, silently turning the cheap path
+    into the expensive one.
+    """
+
+    def built_urls(self, call):
+        import tcg_engine.pricing_feed as pf
+
+        seen = []
+        real_get, real_sleep = pf._http_get, pf.time.sleep
+        pf._http_get = lambda url: (seen.append(url), "2026-01-01T00:00:00+0000")[1]
+        pf.time.sleep = lambda _s: None
+        try:
+            call(pf)
+        finally:
+            pf._http_get, pf.time.sleep = real_get, real_sleep
+        return seen
+
+    def test_the_snapshot_timestamp_is_read_from_the_site_root(self):
+        urls = self.built_urls(lambda pf: pf.fetch_last_updated())
+        self.assertEqual(urls, ["https://tcgcsv.com/last-updated.txt"])
+
+    def test_catalogue_paths_keep_the_tcgplayer_prefix(self):
+        urls = self.built_urls(lambda pf: pf.default_fetcher("3/groups"))
+        self.assertEqual(urls, ["https://tcgcsv.com/tcgplayer/3/groups"])
+
+    def test_no_built_url_contains_a_relative_segment(self):
+        # The specific defect: a ".." that never resolves because it is sent
+        # rather than normalised.
+        urls = self.built_urls(
+            lambda pf: (
+                pf.fetch_last_updated(),
+                pf.default_fetcher("3/groups"),
+                pf.default_fetcher("3/2464/prices"),
+            )
+        )
+        for url in urls:
+            self.assertNotIn("..", url)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,11 @@ from .db import (
     apply_pricing_rules,
 )
 
-TCGCSV_BASE = "https://tcgcsv.com/tcgplayer"
+# The catalogue and price endpoints live under /tcgplayer; the daily
+# snapshot timestamp lives at the site root. Both are needed, so both are
+# named rather than one being derived from the other with "..".
+TCGCSV_ROOT = "https://tcgcsv.com"
+TCGCSV_BASE = f"{TCGCSV_ROOT}/tcgplayer"
 POKEMON_CATEGORY_ID = 3
 
 # Identifies this application, as TCGCSV requires. A generic urllib header
@@ -77,9 +81,22 @@ def _http_get(url: str) -> str:
 
 
 def default_fetcher(path: str) -> str:
-    """Fetch one TCGCSV path, spacing requests as their docs ask."""
+    """
+    Fetch one TCGCSV path, spacing requests as their docs ask.
+
+    A path beginning "/" is taken from the site root rather than from the
+    ``/tcgplayer`` prefix. That distinction exists because ``last-updated.txt``
+    lives at the root while everything else is under the prefix -- and the
+    previous attempt to express it, a relative "../last-updated.txt", was sent
+    literally: urllib does not normalise "..", so TCGCSV received
+    "/tcgplayer/../last-updated.txt" and answered 404. The gate that is
+    supposed to make a same-day refresh cost one request was therefore failing
+    on every run.
+    """
     time.sleep(REQUEST_SPACING_SECONDS)
-    return _http_get(f"{TCGCSV_BASE}/{path.lstrip('/')}")
+    if path.startswith("/"):
+        return _http_get(f"{TCGCSV_ROOT}{path}")
+    return _http_get(f"{TCGCSV_BASE}/{path}")
 
 
 def _json_results(payload: str, what: str) -> List[Dict[str, Any]]:
@@ -102,7 +119,7 @@ def fetch_last_updated(fetcher: Callable[[str], str] = default_fetcher) -> str:
     Checked before anything else so a refresh on an already-current day costs
     exactly one request instead of one per set.
     """
-    return fetcher("../last-updated.txt").strip()
+    return fetcher("/last-updated.txt").strip()
 
 
 def refresh_group_index(
