@@ -103,6 +103,20 @@ class EbayConfig:
                 return environment
         return None
 
+    def cert_id_environment(self) -> Optional[str]:
+        """
+        Which environment the Cert ID says it belongs to, if it says.
+
+        A Cert ID is prefixed rather than infixed -- "PRD-a1b2..." or
+        "SBX-a1b2..." -- so this checks the start. Only ever the marker is
+        used; the value itself is a secret and must not be echoed anywhere.
+        """
+        upper = (self.client_secret or "").upper()
+        for marker, environment in _APP_ID_ENVIRONMENT_MARKERS:
+            if upper.startswith(marker.strip("-") + "-"):
+                return environment
+        return None
+
     def environment_mismatch(self) -> Optional[str]:
         """
         A description of an environment/credential mismatch, or None.
@@ -111,13 +125,33 @@ class EbayConfig:
         raising at construction time turns every status check into a 500 and
         reports the integration as unconfigured -- which is the opposite of
         the diagnosis. Reporting it lets the dashboard say the actual cause.
+
+        The pair is checked before either half against the configured
+        environment, because a production App ID with a sandbox Cert ID is a
+        different fix -- fetch the other Cert ID -- from either value simply
+        disagreeing with EBAY_ENVIRONMENT.
         """
-        declared = self.app_id_environment()
-        if declared and declared != self.environment:
+        app_env = self.app_id_environment()
+        cert_env = self.cert_id_environment()
+
+        if app_env and cert_env and app_env != cert_env:
+            return (
+                f"The App ID is a {app_env} keyset but the Cert ID is a "
+                f"{cert_env} one. They must come from the same keyset: copy "
+                f"the Cert ID from the {app_env} block on the Application "
+                f"Keysets page."
+            )
+        if app_env and app_env != self.environment:
             return (
                 f"EBAY_ENVIRONMENT is {self.environment!r} but the App ID is a "
-                f"{declared} keyset. Credentials are not interchangeable "
-                f"between environments; set EBAY_ENVIRONMENT={declared}."
+                f"{app_env} keyset. Credentials are not interchangeable "
+                f"between environments; set EBAY_ENVIRONMENT={app_env}."
+            )
+        if cert_env and cert_env != self.environment:
+            return (
+                f"EBAY_ENVIRONMENT is {self.environment!r} but the Cert ID is a "
+                f"{cert_env} credential; set EBAY_ENVIRONMENT={cert_env} or use "
+                f"the {self.environment} Cert ID."
             )
         return None
 

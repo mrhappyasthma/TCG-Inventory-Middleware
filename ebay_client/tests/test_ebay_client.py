@@ -123,6 +123,55 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("production", message)
         self.assertEqual(config.app_id_environment(), "production")
 
+    def test_a_production_app_id_with_a_sandbox_cert_id_is_reported(self):
+        """
+        The real misconfiguration this check was written for.
+
+        Both halves carry the marker, EBAY_ENVIRONMENT agreed with the App ID,
+        and eBay still answered "client authentication failed" -- because the
+        Cert ID came from the other keyset. Checking only the App ID missed it.
+        """
+        config = make_config(
+            client_id="MarkKlar-PokemonI-PRD-25fddd70c-24ee0a2c",
+            client_secret="SBX-5fea985bb357-9ca3-4765-aca9-53bc",
+            environment="production",
+        )
+        message = config.environment_mismatch()
+        self.assertIsNotNone(message)
+        self.assertIn("same keyset", message)
+        self.assertEqual(config.cert_id_environment(), "sandbox")
+        # The message is rendered in the dashboard, so it must not carry the
+        # secret it is complaining about.
+        self.assertNotIn("5fea985bb357", message)
+
+    def test_the_pair_mismatch_is_reported_before_the_environment_one(self):
+        # Different fixes: fetch the other Cert ID, versus change
+        # EBAY_ENVIRONMENT. The more specific diagnosis has to win.
+        message = make_config(
+            client_id="MarkKlar-PokemonI-PRD-abc",
+            client_secret="SBX-def",
+            environment="sandbox",
+        ).environment_mismatch()
+        self.assertIn("same keyset", message)
+
+    def test_a_matching_pair_reports_no_mismatch(self):
+        self.assertIsNone(
+            make_config(
+                client_id="MarkKlar-PokemonI-PRD-abc",
+                client_secret="PRD-def",
+                environment="production",
+            ).environment_mismatch()
+        )
+
+    def test_a_cert_id_alone_disagreeing_with_the_environment_is_reported(self):
+        message = make_config(
+            client_id="opaque-app-id",
+            client_secret="SBX-def",
+            environment="production",
+        ).environment_mismatch()
+        self.assertIsNotNone(message)
+        self.assertIn("Cert ID", message)
+
     def test_a_matching_app_id_reports_no_mismatch(self):
         self.assertIsNone(
             make_config(
