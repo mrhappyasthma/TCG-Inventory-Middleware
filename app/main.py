@@ -89,15 +89,50 @@ from tcg_engine.plans import (
 # Submodule imports, not the package root: the project root is on sys.path and
 # the outer ebay_client/ directory shadows the installed package there as an
 # empty namespace package. See AGENTS.md section 2.
-from ebay_client.client import EbayClient
-from ebay_client.config import EbayConfig
-from ebay_client.errors import EbayError, SignatureError
-from ebay_client.notifications import (
-    SIGNATURE_HEADER,
-    challenge_response,
-    payload_topic,
-    verify_signature,
-)
+#
+# Guarded, because the eBay integration is optional and must degrade rather
+# than take the dashboard with it. This is not hypothetical: the package was
+# listed in requirements.txt as an editable install, the Dockerfile strips
+# every '-e' line before installing, and the resulting ImportError stopped the
+# container from starting at all -- so a one-line packaging omission cost the
+# entire site, including endpoints with nothing to do with eBay. An
+# unimportable library is the same situation as an unconfigured one, and now
+# behaves the same way.
+try:
+    from ebay_client.client import EbayClient
+    from ebay_client.config import EbayConfig
+    from ebay_client.errors import EbayError, SignatureError
+    from ebay_client.notifications import (
+        SIGNATURE_HEADER,
+        challenge_response,
+        payload_topic,
+        verify_signature,
+    )
+
+    EBAY_CLIENT_AVAILABLE = True
+except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
+    print(
+        "[ebay] ebay_client could not be imported, so every eBay feature is "
+        f"disabled. The rest of the app is unaffected: {_ebay_import_error}",
+        flush=True,
+    )
+    EBAY_CLIENT_AVAILABLE = False
+
+    class _EbayUnavailable(Exception):
+        """
+        Stands in for the library's exception types.
+
+        The endpoints below catch EbayError and SignatureError by name, and an
+        `except None` is a TypeError at handling time -- which would turn a
+        missing library into a 500 at exactly the moment we are trying to
+        degrade gracefully.
+        """
+
+    EbayClient = None
+    EbayConfig = None
+    EbayError = SignatureError = _EbayUnavailable
+    SIGNATURE_HEADER = "x-ebay-signature"
+    challenge_response = payload_topic = verify_signature = None
 
 try:
     from app.user_db import UserDatabase
@@ -148,6 +183,8 @@ def get_ebay_client():
     themselves, which reads better than a stack trace about a missing key.
     """
     global _ebay_client
+    if not EBAY_CLIENT_AVAILABLE:
+        return None
     if _ebay_client is None and EbayConfig.is_configured():
         _ebay_client = EbayClient(EbayConfig.from_env())
     return _ebay_client
@@ -1484,6 +1521,7 @@ def ebay_notification_challenge(challenge_code: str = ""):
     missing = [
         name
         for name, value in (
+            ("the ebay_client library", EBAY_CLIENT_AVAILABLE),
             ("EBAY_VERIFICATION_TOKEN", EBAY_VERIFICATION_TOKEN),
             ("EBAY_NOTIFICATION_ENDPOINT", EBAY_NOTIFICATION_ENDPOINT),
         )
@@ -1493,10 +1531,10 @@ def ebay_notification_challenge(challenge_code: str = ""):
         # Deliberately vague to an unauthenticated caller; the detail goes to
         # the log, matching how /api/health handles its failures.
         print(
-            "[ebay] notification challenge received but "
+            "[ebay] notification challenge received but missing: "
             + ", ".join(missing)
-            + " unset. The endpoint must be the public URL exactly as entered "
-            "in eBay's console, because the challenge hashes that string.",
+            + ". The endpoint must be the public URL exactly as entered in "
+            "eBay's console, because the challenge hashes that string.",
             flush=True,
         )
         raise HTTPException(

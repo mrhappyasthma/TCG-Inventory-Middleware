@@ -9,7 +9,7 @@
   ```powershell
   python -m unittest discover -s tcg_engine/tests
   python -m unittest discover -s ebay_client/tests -t ebay_client
-  python -m unittest tests/test_web_app.py
+  python -m unittest discover -s tests
   ```
   The `-t ebay_client` is required, not cosmetic: run from the project root
   without it, the outer `ebay_client/` directory shadows the installed package

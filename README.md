@@ -306,10 +306,23 @@ Open `http://localhost:8080`. Browsing via `http://127.0.0.1:8080` also works, b
 # Run standalone engine unit tests
 python -m unittest discover -s tcg_engine/tests
 
-# Run web app & API integration tests
-python -m unittest tests/test_web_app.py
+# Run the eBay client library's tests. The -t is required, not cosmetic:
+# without it the outer ebay_client/ directory shadows the installed package.
+python -m unittest discover -s ebay_client/tests -t ebay_client
+
+# Run web app, API integration and deployment tests
+python -m unittest discover -s tests
 ```
-The web tests stub Google token verification, so they need no network access and no real credentials.
+The web tests stub Google token verification and the eBay client's tests inject
+an HTTP opener, so nothing needs network access or real credentials.
+
+`tests/test_deployment.py` guards the *packaging* rather than the code. It
+asserts that every editable install in `requirements.txt` is also copied and
+pip-installed by the `Dockerfile`, and it boots the app in a subprocess — once
+normally, and once with `ebay_client` deliberately unimportable — to confirm
+the dashboard survives a missing optional dependency. Both checks exist because
+a local package listed only as `-e ./ebay_client` was silently absent from the
+image, and the resulting `ImportError` took the whole site down with a 502.
 
 ---
 
