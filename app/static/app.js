@@ -2571,6 +2571,7 @@ function renderDraftPlan(detail) {
                             &middot; ${group.proposed_copies} cop${group.proposed_copies === 1 ? "y" : "ies"} proposed
                         </p>
                     </div>
+                    ${draftCoverControl(group)}
                     ${invalid ? `<span class="shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-950/80 text-amber-300 border border-amber-800">Needs attention</span>` : ""}
                 </summary>
                 <div class="overflow-x-auto">
@@ -2611,6 +2612,76 @@ function renderDraftPlan(detail) {
         approve.title = blocked
             ? "Fix or leave out the flagged cards first"
             : (included.length ? "Approve this draft" : "Every card is left out");
+    }
+}
+
+// The listing's cover photo, editable from the group header.
+//
+// A cover belongs to the listing rather than to any card in it, so it lives on
+// the plan's group. The control shows the staged choice if one has been made,
+// otherwise whatever the live listing already carries -- so an untouched
+// listing shows its real picture rather than an empty frame, and a change is
+// visibly a change.
+//
+// Not a hover-preview target: the header is a <summary>, so pointing at it is
+// already how you collapse the section, and stacking a preview on that reads
+// as a misclick waiting to happen.
+function draftCoverControl(group) {
+    const staged = group.cover_is_staged;
+    const url = group.cover_image_url || "";
+    const isNewListing = !group.ebay_parent_id;
+    const title = isNewListing
+        ? "This listing does not exist yet, so the cover applies when it is created."
+        : "Revising the cover replaces the listing's whole picture set on eBay.";
+
+    return `
+        <button type="button" onclick="event.preventDefault();event.stopPropagation();openDraftCoverPrompt(${JSON.stringify(group.group_key)})"
+            class="shrink-0 flex items-center gap-2 px-2 py-1 rounded-lg border ${staged ? "border-brand-500 bg-brand-600/15" : "border-slate-700 bg-dark-900/60"} hover:border-accent-cyan transition-colors"
+            title="${escapeHtml(title)}">
+            ${url
+                ? `<img src="${escapeHtml(url)}" alt="" class="block h-8 w-auto rounded border border-slate-700 bg-dark-900" onerror="this.style.visibility='hidden'">`
+                : `<span class="block w-6 h-8 rounded border border-dashed border-slate-700"></span>`}
+            <span class="text-[10px] font-semibold ${staged ? "text-brand-400" : "text-slate-400"}">
+                ${staged ? "Cover changed" : (url ? "Cover" : "Set cover")}
+            </span>
+        </button>`;
+}
+
+async function openDraftCoverPrompt(groupKey) {
+    if (!currentDraftPlan || !currentDraftPlan.plan) return;
+    const group = (currentDraftPlan.groups || []).find(g => g.group_key === groupKey);
+    // Seeded with the staged or current cover, falling back to a card's own
+    // picture -- which is usually what you want for a brand-new listing and
+    // saves pasting a URL by hand.
+    const seed = (group && (group.cover_image_url || group.first_card_image)) || "";
+    const entered = prompt(
+        "Cover photo URL for this listing.
+
+"
+        + "eBay replaces the listing's whole picture set when this is revised.
+"
+        + "Leave empty to keep whatever the listing already has.",
+        seed
+    );
+    if (entered === null) return;
+
+    try {
+        const res = await fetch(`/api/plans/${currentDraftPlan.plan.id}/cover`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ group_key: groupKey, cover_image_url: entered.trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not set the cover photo");
+        logToTerminal(
+            "INFO",
+            entered.trim()
+                ? `[DRAFTS] Cover staged for ${groupKey}`
+                : `[DRAFTS] Cover choice cleared for ${groupKey}`
+        );
+        await fetchDraftPlan();
+    } catch (err) {
+        logToTerminal("ERROR", `[DRAFTS] Cover photo failed: ${err.message}`);
     }
 }
 
@@ -2820,6 +2891,31 @@ async function approveDraftPlan() {
             "SUCCESS",
             `Draft ${planId} approved: ${data.approved_items} change(s) cleared to push`
         );
+
+        // Cover photos are the one part of an approved plan that can already
+        // be applied today, via a File Exchange Revise file. Offered rather
+        // than auto-downloaded, matching how the other generated files work.
+        const stagedCovers = (currentDraftPlan.groups || []).filter(
+            g => g.cover_is_staged && g.ebay_parent_id
+        );
+        if (stagedCovers.length) {
+            logToTerminal(
+                "SUCCESS",
+                `[DRAFTS] ${stagedCovers.length} cover photo change(s) ready: `
+                + `download /api/plans/${planId}/cover-revise.csv and upload it `
+                + `to Seller Hub. Revising a cover replaces the listing's whole `
+                + `picture set.`
+            );
+            const footer = document.getElementById("draftSummary");
+            if (footer) {
+                footer.insertAdjacentHTML(
+                    "afterend",
+                    `<p class="mt-2"><a href="/api/plans/${planId}/cover-revise.csv"
+                        class="text-accent-cyan underline decoration-dotted text-[11px]"
+                        download>Download cover photo Revise file (${stagedCovers.length})</a></p>`
+                );
+            }
+        }
         await fetchDraftPlan();
     } catch (err) {
         logToTerminal("ERROR", `Approval failed: ${err.message}`);

@@ -73,6 +73,7 @@ from tcg_engine.orders import (
 from tcg_engine.batches import (
     process_batch_csv,
     build_cover_photo_revise_csv,
+    build_cover_photo_revise_rows,
     QUANTITY_MODE_SET,
     QUANTITY_MODES,
 )
@@ -2048,6 +2049,93 @@ def update_plan_item_endpoint(
         "problems": problems,
         "blockers": plan_blockers(db, item["plan_id"]),
     }
+
+
+class PlanCoverRequest(BaseModel):
+    group_key: str
+    cover_image_url: str = ""
+
+
+@app.post("/api/plans/{plan_id}/cover")
+def set_plan_cover(
+    plan_id: int,
+    req: PlanCoverRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Stage a cover photo for one listing in a draft.
+
+    Stored against the plan rather than written to ebay_listing_overrides,
+    because that table is what the store currently has -- writing there would
+    apply the change before it was approved. An empty URL clears the staged
+    choice and the page falls back to showing the live listing's own picture.
+    """
+    plan = db.get_plan(plan_id)
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan["status"] != "draft":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This plan is {plan['status']} and can no longer be edited.",
+        )
+
+    url = req.cover_image_url.strip()
+    if url and not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="A cover photo must be an http:// or https:// URL that eBay can fetch.",
+        )
+
+    db.set_plan_group_cover(plan_id, req.group_key, url)
+    return {
+        "success": True,
+        "groups": db.get_plan_groups(plan_id),
+    }
+
+
+@app.get("/api/plans/{plan_id}/cover-revise.csv")
+def download_plan_cover_revise(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """
+    The cover-photo Revise file for an approved plan.
+
+    Approved only: the file exists to be uploaded, and generating it from a
+    draft would hand out something that had not been authorised.
+
+    Note that revising PicURL replaces a listing's whole picture set rather
+    than adding to it, which is why this is a deliberate, separate file rather
+    than something folded silently into another export.
+    """
+    plan = db.get_plan(plan_id)
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan["status"] == "draft":
+        raise HTTPException(
+            status_code=409,
+            detail="Approve the draft before downloading its files.",
+        )
+
+    rows = db.get_plan_cover_revisions(plan_id)
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No cover photo changes in this plan apply to an existing "
+                "listing. A cover for a listing that does not exist yet is "
+                "carried into its creation instead."
+            ),
+        )
+    csv_content = build_cover_photo_revise_rows(rows)
+    return StreamingResponse(
+        io.StringIO(csv_content),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="ebay_cover_photos_plan_{plan_id}.csv"'
+            )
+        },
+    )
 
 
 @app.post("/api/plans/{plan_id}/approve")

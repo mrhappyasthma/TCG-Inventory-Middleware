@@ -526,17 +526,23 @@ class TestWebApp(unittest.TestCase):
         import os
         from app.main import _asset_version, static_dir
 
+        # Binary, deliberately. This test rewrites a real source file, and
+        # reading as text translates CRLF to \n while writing back with
+        # newline="" does not translate it back -- so on a CRLF working copy
+        # the "restore" silently converted app.js to LF, the hash no longer
+        # matched, and the file was left modified. _asset_version hashes
+        # bytes, so the test has to preserve bytes.
         path = os.path.join(static_dir, "app.js")
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, "rb") as handle:
             original = handle.read()
 
         before = _asset_version("/static/app.js")
         try:
-            with open(path, "w", encoding="utf-8", newline="") as handle:
-                handle.write(original + chr(10) + "// touched by a test" + chr(10))
+            with open(path, "wb") as handle:
+                handle.write(original + b"\n// touched by a test\n")
             self.assertNotEqual(_asset_version("/static/app.js"), before)
         finally:
-            with open(path, "w", encoding="utf-8", newline="") as handle:
+            with open(path, "wb") as handle:
                 handle.write(original)
         self.assertEqual(_asset_version("/static/app.js"), before,
                          "restoring the file must restore the hash")
@@ -1005,7 +1011,83 @@ class TestWebApp(unittest.TestCase):
             main._ebay_client = saved_client
             main.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
 
-    def test_39b_inventory_rows_carry_the_card_image(self):
+    def test_39a_a_draft_cover_photo_is_staged_not_applied(self):
+        """
+        A cover chosen in a draft must not reach ebay_listing_overrides until
+        the plan is approved -- that table is what the store currently has, so
+        writing to it would apply the change before it was authorised.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        groups = self.client.get(f"/api/plans/{plan_id}").json()["groups"]
+        if not groups:
+            self.skipTest("no groups in the current draft")
+        group_key = groups[0]["group_key"]
+
+        res = self.client.post(
+            f"/api/plans/{plan_id}/cover",
+            json={
+                "group_key": group_key,
+                "cover_image_url": "https://cdn.example.com/cover.jpg",
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        staged = next(
+            g for g in res.json()["groups"] if g["group_key"] == group_key
+        )
+        self.assertEqual(staged["cover_image_url"], "https://cdn.example.com/cover.jpg")
+        self.assertTrue(staged["cover_is_staged"])
+
+        # The live store's own record is untouched.
+        parent = staged.get("ebay_parent_id")
+        if parent:
+            self.assertNotEqual(
+                db.get_listing_cover_image(parent),
+                "https://cdn.example.com/cover.jpg",
+            )
+
+        # Clearing falls back rather than storing a blank.
+        cleared = self.client.post(
+            f"/api/plans/{plan_id}/cover",
+            json={"group_key": group_key, "cover_image_url": ""},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        after = next(
+            g for g in cleared.json()["groups"] if g["group_key"] == group_key
+        )
+        self.assertFalse(after["cover_is_staged"])
+
+    def test_39b_a_cover_url_must_be_fetchable_by_ebay(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        groups = self.client.get(f"/api/plans/{plan_id}").json()["groups"]
+        if not groups:
+            self.skipTest("no groups in the current draft")
+        res = self.client.post(
+            f"/api/plans/{plan_id}/cover",
+            json={
+                "group_key": groups[0]["group_key"],
+                # eBay fetches the picture itself, so a local path is useless
+                # to it and would fail at upload rather than here.
+                "cover_image_url": "C:\\Users\\Mark\\Desktop\\card.jpg",
+            },
+        )
+        self.assertEqual(res.status_code, 400)
+
+    def test_39c_the_cover_file_is_only_available_after_approval(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        # A draft's files would be something that had not been authorised.
+        res = self.client.get(f"/api/plans/{plan_id}/cover-revise.csv")
+        self.assertEqual(res.status_code, 409)
+
+    def test_39d_inventory_rows_carry_the_card_image(self):
         """
         The dashboard's hover preview needs cdn_image on every inventory row.
 

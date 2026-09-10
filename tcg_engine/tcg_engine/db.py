@@ -384,6 +384,26 @@ class Database:
                 ON listing_plan_item(plan_id, group_key);
                 """
             )
+            # Listing-level decisions staged alongside a plan's items. A cover
+            # photo belongs to the listing, not to any one card in it, so it
+            # cannot live on listing_plan_item.
+            #
+            # Plan-scoped rather than written straight to
+            # ebay_listing_overrides: that table is what the store currently
+            # has, and writing there would apply the change before it was
+            # approved -- exactly the gate this whole design exists to keep.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS listing_plan_group (
+                    plan_id INTEGER NOT NULL,
+                    group_key TEXT NOT NULL,
+                    cover_image_url TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (plan_id, group_key),
+                    FOREIGN KEY (plan_id) REFERENCES listing_plan(id) ON DELETE CASCADE
+                );
+                """
+            )
             # Only one plan may be open at a time per user. Two concurrent
             # drafts against the same cards would each be computed against
             # state the other is about to change, and approving both would
@@ -2369,16 +2389,116 @@ class Database:
                            AS invalid_count,
                        SUM(COALESCE(i.proposed_qty, 0)) AS proposed_copies,
                        MIN(m.set_name) AS set_name,
-                       MIN(m.condition) AS condition
+                       MIN(m.condition) AS condition,
+                       -- The listing this group maps onto, when it already
+                       -- exists. NULL means the plan would create it, and a
+                       -- cover then applies at creation rather than as a
+                       -- revision.
+                       MAX(NULLIF(TRIM(COALESCE(v.ebay_parent_id, '')), ''))
+                           AS ebay_parent_id,
+                       -- The staged cover if one has been chosen, otherwise
+                       -- whatever the live listing already carries, so the
+                       -- drafts page shows the current picture rather than an
+                       -- empty frame.
+                       COALESCE(
+                           NULLIF(TRIM(COALESCE(g.cover_image_url, '')), ''),
+                           MAX(NULLIF(TRIM(COALESCE(o.cover_image_url, '')), ''))
+                       ) AS cover_image_url,
+                       CASE WHEN NULLIF(TRIM(COALESCE(g.cover_image_url, '')), '')
+                                 IS NOT NULL THEN 1 ELSE 0 END AS cover_is_staged,
+                       -- A card's own picture, used as the fallback suggestion
+                       -- when nothing has been chosen for the listing.
+                       MIN(NULLIF(TRIM(COALESCE(m.cdn_image, '')), ''))
+                           AS first_card_image
                 FROM listing_plan_item i
                 JOIN manifest m ON m.manifest_id = i.manifest_id
+                LEFT JOIN ebay_variations v ON v.manifest_id = i.manifest_id
+                LEFT JOIN ebay_listing_overrides o
+                       ON o.ebay_parent_id = v.ebay_parent_id
+                LEFT JOIN listing_plan_group g
+                       ON g.plan_id = i.plan_id
+                      AND g.group_key = COALESCE(i.group_key, '')
                 WHERE i.plan_id = ?
-                GROUP BY COALESCE(i.group_key, '')
+                GROUP BY COALESCE(i.group_key, ''), g.cover_image_url
                 ORDER BY COALESCE(i.group_key, '')
                 """,
                 (int(plan_id),),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def set_plan_group_cover(
+        self, plan_id: int, group_key: str, cover_image_url: Optional[str]
+    ) -> None:
+        """
+        Stage a cover photo for one listing in a plan.
+
+        An empty URL clears the staged choice rather than storing a blank,
+        so the drafts page falls back to showing what the live listing
+        already carries instead of claiming the cover was removed. Removing a
+        photo from a live listing is a different operation, and eBay treats a
+        PicURL revision as replacing the whole picture set.
+        """
+        cleaned = str(cover_image_url or "").strip()
+        with self.get_connection() as conn:
+            if not cleaned:
+                conn.execute(
+                    "DELETE FROM listing_plan_group WHERE plan_id = ? AND group_key = ?",
+                    (int(plan_id), group_key),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO listing_plan_group
+                        (plan_id, group_key, cover_image_url, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(plan_id, group_key) DO UPDATE SET
+                        cover_image_url = excluded.cover_image_url,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (int(plan_id), group_key, cleaned),
+                )
+            conn.commit()
+
+    def get_plan_cover_revisions(self, plan_id: int) -> List[Dict[str, Any]]:
+        """
+        Staged covers that can be applied to an existing listing.
+
+        Restricted to groups that map onto a live listing, because a cover for
+        a listing that does not exist yet is carried into its creation rather
+        than revised onto it. Also skips a staged URL identical to what the
+        listing already has: eBay ignores a PicURL it already holds, so the row
+        would be a no-op that still costs an upload.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT g.group_key,
+                       g.cover_image_url,
+                       MAX(NULLIF(TRIM(COALESCE(v.ebay_parent_id, '')), ''))
+                           AS ebay_parent_id,
+                       MAX(NULLIF(TRIM(COALESCE(o.cover_image_url, '')), ''))
+                           AS current_cover
+                FROM listing_plan_group g
+                JOIN listing_plan_item i
+                     ON i.plan_id = g.plan_id
+                    AND COALESCE(i.group_key, '') = g.group_key
+                LEFT JOIN ebay_variations v ON v.manifest_id = i.manifest_id
+                LEFT JOIN ebay_listing_overrides o
+                       ON o.ebay_parent_id = v.ebay_parent_id
+                WHERE g.plan_id = ?
+                  AND TRIM(COALESCE(g.cover_image_url, '')) != ''
+                GROUP BY g.group_key, g.cover_image_url
+                ORDER BY g.group_key
+                """,
+                (int(plan_id),),
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+        return [
+            r
+            for r in rows
+            if r["ebay_parent_id"] and r["cover_image_url"] != r["current_cover"]
+        ]
 
     def export_all_manifest(self) -> List[Dict[str, Any]]:
         """Export all master manifest rows."""
