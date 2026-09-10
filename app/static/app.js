@@ -2662,12 +2662,9 @@ async function openDraftCoverPrompt(groupKey) {
     // saves pasting a URL by hand.
     const seed = (group && (group.cover_image_url || group.first_card_image)) || "";
     const entered = prompt(
-        "Cover photo URL for this listing.
-
-"
-        + "eBay replaces the listing's whole picture set when this is revised.
-"
-        + "Leave empty to keep whatever the listing already has.",
+        "Cover photo URL for this listing." + "\n\n"
+            + "eBay replaces the listing's whole picture set when this is revised." + "\n"
+            + "Leave empty to keep whatever the listing already has.",
         seed
     );
     if (entered === null) return;
