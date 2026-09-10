@@ -1544,11 +1544,18 @@ function positionCardPreview(event) {
     box.style.top = `${Math.max(8, top)}px`;
 }
 
-function showCardPreview(url, event) {
+// A card and a listing cover want different sizes: a card has a known
+// physical shape and reads best at it, while a cover photo is any shape at all
+// and only needs to be big enough to recognise. The kind travels on the
+// element rather than being guessed from the image, because the same URL could
+// legitimately be either.
+function showCardPreview(url, event, kind = "card") {
     const box = document.getElementById("cardPreview");
     const img = document.getElementById("cardPreviewImage");
     if (!box || !img || !url) return;
     if (img.getAttribute("src") !== url) img.setAttribute("src", url);
+    box.classList.toggle("preview-cover", kind === "cover");
+    box.classList.toggle("preview-card", kind !== "cover");
     box.classList.add("visible");
     positionCardPreview(event);
 }
@@ -1573,7 +1580,11 @@ function initCardPreview() {
     document.addEventListener("mouseover", (event) => {
         const cell = event.target.closest("[data-card-image]");
         if (!cell) return;
-        showCardPreview(cell.getAttribute("data-card-image"), event);
+        showCardPreview(
+            cell.getAttribute("data-card-image"),
+            event,
+            cell.getAttribute("data-preview-kind") || "card",
+        );
     });
     document.addEventListener("mousemove", (event) => {
         // Cheapest possible guard first: mousemove fires constantly, and
@@ -2397,7 +2408,7 @@ async function fetchEbayListings() {
                     </td>
                     <td class="py-3 px-4">
                         <button onclick="openCoverModal('${escapeHtml(l.ebay_parent_id)}')" class="flex items-center gap-2 text-left group/cover"
-                            ${l.cover_image_url ? `data-card-image="${escapeHtml(l.cover_image_url)}"` : ""}
+                            ${l.cover_image_url ? `data-card-image="${escapeHtml(l.cover_image_url)}" data-preview-kind="cover"` : ""}
                             title="${l.cover_image_url ? escapeHtml(l.cover_image_url) : "No cover photo recorded. Click to set one."}">
                             ${l.cover_image_url
                                 ? `<img src="${escapeHtml(l.cover_image_url)}" alt="" class="w-8 h-8 rounded object-cover border border-slate-700 bg-dark-900" onerror="this.style.display='none'">`
@@ -2644,7 +2655,7 @@ function draftCoverControl(group) {
         <button type="button" data-group-key="${escapeHtml(group.group_key)}"
             onclick="event.preventDefault();event.stopPropagation();openDraftCoverPrompt(this)"
             class="shrink-0 flex items-center gap-2 px-2 py-1 rounded-lg border ${staged ? "border-brand-500 bg-brand-600/15" : "border-slate-700 bg-dark-900/60"} hover:border-accent-cyan transition-colors"
-            ${url ? `data-card-image="${escapeHtml(url)}"` : ""}
+            ${url ? `data-card-image="${escapeHtml(url)}" data-preview-kind="cover"` : ""}
             title="${escapeHtml(title)}">
             ${url
                 ? `<img src="${escapeHtml(url)}" alt="" class="block h-8 w-auto rounded border border-slate-700 bg-dark-900" onerror="this.style.visibility='hidden'">`

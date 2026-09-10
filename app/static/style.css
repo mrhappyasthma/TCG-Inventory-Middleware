@@ -122,23 +122,43 @@ details[open] > summary .caret {
 
 #cardPreview img {
     display: block;
-    /* Both dimensions are bounded rather than the height being set outright.
-     * A trading card is taller than it is wide, so height used to be treated
-     * as the only binding dimension -- but a listing cover photo can be any
-     * shape, and a wide one then overflowed sideways. max-* on both axes with
-     * auto sizing fits any aspect ratio inside the box.
-     *
-     * Sized to be readable rather than impressive: 18rem is about 290px, which
-     * shows a card's art and text clearly without covering the table it is
-     * meant to annotate. The vh/vw terms keep it sane on a small window. */
-    max-height: min(40vh, 18rem);
-    max-width: min(50vw, 18rem);
     height: auto;
     width: auto;
     border-radius: 0.75rem;
     border: 1px solid rgb(51 65 85);
     background: rgb(2 6 23);
     box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.8);
+}
+
+/*
+ * A trading card preview is shown at the size of a real card.
+ *
+ * A standard TCG card is 2.5 x 3.5 inches. CSS defines 1in as exactly 96px,
+ * so "3.5in" is card-sized in CSS terms rather than calibrated to the
+ * monitor's actual DPI -- which is as close as a web page can get, and is
+ * what makes it look right at ordinary zoom levels.
+ *
+ * Height is the binding dimension and width is left to follow, so a scan with
+ * slightly different borders keeps its own aspect ratio instead of being
+ * stretched to a nominal 2.5in.
+ */
+#cardPreview.preview-card img {
+    height: 3.5in;
+    /* Safety only, for a short window or a heavy browser zoom. */
+    max-height: 88vh;
+    max-width: 92vw;
+}
+
+/*
+ * A listing cover photo is any shape at all -- a card, a banner, a photo of a
+ * stack -- so both axes are bounded and neither is set outright. Setting the
+ * height alone let a wide cover overflow sideways.
+ *
+ * 20.7rem is the previous 18rem plus 15%.
+ */
+#cardPreview.preview-cover img {
+    max-height: min(46vh, 20.7rem);
+    max-width: min(55vw, 20.7rem);
 }
 
 /* Cells that have a picture to show. The cursor is the only affordance the
