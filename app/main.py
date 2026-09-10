@@ -113,6 +113,7 @@ try:
         verify_signature,
     )
     from ebay_client.oauth import TokenStore
+    from ebay_client.feed import FeedError, download_active_inventory_report
 
     EBAY_CLIENT_AVAILABLE = True
 except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
@@ -139,6 +140,8 @@ except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
     SIGNATURE_HEADER = "x-ebay-signature"
     challenge_response = payload_topic = verify_signature = None
     TokenStore = object
+    FeedError = _EbayUnavailable
+    download_active_inventory_report = None
 
 try:
     from app.user_db import UserDatabase
@@ -1685,6 +1688,61 @@ def ebay_callback(
         "is pushed.",
         True,
     )
+
+
+@app.post("/api/ebay/sync")
+async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)):
+    """
+    Module B without the manual download: fetch the report from eBay and sync.
+
+    Read-only as far as eBay is concerned. It asks for a report, waits, and
+    downloads it -- the same data the Seller Hub Active Listings report
+    carries, obtained through the Feed API instead of a browser.
+
+    The report is handed to the *existing* CSV parser rather than a new one.
+    Every rule in that parser -- skipping variation parent rows, the manifest
+    lookup, and above all zeroing cards absent from the report -- would
+    otherwise have to be reimplemented and could drift from the upload path.
+
+    Diagnostics come back alongside the result because the exact column names
+    in the Feed report are not something this code has yet seen against a real
+    store; if a column is missing, the headers in the response say which.
+    """
+    client = _require_ebay_client()
+    if not client.oauth.is_connected():
+        raise HTTPException(
+            status_code=409,
+            detail="No eBay account is connected. Connect one first.",
+        )
+
+    def run():
+        report = download_active_inventory_report(client)
+        csv_text = decode_csv_bytes(report["content"])
+        # Captured before parsing: if the sync finds nothing, the headers are
+        # the first thing worth looking at, and by then the reader is spent.
+        first_line = next(
+            (line for line in csv_text.splitlines() if line.strip()), ""
+        )
+        with db.session():
+            result = sync_active_listings_csv(csv_text, db)
+        result["report"] = {
+            "task_id": report["task_id"],
+            "status": report["status"],
+            "bytes": len(report["content"]),
+            "row_count": max(
+                0, len([l for l in csv_text.splitlines() if l.strip()]) - 1
+            ),
+            "headers": [h.strip() for h in first_line.split(",")][:40],
+        }
+        return result
+
+    try:
+        return await run_in_threadpool(run)
+    except FeedError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except EbayError as exc:
+        print(f"[ebay] report sync failed: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail=f"eBay refused the request: {exc}")
 
 
 @app.post("/api/ebay/disconnect")

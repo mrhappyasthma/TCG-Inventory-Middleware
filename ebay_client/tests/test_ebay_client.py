@@ -13,6 +13,7 @@ import json
 import time
 import unittest
 
+from ebay_client import feed
 from ebay_client import (
     ApiError,
     AuthError,
@@ -619,6 +620,129 @@ class VerifySignatureTests(unittest.TestCase):
         body = b'{"ok":true}'
         with self.assertRaises(SignatureError):
             verify_signature(body, self.sign(body), self.cache(""))
+
+
+class FeedReportTests(unittest.TestCase):
+    """
+    The Feed API's asynchronous report flow.
+
+    Used instead of the Inventory API because the Inventory API can only see
+    listings created through it -- a store built with File Exchange has no
+    offers at all -- and instead of GetSellerList because that needs a
+    120-day start-time window and returns XML.
+    """
+
+    def transport(self, *responses):
+        opener = RecordingOpener(*responses)
+        return (
+            Transport(
+                "https://api.example",
+                token_provider=lambda: "tok",
+                opener=opener,
+                sleep=lambda _s: None,
+                spacing=0,
+            ),
+            opener,
+        )
+
+    def test_the_task_id_is_read_from_the_location_header(self):
+        # It is not in the body. Reading the body -- the obvious guess --
+        # yields None and fails confusingly two calls later.
+        transport, _ = self.transport(
+            Response(
+                201,
+                {"Location": "/sell/feed/v1/inventory_task/task-42"},
+                b"",
+            )
+        )
+        self.assertEqual(feed.create_inventory_task(transport), "task-42")
+
+    def test_a_task_id_in_the_body_is_accepted_as_a_fallback(self):
+        transport, _ = self.transport(json_response(201, {"taskId": "task-7"}))
+        self.assertEqual(feed.create_inventory_task(transport), "task-7")
+
+    def test_no_task_id_anywhere_is_an_error(self):
+        transport, _ = self.transport(Response(201, {}, b""))
+        with self.assertRaises(feed.FeedError):
+            feed.create_inventory_task(transport)
+
+    def test_the_requested_feed_type_is_the_active_inventory_report(self):
+        transport, opener = self.transport(
+            Response(201, {"Location": "/x/task-1"}, b"")
+        )
+        feed.create_inventory_task(transport)
+        body = json.loads(opener.calls[0]["body"].decode())
+        self.assertEqual(body["feedType"], "LMS_ACTIVE_INVENTORY_REPORT")
+
+    def test_polling_continues_until_the_task_completes(self):
+        transport, _ = self.transport(
+            json_response(200, {"status": "IN_PROGRESS"}),
+            json_response(200, {"status": "IN_PROGRESS"}),
+            json_response(200, {"status": "COMPLETED"}),
+        )
+        seen = []
+        task = feed.wait_for_task(
+            transport,
+            "task-1",
+            poll_interval=0,
+            sleep=lambda _s: None,
+            on_status=seen.append,
+        )
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertEqual(seen, ["IN_PROGRESS", "COMPLETED"])
+
+    def test_a_partial_report_is_still_usable(self):
+        # COMPLETED_WITH_ERROR produces a file. Refusing it would trade a
+        # partial sync for no sync, which is the worse outcome.
+        transport, _ = self.transport(
+            json_response(200, {"status": "COMPLETED_WITH_ERROR"})
+        )
+        task = feed.wait_for_task(transport, "t", sleep=lambda _s: None)
+        self.assertEqual(task["status"], "COMPLETED_WITH_ERROR")
+
+    def test_a_failed_task_raises(self):
+        transport, _ = self.transport(json_response(200, {"status": "FAILED"}))
+        with self.assertRaises(feed.FeedError):
+            feed.wait_for_task(transport, "t", sleep=lambda _s: None)
+
+    def test_polling_gives_up_rather_than_looping_forever(self):
+        now = [0.0]
+        transport, _ = self.transport(*[json_response(200, {"status": "IN_PROGRESS"})] * 3)
+        with self.assertRaises(feed.FeedError) as caught:
+            feed.wait_for_task(
+                transport,
+                "t",
+                poll_interval=1,
+                timeout=2,
+                sleep=lambda s: now.__setitem__(0, now[0] + s),
+                clock=lambda: now[0],
+            )
+        self.assertIn("try again", str(caught.exception))
+
+    def test_a_gzipped_report_is_decompressed(self):
+        import gzip
+
+        payload = b"ItemID,SKU,Quantity,Price\n1234,ID1001,3,2.50\n"
+        transport, _ = self.transport(
+            Response(200, {}, gzip.compress(payload))
+        )
+        self.assertEqual(feed.get_result_file(transport, "t"), payload)
+
+    def test_a_zipped_report_is_decompressed(self):
+        import io as _io
+        import zipfile as _zip
+
+        payload = b"ItemID,SKU\n1,ID1001\n"
+        buffer = _io.BytesIO()
+        with _zip.ZipFile(buffer, "w") as archive:
+            archive.writestr("report.csv", payload)
+        self.assertEqual(feed.decompress(buffer.getvalue()), payload)
+
+    def test_a_plain_report_passes_through(self):
+        self.assertEqual(feed.decompress(b"ItemID,SKU\n"), b"ItemID,SKU\n")
+
+    def test_an_empty_payload_is_empty_rather_than_an_error(self):
+        self.assertEqual(feed.decompress(b""), b"")
 
 
 class PayloadTopicTests(unittest.TestCase):

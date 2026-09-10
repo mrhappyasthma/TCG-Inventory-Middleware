@@ -139,12 +139,18 @@ class Transport:
         payload: Any = None,
         extra_headers: Optional[Dict[str, str]] = None,
         authenticated: bool = True,
+        raw: bool = False,
     ) -> Any:
         """
         Make one call and return its decoded body, or raise a typed error.
 
         Returns ``None`` for the empty bodies eBay sends on 204, which several
         of its write calls do on success.
+
+        ``raw=True`` returns the :class:`Response` instead. Two Feed API calls
+        need it: creating a task puts the new task's id in the ``Location``
+        header rather than the body, and downloading a result file returns
+        gzipped bytes rather than JSON.
         """
         url = self._url(path, params)
         body = None
@@ -175,7 +181,7 @@ class Transport:
             response = self._opener(method, url, headers, body, self._timeout)
 
             if 200 <= response.status < 300:
-                return response.json()
+                return response if raw else response.json()
 
             # A 401 on a token we believed was valid usually means it was
             # revoked or eBay expired it early. Worth exactly one forced

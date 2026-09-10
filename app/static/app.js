@@ -1845,6 +1845,7 @@ async function refreshEbayStatus() {
                 <p class="text-slate-500">Access must be renewed by ${escapeHtml(expiry)}.</p>`;
             connect.innerText = "Reconnect";
             disconnect.classList.remove("hidden");
+            document.getElementById("ebaySyncGroup")?.classList.remove("hidden");
         } else {
             box.innerHTML = `
                 <p class="text-slate-300 font-semibold">Not connected</p>
@@ -1853,6 +1854,7 @@ async function refreshEbayStatus() {
                 ${misconfigured}`;
             connect.innerText = "Connect eBay account";
             disconnect.classList.add("hidden");
+            document.getElementById("ebaySyncGroup")?.classList.add("hidden");
         }
     } catch (err) {
         box.innerHTML = `<p class="text-rose-400">${escapeHtml(err.message)}</p>`;
@@ -1873,6 +1875,53 @@ async function connectEbayAccount() {
         logToTerminal("ERROR", `eBay connect failed: ${err.message}`);
     } finally {
         if (button) button.disabled = false;
+    }
+}
+
+async function syncFromEbay() {
+    const button = document.getElementById("btnEbaySync");
+    const box = document.getElementById("ebaySyncResult");
+    if (button) {
+        button.disabled = true;
+        button.innerText = "Waiting for eBay…";
+    }
+    if (box) {
+        box.classList.remove("hidden");
+        box.innerHTML = `<p class="text-slate-400">eBay generates the report on its own schedule, so this can take a minute.</p>`;
+    }
+    try {
+        const res = await fetch("/api/ebay/sync", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "The sync failed");
+
+        for (const entry of data.logs || []) {
+            logToTerminal(entry.level, entry.message);
+        }
+        const report = data.report || {};
+        if (box) {
+            // The headers are shown because the Feed report's exact column
+            // names have not been seen against a real store yet; if nothing
+            // synced, they are the first thing worth looking at.
+            box.innerHTML = `
+                <p class="${data.synced_count ? "text-emerald-400" : "text-amber-300"} font-semibold">
+                    ${data.synced_count} variation(s) synced across ${data.linked_listing_count || 0} listing(s)
+                </p>
+                ${data.delisted_count ? `<p class="text-amber-300">${data.delisted_count} card(s) no longer on eBay set to 0</p>` : ""}
+                ${data.skipped_unmapped_count ? `<p class="text-amber-300">${data.skipped_unmapped_count} label(s) not in the catalogue &mdash; worth investigating</p>` : ""}
+                <p class="text-slate-500">Report ${escapeHtml(report.status || "?")}, ${report.row_count ?? "?"} row(s), ${report.bytes ?? "?"} bytes</p>
+                ${!data.synced_count && report.headers ? `<p class="text-slate-500">Columns seen: <span class="font-mono">${escapeHtml((report.headers || []).join(", "))}</span></p>` : ""}`;
+        }
+        // The mirror feeds both of these, so neither should show stale numbers.
+        fetchEbayListings();
+        fetchStats();
+    } catch (err) {
+        logToTerminal("ERROR", `eBay sync failed: ${err.message}`);
+        if (box) box.innerHTML = `<p class="text-rose-400">${escapeHtml(err.message)}</p>`;
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerText = "Sync from eBay";
+        }
     }
 }
 

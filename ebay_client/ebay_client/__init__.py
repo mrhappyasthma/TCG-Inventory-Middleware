@@ -16,6 +16,11 @@ happens in the layer above so neither model leaks into the other.
 """
 
 from .client import EbayClient
+from .feed import (
+    ACTIVE_INVENTORY_REPORT,
+    FeedError,
+    download_active_inventory_report,
+)
 from .config import (
     APP_SCOPES,
     DEFAULT_MARKETPLACE_ID,
@@ -46,6 +51,9 @@ from .transport import Transport
 __all__ = [
     "EbayClient",
     "EbayConfig",
+    "ACTIVE_INVENTORY_REPORT",
+    "FeedError",
+    "download_active_inventory_report",
     "PRODUCTION",
     "SANDBOX",
     "DEFAULT_SCOPES",

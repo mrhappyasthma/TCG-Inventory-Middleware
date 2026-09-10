@@ -54,6 +54,15 @@ def sync_active_listings_csv(
     current_parent_item_id: Optional[str] = None
 
     for row_idx, row in enumerate(reader, start=1):
+        # Two report shapes reach this parser and must both work. The Seller
+        # Hub Active Listings report uses human labels ("Item number", "Custom
+        # label (SKU)", "Available quantity"); the Feed API's
+        # LMS_ACTIVE_INVENTORY_REPORT, fetched without anyone clicking through
+        # Seller Hub, uses field names (ItemID, SKU, Quantity, Price). Adding
+        # the second set as candidates reuses this parser rather than growing
+        # a second one, which matters because every rule below -- the parent
+        # row skip, the manifest lookup, the delisting sweep -- would
+        # otherwise need reimplementing and could drift.
         item_id = _find_column(
             row,
             [
@@ -125,7 +134,11 @@ def sync_active_listings_csv(
                 "Available quantity",
                 "Quantity available",
                 "Available Quantity",
+                # The Feed report's own name. Listed after the explicit
+                # "available" spellings so a report carrying both cannot have
+                # the ambiguous one win.
                 "Quantity",
+                "AvailableQuantity",
                 "Qty",
             ],
             skip_blank=True,
@@ -154,7 +167,10 @@ def sync_active_listings_csv(
                 "Start Price",
                 "Buy It Now price",
                 "Buy It Now Price",
+                # The Feed report's own name, last so the more specific
+                # Seller Hub spellings win when both are present.
                 "Price",
+                "StartPrice",
                 "Fixed price",
             ],
             skip_blank=True,
