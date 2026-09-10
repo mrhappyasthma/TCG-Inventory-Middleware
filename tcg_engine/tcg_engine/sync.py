@@ -203,8 +203,37 @@ def sync_active_listings_csv(
     # quantity in place would keep reporting stock eBay does not have, which is
     # the same failure as Module A writing this column speculatively. Only a
     # sync may set it, and this is a sync.
+    #
+    # But it may only run on a report we actually understood. A report whose
+    # columns are not recognised still parses: every row yields a blank custom
+    # label, every row is counted as unlabelled, and synced_count stays 0 --
+    # which is indistinguishable from "eBay has none of these listings any
+    # more". The sweep would then zero the entire mirror off the back of a
+    # parse failure. This is the same invariant process_batch_csv enforces
+    # with skipped_count == 0, and it belongs here for the same reason: the
+    # remedy for an absent card and the symptom of an unreadable file look
+    # identical, and one of them delists a live store.
+    #
+    # Gating on synced_count is safe in the genuine case too: a store with no
+    # linked cards has nothing for the sweep to do anyway.
     delisted_count = 0
-    for live in db.get_live_variations():
+    delisting_skipped = False
+    linked_total = len(db.get_live_variations())
+    if synced_count == 0 and linked_total > 0:
+        delisting_skipped = True
+        logs.append({
+            "level": "ERROR",
+            "message": (
+                f"Not a single row in this report matched a catalogued card, "
+                f"yet {linked_total} card(s) are linked to live listings. That "
+                f"is far more likely to mean the report's columns were not "
+                f"understood than that your whole store ended, so no quantity "
+                f"has been set to 0. Check the report's column names before "
+                f"trusting this result."
+            ),
+        })
+
+    for live in [] if delisting_skipped else db.get_live_variations():
         if live["manifest_id"] in seen_manifest_ids:
             continue
         if int(live.get("last_known_qty") or 0) == 0:
@@ -245,6 +274,10 @@ def sync_active_listings_csv(
     return {
         "synced_count": synced_count,
         "delisted_count": delisted_count,
+        # Surfaced so a caller can tell "nothing needed delisting" from "the
+        # delisting was refused because the report looked unreadable". The
+        # dashboard shows this as a failure rather than a quiet success.
+        "delisting_skipped": delisting_skipped,
         "linked_listing_count": len(linked_item_ids),
         "skipped_parent_count": skipped_parent_count,
         "skipped_unlabelled_count": skipped_unlabelled_count,

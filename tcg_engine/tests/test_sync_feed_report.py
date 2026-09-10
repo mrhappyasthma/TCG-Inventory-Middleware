@@ -105,6 +105,55 @@ class FeedReportCompatibilityTests(unittest.TestCase):
         self.assertEqual(result["synced_count"], 0)
         self.assertEqual(result["skipped_unmapped_count"], 1)
 
+    def test_an_unreadable_report_does_not_zero_the_whole_mirror(self):
+        """
+        The hazard the API path makes likely.
+
+        A report whose columns are not recognised still parses: every row
+        yields a blank custom label, every row counts as unlabelled, and
+        synced_count stays 0 -- which is indistinguishable from "eBay has none
+        of these listings any more". Without a guard the delisting sweep then
+        zeroes the entire mirror off a parse failure, which is the same
+        mistake process_batch_csv already refuses to make.
+        """
+        sync_active_listings_csv(FEED_REPORT, self.db)
+        self.assertEqual(self.db.get_variation("ID1001")["last_known_qty"], 4)
+
+        # Same data, column names nothing recognises.
+        gibberish = (
+            "listing_ref,stock_code,units,amount\n"
+            "110111222333,ID1001-Bin_A12,4,2.50\n"
+            "110111222333,ID1002-Bin_B03,2,1.25\n"
+        )
+        result = sync_active_listings_csv(gibberish, self.db)
+
+        self.assertEqual(result["synced_count"], 0)
+        self.assertTrue(result["delisting_skipped"])
+        self.assertEqual(result["delisted_count"], 0)
+        # The quantities survive untouched.
+        self.assertEqual(self.db.get_variation("ID1001")["last_known_qty"], 4)
+        self.assertEqual(self.db.get_variation("ID1002")["last_known_qty"], 2)
+        self.assertTrue(
+            any(entry["level"] == "ERROR" for entry in result["logs"]),
+            "refusing to delist must be reported as a failure, not a success",
+        )
+
+    def test_a_store_with_no_linked_cards_is_not_a_false_alarm(self):
+        # Nothing is linked, so there is nothing the sweep could zero and no
+        # reason to complain about an empty match.
+        empty_db = Database(os.path.join(self.temp_dir.name, "empty.db"))
+        result = sync_active_listings_csv(FEED_REPORT, empty_db)
+        self.assertFalse(result["delisting_skipped"])
+
+    def test_a_genuine_delisting_still_happens(self):
+        # The guard must not block the real case: rows matched, one card is
+        # legitimately absent.
+        sync_active_listings_csv(FEED_REPORT, self.db)
+        shrunk = "ItemID,SKU,Price,Quantity\n110111222333,ID1001-Bin_A12,2.50,4\n"
+        result = sync_active_listings_csv(shrunk, self.db)
+        self.assertFalse(result["delisting_skipped"])
+        self.assertEqual(result["delisted_count"], 1)
+
     def test_an_explicit_available_quantity_wins_over_a_bare_one(self):
         # A report carrying both must not have the ambiguous column win.
         report = (

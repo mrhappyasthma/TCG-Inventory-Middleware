@@ -84,6 +84,10 @@ async function initAuth() {
             // The scheduled refresh runs with nobody watching, so the pill has
             // to be computed on arrival rather than only after a manual run.
             refreshRepriceIndicator();
+            // Cheap: reads local configuration and the stored token, and calls
+            // nothing at eBay. Done on arrival so Module B's card can point at
+            // the automated path without the eBay panel being opened first.
+            refreshEbayStatus();
         } else if (data.is_pending) {
             document.getElementById("pendingApprovalBanner").classList.remove("hidden");
         } else {
@@ -1926,6 +1930,12 @@ async function refreshEbayStatus() {
             ? `<p class="text-amber-300 mt-1">${escapeHtml(data.misconfiguration)}</p>`
             : "";
 
+        // Module B's card points at the automated path once there is an
+        // account to use it with, without hiding the upload.
+        document
+            .getElementById("syncAutomatedHint")
+            ?.classList.toggle("hidden", !data.connected);
+
         connect.disabled = false;
         if (data.connected) {
             // The refresh token dies after about eighteen months and the only
@@ -2002,10 +2012,18 @@ async function syncFromEbay() {
                 <p class="${data.synced_count ? "text-emerald-400" : "text-amber-300"} font-semibold">
                     ${data.synced_count} variation(s) synced across ${data.linked_listing_count || 0} listing(s)
                 </p>
+                ${data.delisting_skipped ? `<p class="text-rose-400">Nothing matched, so no quantity was set to 0. The report's columns were probably not understood &mdash; your mirror is untouched. Compare the columns below against what the parser expects.</p>` : ""}
                 ${data.delisted_count ? `<p class="text-amber-300">${data.delisted_count} card(s) no longer on eBay set to 0</p>` : ""}
                 ${data.skipped_unmapped_count ? `<p class="text-amber-300">${data.skipped_unmapped_count} label(s) not in the catalogue &mdash; worth investigating</p>` : ""}
                 <p class="text-slate-500">Report ${escapeHtml(report.status || "?")}, ${report.row_count ?? "?"} row(s), ${report.bytes ?? "?"} bytes</p>
                 ${!data.synced_count && report.headers ? `<p class="text-slate-500">Columns seen: <span class="font-mono">${escapeHtml((report.headers || []).join(", "))}</span></p>` : ""}`;
+        }
+        if (data.delisting_skipped) {
+            logToTerminal(
+                "ERROR",
+                "eBay sync matched nothing and refused to zero any quantity. "
+                + "Treat this as a failed sync, not an empty store."
+            );
         }
         // The mirror feeds both of these, so neither should show stale numbers.
         fetchEbayListings();

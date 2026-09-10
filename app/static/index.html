@@ -399,6 +399,20 @@
                         <h3 class="text-base font-bold font-heading text-white group-hover:text-accent-emerald transition-colors">2. Sync Active eBay Inventory</h3>
                         <p class="text-xs text-slate-400 mt-1">Ingests eBay&rsquo;s Active Listings report to sync live Item IDs, the copies eBay reports, and each variation&rsquo;s custom label.</p>
 
+                        <!--
+                            The API path did not replace this module, it
+                            replaced its *input*: the same parser and the same
+                            reconciliation run either way. The upload stays as
+                            the fallback for when eBay's report service is
+                            slow or unhappy, and as the reference for checking
+                            the automated path against.
+                        -->
+                        <p id="syncAutomatedHint" class="hidden text-[11px] text-slate-500 mt-2 rounded-lg border border-slate-700/70 bg-dark-900/60 px-2.5 py-1.5">
+                            An eBay account is connected, so you can
+                            <button type="button" onclick="openEbayModal()" class="text-accent-cyan underline decoration-dotted hover:text-accent-emerald">sync without downloading anything</button>.
+                            Uploading still works, and is the way to cross-check that result.
+                        </p>
+
                         <!-- Dropzone 3 -->
                         <div id="dropzoneSync" class="dropzone mt-4 p-6 rounded-xl border-2 border-dashed border-slate-700 bg-dark-900/40 hover:bg-dark-900/80 hover:border-accent-emerald/70 text-center cursor-pointer transition-all">
                             <input type="file" id="fileInputSync" class="hidden" accept=".csv">
