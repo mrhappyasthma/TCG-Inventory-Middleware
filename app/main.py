@@ -77,6 +77,13 @@ from tcg_engine.pricing_feed import (
     build_reprice_csv,
     PriceFeedError,
 )
+from tcg_engine.plans import (
+    PlanError,
+    approve_plan,
+    build_plan,
+    plan_blockers,
+    revalidate_item,
+)
 
 try:
     from app.user_db import UserDatabase
@@ -1397,6 +1404,187 @@ def health_check():
 # ---------------------------------------------------------
 # FRONTEND HTML ROUTE
 # ---------------------------------------------------------
+
+# -------------------------------------------------------------------
+# Draft plans: staging for every eBay-bound change
+# -------------------------------------------------------------------
+
+
+class PlanItemUpdateRequest(BaseModel):
+    """
+    One edit to one planned change.
+
+    Every field is optional so the drafts page can send just what changed.
+    status is a Literal because it is stored verbatim, compared on later
+    requests and rendered back into the page -- the same reasoning that made
+    role and status closed sets on the user model.
+    """
+
+    proposed_qty: Optional[int] = None
+    proposed_price: Optional[float] = None
+    group_key: Optional[str] = None
+    status: Optional[Literal["pending", "excluded"]] = None
+
+
+class PlanBuildRequest(BaseModel):
+    source: Literal["manual", "batch", "reprice", "photo", "grouping"] = "manual"
+    note: Optional[str] = None
+
+
+@app.get("/api/plans")
+def list_plans(user: Dict[str, Any] = Depends(require_active_user)):
+    """
+    This user's recent plans, newest first.
+
+    Scoped to the caller. Plans carry a user_id because approval is an
+    authorisation record -- whose plan it was and who approved it -- so
+    showing another user's drafts would let one person approve another's
+    intent.
+    """
+    return {"plans": db.get_plans(user_id=user["id"])}
+
+
+@app.post("/api/plans/build")
+async def build_draft_plan(
+    req: PlanBuildRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Compute a fresh draft plan from the current catalogue.
+
+    Replaces any open draft: a draft is a snapshot of a diff, and once the
+    catalogue moves underneath it the old draft describes a change that no
+    longer applies. Runs in a threadpool because it walks the whole catalogue
+    and would otherwise block the event loop and freeze the dashboard.
+    """
+    try:
+        summary = await run_in_threadpool(
+            build_plan,
+            db,
+            user["id"],
+            source=req.source,
+            note=req.note,
+        )
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"success": True, **summary}
+
+
+@app.get("/api/plans/{plan_id}")
+def get_plan_detail(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """
+    A plan with its listings, its items and everything blocking approval.
+
+    One response rather than three round trips, because the page cannot render
+    a meaningful row without all of them: an item's blockers decide how it is
+    drawn.
+    """
+    plan = db.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+
+    try:
+        blockers = plan_blockers(db, plan_id)
+    except PlanError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {
+        "plan": plan,
+        "groups": db.get_plan_groups(plan_id),
+        "items": db.get_plan_items(plan_id),
+        "blockers": blockers,
+    }
+
+
+@app.patch("/api/plans/items/{item_id}")
+def update_plan_item_endpoint(
+    item_id: int,
+    req: PlanItemUpdateRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Edit one planned change: its quantity, price, listing or inclusion.
+
+    Only a draft may be edited. Editing an approved plan would change what is
+    about to be pushed after the approval that authorised it, which makes the
+    approval a record of something that never happened.
+    """
+    item = db.get_plan_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Plan item not found.")
+    plan = db.get_plan(item["plan_id"])
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan item not found.")
+    if plan["status"] != "draft":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This plan is {plan['status']} and can no longer be edited.",
+        )
+
+    changes = req.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to change.")
+    if "proposed_qty" in changes and changes["proposed_qty"] < 0:
+        raise HTTPException(status_code=400, detail="Quantity cannot be negative.")
+    if "proposed_price" in changes and changes["proposed_price"] <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Price must be above zero; eBay rejects a zero-price listing.",
+        )
+
+    db.update_plan_item(item_id, **changes)
+    # Re-validate straight away so the page never shows a blocker for a
+    # problem the user has just fixed.
+    problems = revalidate_item(db, item_id)
+    return {
+        "success": True,
+        "item": db.get_plan_item(item_id),
+        "problems": problems,
+        "blockers": plan_blockers(db, item["plan_id"]),
+    }
+
+
+@app.post("/api/plans/{plan_id}/approve")
+def approve_plan_endpoint(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """
+    Approve a plan, which is the only thing that authorises an eBay write.
+
+    Nothing is pushed here. Approval and push are separate so that the push
+    worker's authorisation check is a stored fact rather than a claim made by
+    whichever request happens to be running.
+    """
+    plan = db.get_plan(plan_id)
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    try:
+        result = approve_plan(db, plan_id, approved_by=user["id"])
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"success": True, **result}
+
+
+@app.delete("/api/plans/{plan_id}")
+def discard_plan_endpoint(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """Throw a plan away. Only a draft; an approved plan is a record."""
+    plan = db.get_plan(plan_id)
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan["status"] != "draft":
+        raise HTTPException(
+            status_code=409,
+            detail=f"A {plan['status']} plan is a record and cannot be discarded.",
+        )
+    db.delete_plan(plan_id)
+    return {"success": True}
+
 
 # Assets whose URLs get a content hash appended, so the browser is forced to
 # fetch the version that belongs with the HTML it just received.

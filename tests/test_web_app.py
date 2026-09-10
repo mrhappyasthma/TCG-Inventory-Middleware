@@ -686,5 +686,142 @@ class TestWebApp(unittest.TestCase):
             self.assertIn(res.status_code, (401, 403),
                           f"{label} token was accepted")
 
+    # -- draft plans -------------------------------------------------------
+
+    def test_29_a_draft_plan_can_be_built_edited_and_approved(self):
+        """
+        The whole drafts round trip, which is the staging path that replaces
+        generating a CSV and uploading it by hand.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        # The catalogue already holds the card from the batch tests above.
+        built = self.client.post("/api/plans/build", json={"source": "manual"})
+        self.assertEqual(built.status_code, 200)
+        plan_id = built.json()["plan_id"]
+        self.assertGreater(built.json()["item_count"], 0)
+
+        detail = self.client.get(f"/api/plans/{plan_id}")
+        self.assertEqual(detail.status_code, 200)
+        body = detail.json()
+        self.assertEqual(body["plan"]["status"], "draft")
+        self.assertTrue(body["items"])
+        item = body["items"][0]
+
+        # An edit re-validates immediately, so the page never shows a blocker
+        # for a problem that has just been fixed.
+        edited = self.client.patch(
+            f"/api/plans/items/{item['id']}",
+            json={"proposed_qty": 4, "proposed_price": 1.25},
+        )
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(edited.json()["item"]["proposed_qty"], 4)
+        self.assertAlmostEqual(edited.json()["item"]["proposed_price"], 1.25)
+
+        approved = self.client.post(f"/api/plans/{plan_id}/approve")
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(
+            self.client.get(f"/api/plans/{plan_id}").json()["plan"]["status"],
+            "approved",
+        )
+
+    def test_30_an_approved_plan_can_no_longer_be_edited_or_discarded(self):
+        """
+        Approval is the authorisation record for an eBay write. Editing after
+        it would change what gets pushed, making the approval a record of
+        something that never happened.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        approved = [
+            p for p in self.client.get("/api/plans").json()["plans"]
+            if p["status"] == "approved"
+        ]
+        self.assertTrue(approved, "test 29 should have left an approved plan")
+        plan_id = approved[0]["id"]
+
+        items = self.client.get(f"/api/plans/{plan_id}").json()["items"]
+        res = self.client.patch(
+            f"/api/plans/items/{items[0]['id']}", json={"proposed_qty": 9}
+        )
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(self.client.delete(f"/api/plans/{plan_id}").status_code, 409)
+
+    def test_31_plan_item_edits_are_validated(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        items = self.client.get(f"/api/plans/{plan_id}").json()["items"]
+        if not items:
+            self.skipTest("nothing left to change after the previous approval")
+        item_id = items[0]["id"]
+
+        for payload in ({"proposed_qty": -1}, {"proposed_price": 0}):
+            res = self.client.patch(f"/api/plans/items/{item_id}", json=payload)
+            self.assertEqual(res.status_code, 400, f"{payload} was accepted")
+        # An empty patch is a client bug, not a no-op success.
+        self.assertEqual(
+            self.client.patch(f"/api/plans/items/{item_id}", json={}).status_code,
+            400,
+        )
+        # status is a closed set: a free string would be stored and rendered.
+        self.assertEqual(
+            self.client.patch(
+                f"/api/plans/items/{item_id}", json={"status": "pushed"}
+            ).status_code,
+            422,
+        )
+
+    def test_32_plans_are_scoped_to_their_owner(self):
+        """
+        A plan carries whose intent it was and who approved it, so one user
+        must not be able to read or approve another's draft.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+
+        # The second user approved back in test 04, on their own session.
+        other = TestClient(app)
+        with mock.patch(
+            "app.main.verify_google_id_token",
+            return_value=google_claims(
+                "google-sub-second", "second@example.com", "Second User"
+            ),
+        ):
+            signed_in = other.post("/api/auth/google", json={"id_token": "stub"})
+        self.assertEqual(signed_in.json()["user"]["status"], "active")
+
+        self.assertEqual(other.get(f"/api/plans/{plan_id}").status_code, 404)
+        self.assertEqual(
+            other.post(f"/api/plans/{plan_id}/approve").status_code, 404
+        )
+        self.assertEqual(other.delete(f"/api/plans/{plan_id}").status_code, 404)
+        # And the other user's own list does not include it.
+        self.assertNotIn(
+            plan_id, [p["id"] for p in other.get("/api/plans").json()["plans"]]
+        )
+
+    def test_33_draft_endpoints_require_authentication(self):
+        anonymous = TestClient(app)
+        for method, path in (
+            ("get", "/api/plans"),
+            ("post", "/api/plans/build"),
+            ("get", "/api/plans/1"),
+            ("post", "/api/plans/1/approve"),
+            ("delete", "/api/plans/1"),
+            ("patch", "/api/plans/items/1"),
+        ):
+            # request() rather than the verb helpers: TestClient.get and
+            # .delete do not take a json body.
+            res = anonymous.request(method.upper(), path, json={})
+            self.assertIn(
+                res.status_code,
+                (401, 403),
+                f"{method.upper()} {path} was reachable without a session",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

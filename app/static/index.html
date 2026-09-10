@@ -477,6 +477,7 @@
             <div class="flex items-center gap-1 border-b border-slate-800 overflow-x-auto">
                 <button id="tabBtnInventory" onclick="switchWorkspaceTab('inventory')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">Live Store Inventory</button>
                 <button id="tabBtnListings" onclick="switchWorkspaceTab('listings')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">eBay Listings</button>
+                <button id="tabBtnDrafts" onclick="switchWorkspaceTab('drafts')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">Drafts<span id="draftsCountBadge" class="hidden ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-slate-700 text-slate-200 align-middle">0</span></button>
                 <button id="tabBtnConsole" onclick="switchWorkspaceTab('console')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">Terminal Console<span id="consoleUnreadBadge" class="hidden ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-slate-700 text-slate-200 align-middle">0</span></button>
             </div>
 
@@ -616,6 +617,70 @@
                     <div class="p-3.5 border-t border-slate-800/80 bg-dark-800/50 text-xs text-slate-400">
                         <span id="ebayListingsSummary">&nbsp;</span>
                     </div>
+                </div>
+            </div>
+
+            <!--
+                DRAFTS
+                Staging for everything eBay-bound. Nothing here has reached
+                eBay: a plan is the difference between what the catalogue says
+                and what eBay is known to hold, and only an approved plan may
+                be pushed. Staging is deliberately ours rather than eBay's --
+                see docs/ebay-api-design.md.
+            -->
+            <div id="panelDrafts" class="hidden space-y-4">
+                <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                    <div>
+                        <h2 class="text-lg font-bold font-heading text-white tracking-tight">Drafts</h2>
+                        <p class="text-xs text-slate-400 max-w-2xl">
+                            The listings and updates we plan to make, before anything reaches eBay.
+                            Regroup cards, adjust a price or quantity, or leave a card out &mdash; then approve.
+                        </p>
+                    </div>
+                    <div class="flex items-center gap-2 self-start">
+                        <button id="btnBuildPlan" onclick="buildDraftPlan()" class="text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5" title="Recompute the draft from the current catalogue">
+                            <svg class="w-4 h-4 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                            <span>Rebuild draft</span>
+                        </button>
+                        <button id="btnDiscardPlan" onclick="discardDraftPlan()" class="hidden text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-rose-300 transition-all" title="Throw this draft away">Discard</button>
+                    </div>
+                </div>
+
+                <!--
+                    Blockers. eBay fails an entire variation listing if one of
+                    its offers is invalid, and it does so after approval, so
+                    these are shown before the approve button becomes live.
+                -->
+                <div id="draftBlockers" class="hidden rounded-2xl border border-amber-800/70 bg-amber-950/30 p-4 space-y-2">
+                    <div class="flex items-center gap-2 text-amber-300 text-xs font-semibold">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                        <span id="draftBlockersHeading">Some listings cannot be pushed yet</span>
+                    </div>
+                    <div id="draftBlockersList" class="text-[11px] text-amber-200/90 space-y-1"></div>
+                    <p class="text-[11px] text-amber-200/60">
+                        eBay refuses a whole variation listing if any one of its cards is invalid, so
+                        every problem must be fixed or the card left out before this draft can be approved.
+                    </p>
+                </div>
+
+                <div id="draftGroups" class="space-y-3">
+                    <div class="glass-card rounded-2xl border border-slate-800 bg-dark-800/40 p-8 text-center text-slate-500 text-xs">Loading drafts&hellip;</div>
+                </div>
+
+                <div id="draftFooter" class="hidden glass-card rounded-2xl border border-slate-800 bg-dark-800/40 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div class="text-xs text-slate-400">
+                        <span id="draftSummary">&nbsp;</span>
+                        <p class="text-[11px] text-slate-500 mt-1">
+                            Approving records who authorised the change. Nothing is sent to eBay by this button yet.
+                        </p>
+                    </div>
+                    <button id="btnApprovePlan" onclick="approveDraftPlan()" class="text-xs font-bold px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 border border-brand-500 text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                        Approve draft
+                    </button>
                 </div>
             </div>
 

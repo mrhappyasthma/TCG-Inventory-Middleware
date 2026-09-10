@@ -1708,6 +1708,7 @@ function getConditionBadgeClass(condition) {
 const WORKSPACE_TABS = {
     inventory: { panel: "panelInventory", button: "tabBtnInventory" },
     listings: { panel: "panelListings", button: "tabBtnListings" },
+    drafts: { panel: "panelDrafts", button: "tabBtnDrafts" },
     console: { panel: "panelConsole", button: "tabBtnConsole" },
 };
 
@@ -1745,6 +1746,9 @@ function switchWorkspaceTab(key) {
     // Listings are derived from the store mirror, so refetch on entry rather
     // than showing whatever was true when the page loaded.
     if (key === "listings") fetchEbayListings();
+    // Same for drafts: a plan is a diff against the catalogue, and the
+    // catalogue may have moved since this page loaded.
+    if (key === "drafts") fetchDraftPlan();
 }
 
 function clearConsoleUnread() {
@@ -2092,6 +2096,385 @@ async function fetchEbayListings() {
         }
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-rose-400">Failed to load listings: ${escapeHtml(err.message)}</td></tr>`;
+    }
+}
+
+// -------------------------------------------------------------------
+// 3b. DRAFTS: staging for every eBay-bound change
+// -------------------------------------------------------------------
+
+// The draft currently on screen. Held so an edit can re-render without a
+// second round trip for data the PATCH response already returned.
+let currentDraftPlan = null;
+
+const DRAFT_ACTION_LABELS = {
+    create_listing: { label: "New listing", cls: "bg-emerald-950/80 text-emerald-400 border-emerald-800" },
+    update: { label: "Update", cls: "bg-sky-950/80 text-sky-300 border-sky-800" },
+    zero_out: { label: "Sold out → 0", cls: "bg-amber-950/80 text-amber-300 border-amber-800" },
+    remove_from_group: { label: "Remove", cls: "bg-rose-950/80 text-rose-300 border-rose-800" },
+    end_listing: { label: "End listing", cls: "bg-rose-950/80 text-rose-300 border-rose-800" },
+};
+
+function draftActionBadge(action) {
+    const meta = DRAFT_ACTION_LABELS[action]
+        || { label: action, cls: "bg-slate-900 text-slate-400 border-slate-800" };
+    return `<span class="inline-block px-2 py-0.5 rounded-full text-[10px] font-bold border ${meta.cls}">${escapeHtml(meta.label)}</span>`;
+}
+
+function isSingleGroup(groupKey) {
+    return typeof groupKey === "string" && groupKey.startsWith("single:");
+}
+
+function draftGroupTitle(group, items) {
+    if (isSingleGroup(group.group_key)) {
+        const first = items[0];
+        return first
+            ? `${escapeHtml(first.product_name)} — single listing`
+            : "Single listing";
+    }
+    const set = group.set_name || "(no set)";
+    const condition = group.condition || "(no condition)";
+    return `${escapeHtml(set)} · ${escapeHtml(condition)}`;
+}
+
+async function fetchDraftPlan() {
+    const container = document.getElementById("draftGroups");
+    if (!container) return;
+
+    try {
+        const res = await fetch("/api/plans");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to load drafts");
+
+        const draft = (data.plans || []).find(p => p.status === "draft");
+        if (!draft) {
+            currentDraftPlan = null;
+            renderNoDraft(data.plans || []);
+            return;
+        }
+
+        const detailRes = await fetch(`/api/plans/${draft.id}`);
+        const detail = await detailRes.json();
+        if (!detailRes.ok) throw new Error(detail.detail || "Failed to load draft");
+
+        currentDraftPlan = detail;
+        renderDraftPlan(detail);
+    } catch (err) {
+        container.innerHTML = `<div class="glass-card rounded-2xl border border-rose-900/60 bg-rose-950/20 p-6 text-center text-rose-400 text-xs">Failed to load drafts: ${escapeHtml(err.message)}</div>`;
+    }
+}
+
+function renderNoDraft(plans) {
+    const container = document.getElementById("draftGroups");
+    const footer = document.getElementById("draftFooter");
+    const discard = document.getElementById("btnDiscardPlan");
+    const blockers = document.getElementById("draftBlockers");
+    if (footer) footer.classList.add("hidden");
+    if (discard) discard.classList.add("hidden");
+    if (blockers) blockers.classList.add("hidden");
+    setDraftsBadge(0);
+
+    const approved = plans.filter(p => p.status !== "draft").length;
+    container.innerHTML = `
+        <div class="glass-card rounded-2xl border border-slate-800 bg-dark-800/40 p-8 text-center space-y-2">
+            <p class="text-sm text-slate-300 font-semibold">No open draft</p>
+            <p class="text-xs text-slate-500 max-w-md mx-auto">
+                A draft is the difference between what your catalogue says and what eBay is
+                known to hold. Rebuild one after a batch upload, a price refresh or a manual
+                edit. An empty draft means nothing needs changing.
+            </p>
+            ${approved ? `<p class="text-[11px] text-slate-600">${approved} earlier plan(s) on record.</p>` : ""}
+        </div>`;
+}
+
+function renderDraftPlan(detail) {
+    const container = document.getElementById("draftGroups");
+    const footer = document.getElementById("draftFooter");
+    const discard = document.getElementById("btnDiscardPlan");
+    const items = detail.items || [];
+    const groups = detail.groups || [];
+
+    if (discard) discard.classList.remove("hidden");
+    renderDraftBlockers(detail.blockers || []);
+
+    const included = items.filter(i => i.status !== "excluded");
+    setDraftsBadge(included.length);
+
+    if (!items.length) {
+        container.innerHTML = `
+            <div class="glass-card rounded-2xl border border-slate-800 bg-dark-800/40 p-8 text-center space-y-2">
+                <p class="text-sm text-slate-300 font-semibold">Nothing to change</p>
+                <p class="text-xs text-slate-500 max-w-md mx-auto">
+                    Every catalogued card already matches what eBay is known to hold. An empty
+                    draft is the correct result of a dump that changed nothing.
+                </p>
+            </div>`;
+        if (footer) footer.classList.add("hidden");
+        return;
+    }
+
+    // Every group in the plan, offered as a move target on each row. Built
+    // once rather than per row: a plan can hold thousands of items.
+    const moveTargets = groups
+        .filter(g => !isSingleGroup(g.group_key))
+        .map(g => ({ key: g.group_key, label: `${g.set_name || "(no set)"} · ${g.condition || "-"}` }));
+
+    const byGroup = new Map();
+    for (const item of items) {
+        const key = item.group_key || "";
+        if (!byGroup.has(key)) byGroup.set(key, []);
+        byGroup.get(key).push(item);
+    }
+
+    container.innerHTML = groups.map(group => {
+        const groupItems = byGroup.get(group.group_key) || [];
+        const invalid = groupItems.some(
+            i => i.status !== "excluded" && i.validation && i.validation !== "[]"
+        );
+        const border = invalid ? "border-amber-800/70" : "border-slate-800";
+        return `
+            <div class="glass-card rounded-2xl border ${border} bg-dark-800/40 overflow-hidden">
+                <div class="px-4 py-3 border-b border-slate-800/80 bg-dark-800/60 flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <p class="text-xs font-bold text-white truncate">${draftGroupTitle(group, groupItems)}</p>
+                        <p class="text-[11px] text-slate-500">
+                            ${group.item_count} card(s)${group.excluded_count ? `, ${group.excluded_count} left out` : ""}
+                            &middot; ${group.proposed_copies} cop${group.proposed_copies === 1 ? "y" : "ies"} proposed
+                        </p>
+                    </div>
+                    ${invalid ? `<span class="shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-950/80 text-amber-300 border border-amber-800">Needs attention</span>` : ""}
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse text-xs">
+                        <thead>
+                            <tr class="border-b border-slate-800 text-slate-400 uppercase font-semibold text-[10px] tracking-wider">
+                                <th class="py-2 px-4">Card</th>
+                                <th class="py-2 px-4">Change</th>
+                                <th class="py-2 px-4 text-center">Quantity</th>
+                                <th class="py-2 px-4 text-center">Price</th>
+                                <th class="py-2 px-4">Listing</th>
+                                <th class="py-2 px-4 text-right">Include</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800/60 text-slate-300">
+                            ${groupItems.map(i => draftItemRow(i, moveTargets)).join("")}
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+    }).join("");
+
+    if (footer) footer.classList.remove("hidden");
+    const summary = document.getElementById("draftSummary");
+    if (summary) {
+        const copies = included.reduce((n, i) => n + (i.proposed_qty || 0), 0);
+        summary.innerText =
+            `${included.length} change(s) across ${groups.length} listing(s), `
+            + `${copies} cop${copies === 1 ? "y" : "ies"} in total`
+            + (items.length - included.length ? `; ${items.length - included.length} left out` : "");
+    }
+
+    const approve = document.getElementById("btnApprovePlan");
+    if (approve) {
+        const blocked = (detail.blockers || []).length > 0;
+        approve.disabled = blocked || !included.length;
+        approve.title = blocked
+            ? "Fix or leave out the flagged cards first"
+            : (included.length ? "Approve this draft" : "Every card is left out");
+    }
+}
+
+function draftItemRow(item, moveTargets) {
+    const excluded = item.status === "excluded";
+    const problems = item.validation ? JSON.parse(item.validation) : [];
+    const rowCls = excluded
+        ? "opacity-40"
+        : (problems.length ? "bg-amber-950/10" : "hover:bg-dark-800/80");
+
+    const from = (before, after, money) => {
+        if (before === null || before === undefined) {
+            return `<span class="text-slate-500 text-[10px]" title="eBay's value is unknown until a sync has run, so this counts as a change">new</span>`;
+        }
+        const fmt = v => (money ? `$${Number(v).toFixed(2)}` : v);
+        return before === after
+            ? ""
+            : `<span class="text-slate-500 text-[10px] line-through">${escapeHtml(String(fmt(before)))}</span>`;
+    };
+
+    // The listing selector carries group keys as option values rather than
+    // interpolating them into an inline handler: a group key is built from a
+    // set name that came out of an uploaded CSV.
+    const options = [
+        `<option value="single:${escapeHtml(item.manifest_id)}"${isSingleGroup(item.group_key) ? " selected" : ""}>Own single listing</option>`,
+        ...moveTargets.map(t =>
+            `<option value="${escapeHtml(t.key)}"${t.key === item.group_key ? " selected" : ""}>${escapeHtml(t.label)}</option>`
+        ),
+    ].join("");
+
+    return `
+        <tr class="${rowCls} transition-colors">
+            <td class="py-2.5 px-4">
+                <p class="font-semibold text-slate-200">${escapeHtml(item.product_name || "-")}</p>
+                <p class="text-[10px] text-slate-500 font-mono">${escapeHtml(item.manifest_id)}${item.card_number ? ` · #${escapeHtml(item.card_number)}` : ""}</p>
+                ${problems.length ? `<ul class="mt-1 space-y-0.5">${problems.map(p => `<li class="text-[10px] text-amber-300">⚠ ${escapeHtml(p)}</li>`).join("")}</ul>` : ""}
+            </td>
+            <td class="py-2.5 px-4">${draftActionBadge(item.action)}</td>
+            <td class="py-2.5 px-4 text-center whitespace-nowrap">
+                ${from(item.observed_qty, item.proposed_qty, false)}
+                <input type="number" min="0" value="${item.proposed_qty === null ? "" : item.proposed_qty}"
+                    ${excluded ? "disabled" : ""}
+                    onchange="updateDraftItem(${item.id}, { proposed_qty: parseInt(this.value, 10) })"
+                    class="w-16 text-center px-1.5 py-1 rounded-lg bg-dark-900 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-brand-500 disabled:opacity-50">
+            </td>
+            <td class="py-2.5 px-4 text-center whitespace-nowrap">
+                ${from(item.observed_price, item.proposed_price, true)}
+                <input type="number" min="0" step="0.01" value="${item.proposed_price === null ? "" : Number(item.proposed_price).toFixed(2)}"
+                    ${excluded ? "disabled" : ""}
+                    onchange="updateDraftItem(${item.id}, { proposed_price: parseFloat(this.value) })"
+                    class="w-20 text-center px-1.5 py-1 rounded-lg bg-dark-900 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-brand-500 disabled:opacity-50">
+            </td>
+            <td class="py-2.5 px-4">
+                <select ${excluded ? "disabled" : ""}
+                    onchange="updateDraftItem(${item.id}, { group_key: this.value })"
+                    class="max-w-[14rem] truncate px-2 py-1 rounded-lg bg-dark-900 border border-slate-700 text-slate-200 text-[11px] focus:outline-none focus:border-brand-500 disabled:opacity-50"
+                    title="Move this card into another listing, or give it one of its own">
+                    ${options}
+                </select>
+            </td>
+            <td class="py-2.5 px-4 text-right">
+                <button onclick="updateDraftItem(${item.id}, { status: '${excluded ? "pending" : "excluded"}' })"
+                    class="text-[11px] font-semibold px-2 py-1 rounded-lg border transition-all ${excluded
+                        ? "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
+                        : "bg-dark-900 border-slate-700 text-slate-400 hover:text-rose-300"}"
+                    title="${excluded ? "Put this card back into the draft" : "Leave this card out of the push"}">
+                    ${excluded ? "Left out" : "Included"}
+                </button>
+            </td>
+        </tr>`;
+}
+
+function renderDraftBlockers(blockers) {
+    const box = document.getElementById("draftBlockers");
+    const list = document.getElementById("draftBlockersList");
+    const heading = document.getElementById("draftBlockersHeading");
+    if (!box || !list) return;
+
+    if (!blockers.length) {
+        box.classList.add("hidden");
+        return;
+    }
+    const total = blockers.reduce((n, b) => n + b.problems.length, 0);
+    if (heading) {
+        heading.innerText =
+            `${total} problem(s) across ${blockers.length} listing(s) must be fixed or left out`;
+    }
+    list.innerHTML = blockers.map(b => {
+        const name = isSingleGroup(b.group_key)
+            ? "Single listing"
+            : `${escapeHtml(b.set_name || "(no set)")} · ${escapeHtml(b.condition || "-")}`;
+        return `
+            <div>
+                <span class="font-semibold text-amber-200">${name}</span>
+                <ul class="ml-4 list-disc">
+                    ${b.problems.map(p => `<li>${p.product_name ? `<span class="font-mono text-[10px]">${escapeHtml(p.manifest_id)}</span> ${escapeHtml(p.product_name)}: ` : ""}${escapeHtml(p.problem)}</li>`).join("")}
+                </ul>
+            </div>`;
+    }).join("");
+    box.classList.remove("hidden");
+}
+
+function setDraftsBadge(count) {
+    const badge = document.getElementById("draftsCountBadge");
+    if (!badge) return;
+    if (!count) {
+        badge.classList.add("hidden");
+        return;
+    }
+    badge.innerText = count > 999 ? "999+" : String(count);
+    badge.classList.remove("hidden");
+}
+
+async function buildDraftPlan() {
+    const button = document.getElementById("btnBuildPlan");
+    const container = document.getElementById("draftGroups");
+    if (button) button.disabled = true;
+    if (container) {
+        container.innerHTML = `<div class="glass-card rounded-2xl border border-slate-800 bg-dark-800/40 p-8 text-center text-slate-500 text-xs">Comparing the catalogue against eBay&hellip;</div>`;
+    }
+    try {
+        const res = await fetch("/api/plans/build", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source: "manual" }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not build a draft");
+        logToTerminal(
+            "SUCCESS",
+            `Draft ${data.plan_id}: ${data.item_count} change(s) across ${data.group_count} listing(s)`
+                + (data.invalid_count ? `, ${data.invalid_count} needing attention` : "")
+        );
+        await fetchDraftPlan();
+    } catch (err) {
+        logToTerminal("ERROR", `Draft build failed: ${err.message}`);
+        await fetchDraftPlan();
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+async function updateDraftItem(itemId, changes) {
+    try {
+        const res = await fetch(`/api/plans/items/${itemId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(changes),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not apply that change");
+        // Refetched rather than patched in place: a regrouping changes which
+        // listings exist and therefore what every other row may move into.
+        await fetchDraftPlan();
+    } catch (err) {
+        logToTerminal("ERROR", `Draft edit failed: ${err.message}`);
+        await fetchDraftPlan();
+    }
+}
+
+async function approveDraftPlan() {
+    if (!currentDraftPlan || !currentDraftPlan.plan) return;
+    const planId = currentDraftPlan.plan.id;
+    const button = document.getElementById("btnApprovePlan");
+    if (button) button.disabled = true;
+    try {
+        const res = await fetch(`/api/plans/${planId}/approve`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not approve this draft");
+        logToTerminal(
+            "SUCCESS",
+            `Draft ${planId} approved: ${data.approved_items} change(s) cleared to push`
+        );
+        await fetchDraftPlan();
+    } catch (err) {
+        logToTerminal("ERROR", `Approval failed: ${err.message}`);
+        if (button) button.disabled = false;
+    }
+}
+
+async function discardDraftPlan() {
+    if (!currentDraftPlan || !currentDraftPlan.plan) return;
+    const planId = currentDraftPlan.plan.id;
+    if (!confirm("Discard this draft? The catalogue is untouched and a new draft can be rebuilt at any time.")) {
+        return;
+    }
+    try {
+        const res = await fetch(`/api/plans/${planId}`, { method: "DELETE" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not discard this draft");
+        logToTerminal("INFO", `Draft ${planId} discarded`);
+        await fetchDraftPlan();
+    } catch (err) {
+        logToTerminal("ERROR", `Discard failed: ${err.message}`);
     }
 }
 
