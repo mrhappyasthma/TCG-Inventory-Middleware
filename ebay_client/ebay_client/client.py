@@ -83,4 +83,8 @@ class EbayClient:
             "marketplace_id": self.config.marketplace_id,
             "connected": self.oauth.is_connected(),
             "refresh_expires_at": self.oauth.refresh_expires_at(),
+            # A mismatch can never authenticate, and eBay's own error for it
+            # ("client authentication failed") points at the secret rather
+            # than at the environment. Say so before a token is attempted.
+            "misconfiguration": self.config.environment_mismatch(),
         }

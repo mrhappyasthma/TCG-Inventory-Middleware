@@ -1664,10 +1664,18 @@ def ebay_callback(
     try:
         client.oauth.exchange_code(code)
     except EbayError as exc:
-        # The detail is eBay's, not ours, and it names the real cause -- most
-        # often a RuName that does not match the keyset.
+        # eBay's own detail, plus whatever we can add. Its 401 for the token
+        # endpoint says only "client authentication failed", which names
+        # neither the credential nor the environment -- so the hints below are
+        # usually more useful than the error itself.
         print(f"[ebay] authorization code exchange failed: {exc}", flush=True)
-        return page("eBay refused the authorization", str(exc), False)
+        hint = client.config.environment_mismatch() or (
+            "Check EBAY_CLIENT_SECRET against the Cert ID on the Application "
+            "Keysets page, and that EBAY_CLIENT_ID and EBAY_CLIENT_SECRET come "
+            "from the same keyset. A .env saved with Windows line endings can "
+            "also leave a stray carriage return on the value."
+        )
+        return page("eBay refused the authorization", f"{exc}. {hint}", False)
 
     print("[ebay] account connected", flush=True)
     return page(

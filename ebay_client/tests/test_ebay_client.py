@@ -111,6 +111,52 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.scopes, ["scope/one", "scope/two"])
 
+    def test_an_app_id_declaring_the_wrong_environment_is_reported(self):
+        # eBay's own error for this is "client authentication failed", which
+        # blames the secret and sends you hunting in the wrong place.
+        config = make_config(
+            client_id="MarkKlar-PokemonI-PRD-25fddd70c-24ee0a2c",
+            environment="sandbox",
+        )
+        message = config.environment_mismatch()
+        self.assertIsNotNone(message)
+        self.assertIn("production", message)
+        self.assertEqual(config.app_id_environment(), "production")
+
+    def test_a_matching_app_id_reports_no_mismatch(self):
+        self.assertIsNone(
+            make_config(
+                client_id="MarkKlar-PokemonI-SBX-abc-def", environment="sandbox"
+            ).environment_mismatch()
+        )
+
+    def test_an_app_id_without_a_marker_is_not_second_guessed(self):
+        # Not every keyset name carries the marker, and inventing a mismatch
+        # would block a working configuration.
+        config = make_config(client_id="some-other-shape")
+        self.assertIsNone(config.app_id_environment())
+        self.assertIsNone(config.environment_mismatch())
+
+    def test_windows_line_endings_do_not_reach_the_credentials(self):
+        """
+        In the container these arrive through docker-compose's .env
+        substitution, and compose does not strip a trailing CR -- so a .env
+        saved on Windows produces a secret ending in "\\r", and eBay answers
+        "client authentication failed" naming nothing useful.
+        """
+        config = EbayConfig.from_env(
+            {
+                "EBAY_CLIENT_ID": "cid\r",
+                "EBAY_CLIENT_SECRET": '  "secret"\r\n',
+                "EBAY_REDIRECT_URI": "Mark-RuName\r",
+                "EBAY_ENVIRONMENT": "production\r",
+            }
+        )
+        self.assertEqual(config.client_id, "cid")
+        self.assertEqual(config.client_secret, "secret")
+        self.assertEqual(config.redirect_uri, "Mark-RuName")
+        self.assertEqual(config.environment, "production")
+
     def test_is_configured_does_not_raise_on_a_bare_environment(self):
         self.assertFalse(EbayConfig.is_configured({}))
         self.assertTrue(

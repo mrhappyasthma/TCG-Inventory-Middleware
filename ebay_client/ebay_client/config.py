@@ -46,6 +46,14 @@ APP_SCOPES = [
 
 DEFAULT_MARKETPLACE_ID = "EBAY_US"
 
+# eBay embeds the environment in the App ID itself -- a production keyset reads
+# like "MarkKlar-PokemonI-PRD-25fddd70c-24ee0a2c" and a sandbox one carries
+# SBX. That makes the commonest misconfiguration *detectable* rather than
+# merely fatal: posting production credentials to the sandbox token endpoint
+# fails with "client authentication failed", which names neither the
+# environment nor the credential and sends you hunting for a bad secret.
+_APP_ID_ENVIRONMENT_MARKERS = (("-PRD-", PRODUCTION), ("-SBX-", SANDBOX))
+
 
 @dataclass
 class EbayConfig:
@@ -87,6 +95,32 @@ class EbayConfig:
     def is_sandbox(self) -> bool:
         return self.environment == SANDBOX
 
+    def app_id_environment(self) -> Optional[str]:
+        """Which environment the App ID says it belongs to, if it says."""
+        upper = (self.client_id or "").upper()
+        for marker, environment in _APP_ID_ENVIRONMENT_MARKERS:
+            if marker in upper:
+                return environment
+        return None
+
+    def environment_mismatch(self) -> Optional[str]:
+        """
+        A description of an environment/credential mismatch, or None.
+
+        Deliberately not raised. A mismatch can never authenticate, but
+        raising at construction time turns every status check into a 500 and
+        reports the integration as unconfigured -- which is the opposite of
+        the diagnosis. Reporting it lets the dashboard say the actual cause.
+        """
+        declared = self.app_id_environment()
+        if declared and declared != self.environment:
+            return (
+                f"EBAY_ENVIRONMENT is {self.environment!r} but the App ID is a "
+                f"{declared} keyset. Credentials are not interchangeable "
+                f"between environments; set EBAY_ENVIRONMENT={declared}."
+            )
+        return None
+
     @classmethod
     def from_env(cls, env=None) -> "EbayConfig":
         """
@@ -108,14 +142,29 @@ class EbayConfig:
                 + ", ".join(missing)
             )
         raw_scopes = env.get("EBAY_SCOPES", "").strip()
+
+        def clean(name: str, default: str = "") -> str:
+            """
+            Trim surrounding whitespace, quotes and stray carriage returns.
+
+            Not paranoia. In the container these values arrive through
+            docker-compose's ``.env`` substitution rather than through the
+            app's own loader, and compose does not strip a trailing CR -- so a
+            ``.env`` saved with Windows line endings yields a client secret
+            ending in "\\r". The Basic auth header then carries it and eBay
+            answers "client authentication failed", naming nothing useful.
+            """
+            value = str(env.get(name, default) or "")
+            return value.strip().strip('"').strip("'").strip()
+
         return cls(
-            client_id=env["EBAY_CLIENT_ID"],
-            client_secret=env["EBAY_CLIENT_SECRET"],
-            redirect_uri=env["EBAY_REDIRECT_URI"],
-            environment=env.get("EBAY_ENVIRONMENT", PRODUCTION).strip().lower(),
-            marketplace_id=env.get("EBAY_MARKETPLACE_ID", DEFAULT_MARKETPLACE_ID),
+            client_id=clean("EBAY_CLIENT_ID"),
+            client_secret=clean("EBAY_CLIENT_SECRET"),
+            redirect_uri=clean("EBAY_REDIRECT_URI"),
+            environment=clean("EBAY_ENVIRONMENT", PRODUCTION).lower(),
+            marketplace_id=clean("EBAY_MARKETPLACE_ID", DEFAULT_MARKETPLACE_ID),
             scopes=raw_scopes.split() if raw_scopes else list(DEFAULT_SCOPES),
-            verification_token=env.get("EBAY_VERIFICATION_TOKEN") or None,
+            verification_token=clean("EBAY_VERIFICATION_TOKEN") or None,
         )
 
     @classmethod

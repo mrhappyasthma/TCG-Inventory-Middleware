@@ -1824,6 +1824,12 @@ async function refreshEbayStatus() {
             return;
         }
 
+        // A credential/environment mismatch can never authenticate, and
+        // eBay's error for it blames the secret. Say it plainly instead.
+        const misconfigured = data.misconfiguration
+            ? `<p class="text-amber-300 mt-1">${escapeHtml(data.misconfiguration)}</p>`
+            : "";
+
         connect.disabled = false;
         if (data.connected) {
             // The refresh token dies after about eighteen months and the only
@@ -1843,7 +1849,8 @@ async function refreshEbayStatus() {
             box.innerHTML = `
                 <p class="text-slate-300 font-semibold">Not connected</p>
                 <p class="text-slate-400">Environment: <span class="font-mono">${escapeHtml(data.environment || "-")}</span></p>
-                <p class="text-slate-500">Connecting opens eBay's consent screen in a new tab.</p>`;
+                <p class="text-slate-500">Connecting opens eBay's consent screen in a new tab.</p>
+                ${misconfigured}`;
             connect.innerText = "Connect eBay account";
             disconnect.classList.add("hidden");
         }
