@@ -112,6 +112,50 @@ against different numbers than the ones reviewed.
 
 ---
 
+## 3a. The Inventory API cannot see the existing store
+
+**Found while building the read path, and it invalidates an assumption in §4.**
+
+The Inventory API only manages listings that were created *through* the
+Inventory API. That is what `bulkMigrateListing` exists for: it converts an
+existing eBay listing into the Inventory Location, Inventory Item and Offer
+objects the API works in. A store built with File Exchange has none of those,
+so `getOffers` returns nothing for it and `bulkUpdatePriceQuantity` has
+nothing to update.
+
+So the store divides in two, and the boundary is how a listing was created:
+
+| | Existing File Exchange listings | Listings we create via the Inventory API |
+|---|---|---|
+| Read | Feed API `LMS_ACTIVE_INVENTORY_REPORT` | `getOffers`, or the same report |
+| Update | needs migration first | `bulkUpdatePriceQuantity` |
+
+**Reading is solved and needs no migration.** The Feed API's LMS reports live
+in the same world as File Exchange and see the listings as they are. That is
+what `/api/ebay/sync` uses, and it feeds the same parser the uploaded report
+does.
+
+`GetSellerList` would also read them, but it requires a start-time window of
+at most 120 days — so an older store means paging over several windows and
+stitching them — and it returns XML needing a second parser.
+
+**Writing is an open decision, and it is the real one.** Three options:
+
+1. **Migrate** the existing listings with `bulkMigrateListing`, then use the
+   Inventory API for everything. Cleanest end state, and §4 becomes true as
+   written. But migration mutates live listings, so it is exactly the kind of
+   change that belongs behind the approval gate rather than in a setup script.
+2. **Write through the Trading API** (`ReviseFixedPriceItem`) for the legacy
+   listings, and the Inventory API only for new ones. No migration, but two
+   push paths to maintain, on an API eBay is retiring.
+3. **Feed API `LMS_REVISE_INVENTORY_STATUS`** for quantity and price on legacy
+   listings. Same asynchronous shape as the report we already fetch, so it
+   reuses this code, and no migration.
+
+Option 3 looks strongest for reprices and quantity changes — the bulk of what
+this system does — with the Inventory API used for genuinely new listings.
+Not decided; §10 tracks it.
+
 ## 4. Push semantics
 
 The push worker walks approved items grouped by `group_key`, because eBay's
@@ -307,6 +351,15 @@ The drafts page therefore arrives at step 4, before any write risk exists.
 ---
 
 ## 10. Open questions
+
+* **How to write to the existing File Exchange listings** (§3a) — the biggest
+  one, since the Inventory API cannot touch them without migration. Leaning
+  toward the Feed API's `LMS_REVISE_INVENTORY_STATUS` for quantity and price,
+  with the Inventory API for new listings only.
+* **The Feed report's exact column names** have not yet been seen against a
+  real store. The parser accepts both documented shapes and `/api/ebay/sync`
+  returns the headers it saw, so a mismatch is diagnosable on the first run
+  rather than silent.
 
 * **Bin location in the SKU** (§7) — the recommendation moves it out of eBay
   entirely, which changes how orders are physically picked.
