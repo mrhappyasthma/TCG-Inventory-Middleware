@@ -16,11 +16,22 @@ COPY requirements.txt .
 # "tcg_engine" as a namespace package pointing at that directory, shadowing the
 # installed distribution. Submodules still resolve, so it appears to work until
 # something imports the package itself.
+#
+# ebay_client is staged the same way and for the same reason: its layout is
+# ebay_client/ebay_client/, so it would shadow itself identically.
+#
+# Both MUST be installed explicitly. requirements.txt lists them as editable
+# installs and the grep below strips every '-e' line, so a local package that
+# is not named here is simply absent from the image. app/main.py imports
+# ebay_client at module load, which turned that omission into a container that
+# would not start at all and a reverse proxy answering 502 for the whole site.
 COPY tcg_engine/ /src/tcg_engine/
-RUN pip install --no-cache-dir /src/tcg_engine \
+COPY ebay_client/ /src/ebay_client/
+RUN pip install --no-cache-dir /src/tcg_engine "/src/ebay_client[notifications]" \
  && grep -v '^-e ' requirements.txt > /tmp/requirements-web.txt \
  && pip install --no-cache-dir -r /tmp/requirements-web.txt \
- && rm -rf /src /tmp/requirements-web.txt
+ && rm -rf /src /tmp/requirements-web.txt \
+ && python -c "import tcg_engine.db, ebay_client.client"
 
 # Copy application files
 COPY app/ ./app/

@@ -23,4 +23,17 @@ services:
       # Optional: if blank, a random secret is generated and persisted to /data.
       - JWT_SECRET=${JWT_SECRET:-}
       - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      # eBay integration. All optional: with these blank the app is the CSV
+      # tool it has always been and every eBay control is absent. They must be
+      # listed here or a value in .env never reaches the container.
+      - EBAY_CLIENT_ID=${EBAY_CLIENT_ID:-}
+      - EBAY_CLIENT_SECRET=${EBAY_CLIENT_SECRET:-}
+      - EBAY_REDIRECT_URI=${EBAY_REDIRECT_URI:-}
+      - EBAY_ENVIRONMENT=${EBAY_ENVIRONMENT:-sandbox}
+      - EBAY_MARKETPLACE_ID=${EBAY_MARKETPLACE_ID:-EBAY_US}
+      - EBAY_VERIFICATION_TOKEN=${EBAY_VERIFICATION_TOKEN:-}
+      # Must be the public URL exactly as entered in eBay's console: the
+      # endpoint challenge hashes this string, and behind the reverse proxy it
+      # is not the URL this container sees.
+      - EBAY_NOTIFICATION_ENDPOINT=${EBAY_NOTIFICATION_ENDPOINT:-}
     restart: unless-stopped
