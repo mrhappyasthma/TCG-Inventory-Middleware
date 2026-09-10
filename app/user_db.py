@@ -66,7 +66,105 @@ class UserDatabase:
                 WHERE google_sub IS NOT NULL;
                 """
             )
+
+            # The connected eBay account. One row, ever: there is one eBay
+            # store behind this application, the inventory it manages is
+            # shared rather than per-user, and letting two users each connect
+            # a different account would make it ambiguous which store a push
+            # targets. The CHECK is what enforces that rather than convention.
+            #
+            # It lives in the users database rather than beside the inventory
+            # deliberately. The inventory database is the one that gets
+            # restored from a snapshot in the admin Database panel, and a
+            # restore must not silently cost the eBay connection -- the
+            # refresh token is the only credential here that cannot be
+            # recreated without an interactive re-consent.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ebay_connection (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    token_json TEXT NOT NULL,
+                    connected_by INTEGER,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
             conn.commit()
+
+    # -- eBay connection ---------------------------------------------------
+
+    def get_ebay_token(self) -> Optional[Dict[str, Any]]:
+        """
+        The stored eBay token record, or None when no account is connected.
+
+        Returns the decoded payload rather than the raw row: the caller is
+        ebay_client's TokenStore, which is deliberately ignorant of SQLite.
+        """
+        import json
+
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT token_json FROM ebay_connection WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            token = json.loads(row["token_json"])
+        except (ValueError, TypeError):
+            # A corrupt row is treated as "not connected" rather than raising.
+            # The remedy is the same either way -- reconnect -- and raising
+            # here would take out every request that checks eBay status.
+            return None
+        return token or None
+
+    def save_ebay_token(
+        self, token: Optional[Dict[str, Any]], connected_by: Optional[int] = None
+    ) -> None:
+        """
+        Persist the eBay token record, replacing any previous connection.
+
+        An empty or falsy token clears the row, which is how disconnecting
+        works: ebay_client's TokenStore.clear() saves an empty dict, and
+        leaving a blank record behind would report a connection that cannot
+        authenticate.
+        """
+        import json
+
+        with self.get_connection() as conn:
+            if not token:
+                conn.execute("DELETE FROM ebay_connection WHERE id = 1")
+                conn.commit()
+                return
+            conn.execute(
+                """
+                INSERT INTO ebay_connection (id, token_json, connected_by, updated_at)
+                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    token_json = excluded.token_json,
+                    connected_by = excluded.connected_by,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (json.dumps(token), connected_by),
+            )
+            conn.commit()
+
+    def get_ebay_connection_meta(self) -> Optional[Dict[str, Any]]:
+        """
+        Who connected the eBay account and when, without the token itself.
+
+        Split from get_ebay_token so the dashboard can show the connection
+        without the refresh token ever entering a response payload.
+        """
+        with self.get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT c.connected_by, c.updated_at, u.username, u.email
+                FROM ebay_connection c
+                LEFT JOIN users u ON u.id = c.connected_by
+                WHERE c.id = 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_user_count(self) -> int:
         with self.get_connection() as conn:

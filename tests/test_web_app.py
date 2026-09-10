@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -1003,6 +1004,169 @@ class TestWebApp(unittest.TestCase):
         finally:
             main._ebay_client = saved_client
             main.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
+
+    # -- connecting the eBay account ---------------------------------------
+
+    def signed_in_second_user(self):
+        """A session for the non-admin account approved back in test 04."""
+        other = TestClient(app)
+        with mock.patch(
+            "app.main.verify_google_id_token",
+            return_value=google_claims(
+                "google-sub-second", "second@example.com", "Second User"
+            ),
+        ):
+            other.post("/api/auth/google", json={"id_token": "stub"})
+        return other
+
+    def test_40_status_reports_configuration_without_leaking_tokens(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.get("/api/ebay/status")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertTrue(body["available"])
+        self.assertTrue(body["configured"])
+        self.assertEqual(body["environment"], "sandbox")
+        # No token material may appear in a response the dashboard renders.
+        serialised = json.dumps(body)
+        self.assertNotIn("refresh_token", serialised)
+        self.assertNotIn(os.environ["EBAY_CLIENT_SECRET"], serialised)
+
+    def test_41_connecting_is_admin_only(self):
+        # The inventory is shared and there is one eBay store behind it, so
+        # the connection is infrastructure rather than a user preference.
+        second = self.signed_in_second_user()
+        self.assertEqual(second.post("/api/ebay/connect").status_code, 403)
+        self.assertEqual(second.post("/api/ebay/disconnect").status_code, 403)
+        # But a non-admin may still see whether eBay is connected.
+        self.assertEqual(second.get("/api/ebay/status").status_code, 200)
+
+    def test_42_connect_returns_a_consent_url_with_a_signed_state(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.post("/api/ebay/connect")
+        self.assertEqual(res.status_code, 200)
+        url = res.json()["authorization_url"]
+        self.assertIn("auth.sandbox.ebay.com", url)
+        self.assertIn("client_id=test-ebay-client-id", url)
+
+        state = url.split("state=")[1].split("&")[0]
+        claims = main.decode_jwt_token(state)
+        self.assertEqual(claims["purpose"], "ebay_oauth")
+        self.assertIsNotNone(claims.get("user_id"))
+
+    def test_43_the_callback_refuses_a_missing_or_forged_state(self):
+        """
+        Without this check anyone able to reach the callback could deliver an
+        authorization code of their choosing and connect *their* eBay account
+        to this deployment.
+        """
+        anonymous = TestClient(app)
+        for label, params in (
+            ("no state", {"code": "abc"}),
+            ("garbage state", {"code": "abc", "state": "a.b.c"}),
+            (
+                "wrong purpose",
+                {
+                    "code": "abc",
+                    "state": main.create_jwt_token({"purpose": "session"}),
+                },
+            ),
+        ):
+            with self.subTest(case=label):
+                res = anonymous.get("/api/ebay/callback", params=params)
+                self.assertEqual(res.status_code, 400)
+                self.assertIn("no longer valid", res.text)
+
+    def test_44_a_declined_consent_escapes_ebays_error_text(self):
+        """
+        error_description arrives in a query string, so it is controlled by
+        anyone who can get a person to click a link. It is rendered into HTML.
+        """
+        res = TestClient(app).get(
+            "/api/ebay/callback",
+            params={
+                "error": "access_denied",
+                "error_description": "<script>alert(1)</script>",
+            },
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertNotIn("<script>alert(1)</script>", res.text)
+        self.assertIn("&lt;script&gt;", res.text)
+
+    def test_45_a_valid_callback_stores_the_refresh_token(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        url = self.client.post("/api/ebay/connect").json()["authorization_url"]
+        state = url.split("state=")[1].split("&")[0]
+
+        client = main.get_ebay_client()
+        original_opener = client.oauth._opener
+
+        def fake_opener(method, target, headers, body, timeout):
+            from ebay_client.transport import Response
+
+            return Response(
+                200,
+                {"Content-Type": "application/json"},
+                json.dumps(
+                    {
+                        "access_token": "at",
+                        "expires_in": 7200,
+                        "refresh_token": "rt-from-consent",
+                        "refresh_token_expires_in": 47304000,
+                    }
+                ).encode(),
+            )
+
+        client.oauth._opener = fake_opener
+        try:
+            res = TestClient(app).get(
+                "/api/ebay/callback", params={"code": "the-code", "state": state}
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertIn("connected", res.text)
+
+            stored = user_db.get_ebay_token()
+            self.assertEqual(stored["refresh_token"], "rt-from-consent")
+            # The connection records who authorised it: approval to write to a
+            # live storefront should not be anonymous.
+            meta = user_db.get_ebay_connection_meta()
+            self.assertEqual(meta["username"], "Admin User")
+
+            self.assertTrue(self.client.get("/api/ebay/status").json()["connected"])
+        finally:
+            client.oauth._opener = original_opener
+
+    def test_46_disconnecting_forgets_the_token(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.post("/api/ebay/disconnect")
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.json()["connected"])
+        self.assertIsNone(user_db.get_ebay_token())
+        self.assertFalse(self.client.get("/api/ebay/status").json()["connected"])
+
+    def test_47_the_token_survives_an_inventory_restore(self):
+        """
+        The refresh token lives in the users database, not the inventory one.
+
+        The inventory database is what the admin Database panel restores from a
+        snapshot, and a restore must not silently cost the eBay connection --
+        the refresh token is the only credential here that cannot be recreated
+        without an interactive re-consent.
+        """
+        user_db.save_ebay_token({"refresh_token": "survivor"}, connected_by=1)
+        try:
+            with db.get_connection() as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+            self.assertNotIn("ebay_connection", tables)
+            self.assertEqual(user_db.get_ebay_token()["refresh_token"], "survivor")
+        finally:
+            user_db.save_ebay_token(None)
+
 
 if __name__ == "__main__":
     unittest.main()

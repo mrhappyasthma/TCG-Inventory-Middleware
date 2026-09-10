@@ -1782,6 +1782,107 @@ function noteConsoleActivity(level) {
 let restoreValidatedFile = null;
 
 document.getElementById("btnDatabasePanel")?.addEventListener("click", openDatabaseModal);
+document.getElementById("btnEbayPanel")?.addEventListener("click", openEbayModal);
+
+// -------------------------------------------------------------------
+// eBay account connection (admin only)
+// -------------------------------------------------------------------
+
+function openEbayModal() {
+    document.getElementById("accountMenu")?.classList.add("hidden");
+    document.getElementById("ebayModal").classList.remove("hidden");
+    refreshEbayStatus();
+}
+
+function closeEbayModal() {
+    document.getElementById("ebayModal").classList.add("hidden");
+}
+
+async function refreshEbayStatus() {
+    const box = document.getElementById("ebayStatusBox");
+    const connect = document.getElementById("btnEbayConnect");
+    const disconnect = document.getElementById("btnEbayDisconnect");
+    if (!box) return;
+
+    try {
+        const res = await fetch("/api/ebay/status");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not read eBay status");
+
+        if (!data.available) {
+            box.innerHTML = `<p class="text-amber-300">The eBay client library is not installed in this deployment, so every eBay feature is disabled. The rest of the app is unaffected.</p>`;
+            connect.disabled = true;
+            disconnect.classList.add("hidden");
+            return;
+        }
+        if (!data.configured) {
+            box.innerHTML = `
+                <p class="text-amber-300 font-semibold">Not configured</p>
+                <p class="text-slate-400">Set <span class="font-mono">EBAY_CLIENT_ID</span>, <span class="font-mono">EBAY_CLIENT_SECRET</span> and <span class="font-mono">EBAY_REDIRECT_URI</span> in <span class="font-mono">.env</span>, then restart the container.</p>`;
+            connect.disabled = true;
+            disconnect.classList.add("hidden");
+            return;
+        }
+
+        connect.disabled = false;
+        if (data.connected) {
+            // The refresh token dies after about eighteen months and the only
+            // cure is another consent screen, so show the date rather than
+            // waiting for it to fail.
+            const expiry = data.refresh_expires_at
+                ? new Date(data.refresh_expires_at * 1000).toLocaleDateString()
+                : "unknown";
+            box.innerHTML = `
+                <p class="text-emerald-400 font-semibold">Connected</p>
+                <p class="text-slate-400">Environment: <span class="font-mono">${escapeHtml(data.environment || "-")}</span> &middot; Marketplace: <span class="font-mono">${escapeHtml(data.marketplace_id || "-")}</span></p>
+                ${data.connected_by ? `<p class="text-slate-400">Authorised by ${escapeHtml(data.connected_by)}${data.connected_at ? ` on ${escapeHtml(String(data.connected_at).slice(0, 10))}` : ""}</p>` : ""}
+                <p class="text-slate-500">Access must be renewed by ${escapeHtml(expiry)}.</p>`;
+            connect.innerText = "Reconnect";
+            disconnect.classList.remove("hidden");
+        } else {
+            box.innerHTML = `
+                <p class="text-slate-300 font-semibold">Not connected</p>
+                <p class="text-slate-400">Environment: <span class="font-mono">${escapeHtml(data.environment || "-")}</span></p>
+                <p class="text-slate-500">Connecting opens eBay's consent screen in a new tab.</p>`;
+            connect.innerText = "Connect eBay account";
+            disconnect.classList.add("hidden");
+        }
+    } catch (err) {
+        box.innerHTML = `<p class="text-rose-400">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+async function connectEbayAccount() {
+    const button = document.getElementById("btnEbayConnect");
+    if (button) button.disabled = true;
+    try {
+        const res = await fetch("/api/ebay/connect", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not start the connection");
+        // A new tab, so the dashboard is not lost if consent is abandoned.
+        window.open(data.authorization_url, "_blank", "noopener");
+        logToTerminal("INFO", "Opened eBay's consent screen in a new tab");
+    } catch (err) {
+        logToTerminal("ERROR", `eBay connect failed: ${err.message}`);
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+async function disconnectEbayAccount() {
+    if (!confirm("Disconnect the eBay account? Reconnecting requires the consent screen again.")) {
+        return;
+    }
+    try {
+        const res = await fetch("/api/ebay/disconnect", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not disconnect");
+        logToTerminal("INFO", "eBay account disconnected");
+        refreshEbayStatus();
+    } catch (err) {
+        logToTerminal("ERROR", `eBay disconnect failed: ${err.message}`);
+    }
+}
 
 function openDatabaseModal() {
     restoreValidatedFile = null;

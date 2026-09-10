@@ -5,6 +5,10 @@ import csv
 import hashlib
 import json
 import mimetypes
+# The OAuth callback renders eBay's own error text into a small HTML page.
+# That text arrives in a query string, so it is attacker-controlled for anyone
+# who can get a person to click a link -- it must be escaped.
+from html import escape as escape_html
 import shutil
 import tempfile
 import zipfile
@@ -108,6 +112,7 @@ try:
         payload_topic,
         verify_signature,
     )
+    from ebay_client.oauth import TokenStore
 
     EBAY_CLIENT_AVAILABLE = True
 except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
@@ -133,12 +138,14 @@ except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
     EbayError = SignatureError = _EbayUnavailable
     SIGNATURE_HEADER = "x-ebay-signature"
     challenge_response = payload_topic = verify_signature = None
+    TokenStore = object
 
 try:
     from app.user_db import UserDatabase
     from app.auth import (
         AuthManager,
         create_jwt_token,
+        decode_jwt_token,
         set_session_cookie,
         verify_google_id_token,
         GOOGLE_CLIENT_ID,
@@ -148,6 +155,7 @@ except ImportError:
     from .auth import (
         AuthManager,
         create_jwt_token,
+        decode_jwt_token,
         set_session_cookie,
         verify_google_id_token,
         GOOGLE_CLIENT_ID,
@@ -186,8 +194,30 @@ def get_ebay_client():
     if not EBAY_CLIENT_AVAILABLE:
         return None
     if _ebay_client is None and EbayConfig.is_configured():
-        _ebay_client = EbayClient(EbayConfig.from_env())
+        _ebay_client = EbayClient(
+            EbayConfig.from_env(), store=_UserDbTokenStore()
+        )
     return _ebay_client
+
+
+class _UserDbTokenStore(TokenStore):
+    """
+    Persists the eBay refresh token in the users database.
+
+    The library takes a store rather than touching SQLite itself, which is what
+    keeps it free of any opinion about where credentials live. ``actor`` is set
+    by the OAuth callback just before the code exchange, so the connection can
+    record who authorised it; a refresh does not write, so it never clears it.
+    """
+
+    def __init__(self):
+        self.actor = None
+
+    def load(self):
+        return user_db.get_ebay_token()
+
+    def save(self, token):
+        user_db.save_ebay_token(token, connected_by=self.actor)
 
 # Initialize databases & auth
 db = Database(db_path=DATABASE_URL)
@@ -1484,6 +1514,190 @@ def health_check():
 # ---------------------------------------------------------
 # FRONTEND HTML ROUTE
 # ---------------------------------------------------------
+
+# -------------------------------------------------------------------
+# Connecting the eBay account
+# -------------------------------------------------------------------
+#
+# One connection for the whole deployment, and an administrative one. There is
+# a single eBay store behind this application and the inventory it manages is
+# shared rather than per-user, so letting two users each connect a different
+# account would make it ambiguous which store a push targets. Pricing rules
+# are per-user because they are preferences; the store connection is
+# infrastructure, like backup and restore.
+
+# How long a consent attempt may sit unfinished. Long enough to read eBay's
+# screen, short enough that a stale link in someone's history is useless.
+EBAY_OAUTH_STATE_TTL_SECONDS = 600
+
+
+def _require_ebay_client():
+    client = get_ebay_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "eBay is not configured. Set EBAY_CLIENT_ID, "
+                "EBAY_CLIENT_SECRET and EBAY_REDIRECT_URI."
+            ),
+        )
+    return client
+
+
+@app.get("/api/ebay/status")
+def ebay_status(user: Dict[str, Any] = Depends(require_active_user)):
+    """
+    Whether eBay is configured and connected, for the dashboard.
+
+    Carries no token material. The refresh expiry is included because an eBay
+    refresh token dies after roughly eighteen months and the only cure is an
+    interactive re-consent, so it is worth showing before it lapses rather
+    than after.
+    """
+    client = get_ebay_client()
+    if client is None:
+        return {
+            "available": EBAY_CLIENT_AVAILABLE,
+            "configured": False,
+            "connected": False,
+        }
+    status_payload = dict(client.status())
+    status_payload["available"] = True
+    meta = user_db.get_ebay_connection_meta() or {}
+    status_payload["connected_by"] = meta.get("username")
+    status_payload["connected_at"] = meta.get("updated_at")
+    return status_payload
+
+
+@app.post("/api/ebay/connect")
+def ebay_connect(admin: Dict[str, Any] = Depends(require_admin_user)):
+    """
+    Begin the consent flow: returns the eBay URL to send the seller to.
+
+    The ``state`` is a signed, short-lived token rather than a random string
+    held in memory. Signing it makes the callback self-contained -- it survives
+    a container restart mid-consent -- and verifying it on return is what stops
+    an attacker delivering an authorization code of their choosing to the
+    callback, which would connect *their* eBay account to this deployment.
+    """
+    client = _require_ebay_client()
+    state = create_jwt_token(
+        {"purpose": "ebay_oauth", "user_id": admin["id"]},
+        expires_in_seconds=EBAY_OAUTH_STATE_TTL_SECONDS,
+    )
+    return {"authorization_url": client.oauth.authorization_url(state)}
+
+
+@app.get("/api/ebay/callback")
+def ebay_callback(
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    error_description: str = "",
+    declined: str = "",
+):
+    """
+    Finish the consent flow and store the refresh token.
+
+    Deliberately not behind a session dependency: the signed ``state`` is the
+    authorisation, and it carries the user id itself. Requiring a live session
+    as well would throw away a valid authorization code whenever a session
+    happened to lapse during consent -- and the code cannot be replayed, so
+    that costs a whole re-consent for no security gain.
+
+    Answers HTML rather than JSON because a person's browser lands here, not a
+    program.
+    """
+    def page(title: str, message: str, ok: bool) -> HTMLResponse:
+        colour = "#10B981" if ok else "#F43F5E"
+        return HTMLResponse(
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>{escape_html(title)}</title></head>"
+            "<body style=\"font-family:system-ui,sans-serif;background:#0f172a;"
+            "color:#e2e8f0;display:flex;align-items:center;"
+            "justify-content:center;height:100vh;margin:0\">"
+            "<div style='text-align:center;max-width:34rem;padding:2rem'>"
+            f"<h1 style='color:{colour};font-size:1.25rem'>"
+            f"{escape_html(title)}</h1>"
+            f"<p style='color:#94a3b8;font-size:0.9rem;line-height:1.6'>"
+            f"{escape_html(message)}</p>"
+            "<p><a href='/' style='color:#818CF8;font-size:0.9rem'>"
+            "Back to the dashboard</a></p></div></body></html>",
+            status_code=200 if ok else 400,
+        )
+
+    if declined or error:
+        # eBay's own description is shown: it is the only thing that
+        # distinguishes "I changed my mind" from a misconfigured RuName.
+        return page(
+            "eBay access was not granted",
+            error_description or error or "The consent screen was declined.",
+            False,
+        )
+
+    claims = decode_jwt_token(state) if state else None
+    if not claims or claims.get("purpose") != "ebay_oauth":
+        print("[ebay] oauth callback with a missing or invalid state", flush=True)
+        return page(
+            "That link is no longer valid",
+            "Start the connection again from the dashboard. Consent links "
+            "expire after ten minutes.",
+            False,
+        )
+    if not code:
+        return page(
+            "eBay returned no authorization code",
+            "Start the connection again from the dashboard.",
+            False,
+        )
+
+    client = get_ebay_client()
+    if client is None:
+        return page(
+            "eBay is not configured",
+            "Set EBAY_CLIENT_ID, EBAY_CLIENT_SECRET and EBAY_REDIRECT_URI, "
+            "then try again.",
+            False,
+        )
+
+    client.oauth.store.actor = claims.get("user_id")
+    try:
+        client.oauth.exchange_code(code)
+    except EbayError as exc:
+        # The detail is eBay's, not ours, and it names the real cause -- most
+        # often a RuName that does not match the keyset.
+        print(f"[ebay] authorization code exchange failed: {exc}", flush=True)
+        return page("eBay refused the authorization", str(exc), False)
+
+    print("[ebay] account connected", flush=True)
+    return page(
+        "eBay account connected",
+        "This deployment can now read and manage your listings. Nothing has "
+        "been sent to eBay: a draft still has to be approved before anything "
+        "is pushed.",
+        True,
+    )
+
+
+@app.post("/api/ebay/disconnect")
+def ebay_disconnect(admin: Dict[str, Any] = Depends(require_admin_user)):
+    """
+    Forget the stored refresh token.
+
+    Reconnecting requires the consent screen again, so this is not a toggle to
+    flip idly -- but it is the correct response to a credential you no longer
+    trust.
+    """
+    client = get_ebay_client()
+    if client is not None:
+        client.oauth.disconnect()
+    else:
+        # Still clear the row: the token outlives a configuration change, and
+        # leaving it behind would silently reconnect if the keys came back.
+        user_db.save_ebay_token(None)
+    print(f"[ebay] account disconnected by user {admin['id']}", flush=True)
+    return {"success": True, "connected": False}
+
 
 # -------------------------------------------------------------------
 # eBay marketplace account deletion notifications
