@@ -949,6 +949,33 @@ class TestWebApp(unittest.TestCase):
             (401, 403),
         )
 
+    def test_38b_the_challenge_works_before_any_keyset_credentials_exist(self):
+        """
+        The bootstrap order eBay forces on you: the keyset is disabled until
+        this endpoint validates, and the RuName is registered later still. So
+        the challenge must answer with only the token and the endpoint URL.
+        """
+        saved = main._ebay_client
+        main._ebay_client = None
+        try:
+            with mock.patch.object(
+                main.EbayConfig, "is_configured", return_value=False
+            ):
+                res = TestClient(app).get(
+                    "/api/ebay/notifications", params={"challenge_code": "BOOT"}
+                )
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertEqual(
+                res.json()["challengeResponse"],
+                hashlib.sha256(
+                    b"BOOT"
+                    + os.environ["EBAY_VERIFICATION_TOKEN"].encode()
+                    + os.environ["EBAY_NOTIFICATION_ENDPOINT"].encode()
+                ).hexdigest(),
+            )
+        finally:
+            main._ebay_client = saved
+
     def test_39_an_unconfigured_deployment_reports_503_not_a_crash(self):
         """
         The app must keep working as a CSV tool with no eBay credentials, and

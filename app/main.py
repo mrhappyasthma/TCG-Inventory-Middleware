@@ -129,6 +129,13 @@ PORT = int(os.environ.get("PORT", 8080))
 # single request -- refetching eBay's verification key per notification is
 # what their documentation warns will exhaust the call quota.
 EBAY_NOTIFICATION_ENDPOINT = os.environ.get("EBAY_NOTIFICATION_ENDPOINT", "").strip()
+# Read independently of the rest of the eBay configuration, because the
+# endpoint challenge needs only this and the endpoint URL. That ordering is
+# not hypothetical: eBay disables a new keyset until the deletion endpoint
+# validates, and the RuName is registered later still -- so requiring a
+# complete credential set to answer the challenge would deadlock the very
+# bootstrap the challenge exists to unblock.
+EBAY_VERIFICATION_TOKEN = os.environ.get("EBAY_VERIFICATION_TOKEN", "").strip()
 _ebay_client = None
 
 
@@ -1468,25 +1475,28 @@ def ebay_notification_challenge(challenge_code: str = ""):
     process sees is not the URL eBay called -- and the URL is hashed, so a
     mismatch fails validation with an error that never says why. This is the
     single most common cause of failed endpoint validation.
+
+    Needs only the verification token and the endpoint URL: no client id, no
+    secret, no RuName. eBay disables a new keyset until this endpoint
+    validates, so demanding a complete credential set here would deadlock the
+    bootstrap it exists to unblock.
     """
-    config = get_ebay_client().config if get_ebay_client() else None
-    if config is None or not config.verification_token:
+    missing = [
+        name
+        for name, value in (
+            ("EBAY_VERIFICATION_TOKEN", EBAY_VERIFICATION_TOKEN),
+            ("EBAY_NOTIFICATION_ENDPOINT", EBAY_NOTIFICATION_ENDPOINT),
+        )
+        if not value
+    ]
+    if missing:
         # Deliberately vague to an unauthenticated caller; the detail goes to
         # the log, matching how /api/health handles its failures.
         print(
-            "[ebay] notification challenge received but EBAY_CLIENT_ID/"
-            "EBAY_CLIENT_SECRET/EBAY_REDIRECT_URI/EBAY_VERIFICATION_TOKEN "
-            "are not all configured",
-            flush=True,
-        )
-        raise HTTPException(
-            status_code=503, detail="eBay notifications are not configured."
-        )
-    if not EBAY_NOTIFICATION_ENDPOINT:
-        print(
             "[ebay] notification challenge received but "
-            "EBAY_NOTIFICATION_ENDPOINT is unset; it must be the public URL "
-            "exactly as entered in eBay's console",
+            + ", ".join(missing)
+            + " unset. The endpoint must be the public URL exactly as entered "
+            "in eBay's console, because the challenge hashes that string.",
             flush=True,
         )
         raise HTTPException(
@@ -1498,7 +1508,7 @@ def ebay_notification_challenge(challenge_code: str = ""):
     return {
         "challengeResponse": challenge_response(
             challenge_code,
-            config.verification_token,
+            EBAY_VERIFICATION_TOKEN,
             EBAY_NOTIFICATION_ENDPOINT,
         )
     }
