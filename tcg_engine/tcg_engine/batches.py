@@ -231,6 +231,40 @@ def _flush_warn_tallies(logs: List[Dict[str, str]], tallies: Dict[str, int]) -> 
                     f"first {WARN_SAMPLE_LIMIT} are listed individually."
                 ),
             })
+    # Cleared so a second call is a no-op: the skip path flushes early
+    # to put the tally above its own warning, and the normal path
+    # flushes again before the summary.
+    tallies.clear()
+
+def _log_once(logs: List[Dict[str, str]], tallies: Dict[str, int], kind: str,
+              message: str, level: str = "SUCCESS") -> None:
+    """
+    Log a per-row SUCCESS line, sampled like the warnings are.
+
+    A 426-row export produced 426 of these. Each one is a DOM append in the
+    browser and bytes in the response, for information that is a per-kind
+    tally in practice -- and the volume buried the summary that says what the
+    run actually did.
+    """
+    tallies[kind] = tallies.get(kind, 0) + 1
+    if tallies[kind] <= WARN_SAMPLE_LIMIT:
+        logs.append({"level": level, "message": message})
+
+
+def _flush_log_tallies(logs: List[Dict[str, str]], tallies: Dict[str, int]) -> None:
+    for kind, count in sorted(tallies.items()):
+        if count > WARN_SAMPLE_LIMIT:
+            logs.append({
+                "level": "INFO",
+                "message": (
+                    f"{count} row(s) routed as {kind}; the first "
+                    f"{WARN_SAMPLE_LIMIT} are listed above."
+                ),
+            })
+    # Cleared so a second call is a no-op: the skip path flushes early
+    # to put the tally above its own warning, and the normal path
+    # flushes again before the summary.
+    tallies.clear()
 
 # eBay accepts exactly four ungraded grades, and SortSwift does not supply them,
 # so a translation is genuinely required here rather than being an invented
@@ -516,6 +550,7 @@ def process_batch_csv(
     # Repeated per-row warnings are sampled and tallied rather than
     # logged once each; a few hundred identical lines bury the summary.
     warn_tallies: Dict[str, int] = {}
+    log_tallies: Dict[str, int] = {}
 
     mode = str(quantity_mode or QUANTITY_MODE_SET).strip().lower()
     if mode not in QUANTITY_MODES:
@@ -972,10 +1007,17 @@ def process_batch_csv(
         if is_new:
             new_catalog_count += 1
             bin_note = f" | Bin: {remarks}" if remarks and str(remarks).strip().lower() != "no remark" else ""
-            logs.append({
-                "level": "INFO",
-                "message": f"Row {row_idx}: Registered NEW card -> [{manifest_id}] {product_name} ({set_name} | {condition_name} | {printing} | SKU: {sku_id or 'N/A'}{bin_note})",
-            })
+            # Sampled: a first-time import registers every row, and 426
+            # near-identical lines are noise rather than information. The
+            # count is reported as "new catalog entries created" in the
+            # summary either way.
+            _log_once(
+                logs, log_tallies, "new catalogue entry",
+                f"Row {row_idx}: Registered NEW card -> [{manifest_id}] "
+                f"{product_name} ({set_name} | {condition_name} | {printing} "
+                f"| SKU: {sku_id or 'N/A'}{bin_note})",
+                level="INFO",
+            )
 
         # Check if live on eBay
         variation = db.get_variation(manifest_id)
@@ -1026,10 +1068,9 @@ def process_batch_csv(
             else:
                 revise_pairs.append((manifest_id, revise_entry))
 
-            logs.append({
-                "level": "SUCCESS",
-                "message": f"Row {row_idx}: [REVISE] #{ebay_item_id} [{revise_label}] {product_name} ({qty_note})",
-            })
+            _log_once(logs, log_tallies, "REVISE",
+                      f"Row {row_idx}: [REVISE] #{ebay_item_id} [{revise_label}] "
+                      f"{product_name} ({qty_note})")
         else:
             # ADD Scenario: Stage for Single vs Variation listing
             card_entry = {
@@ -1055,23 +1096,22 @@ def process_batch_csv(
 
             if not group_by_set:
                 staged_singles.append(card_entry)
-                logs.append({
-                    "level": "SUCCESS",
-                    "message": f"Row {row_idx}: [ADD SINGLE] [{ebay_custom_label}] {product_name} (set grouping disabled)",
-                })
+                _log_once(logs, log_tallies, "ADD SINGLE",
+                          f"Row {row_idx}: [ADD SINGLE] [{ebay_custom_label}] "
+                          f"{product_name} (set grouping disabled)")
             elif effective_price >= single_threshold:
                 staged_singles.append(card_entry)
-                logs.append({
-                    "level": "SUCCESS",
-                    "message": f"Row {row_idx}: [ADD SINGLE] [{ebay_custom_label}] {product_name} (Price: ${effective_price:.2f} >= ${single_threshold:.2f} threshold)",
-                })
+                _log_once(logs, log_tallies, "ADD SINGLE",
+                          f"Row {row_idx}: [ADD SINGLE] [{ebay_custom_label}] "
+                          f"{product_name} (Price: ${effective_price:.2f} >= "
+                          f"${single_threshold:.2f} threshold)")
             else:
                 group_key = (set_name, condition_name)
                 staged_variations.setdefault(group_key, []).append(card_entry)
-                logs.append({
-                    "level": "SUCCESS",
-                    "message": f"Row {row_idx}: [ADD VARIATION] [{ebay_custom_label}] {product_name} grouped into '{set_name}' / {condition_name} (Price: ${effective_price:.2f})",
-                })
+                _log_once(logs, log_tallies, "ADD VARIATION",
+                          f"Row {row_idx}: [ADD VARIATION] [{ebay_custom_label}] "
+                          f"{product_name} grouped into '{set_name}' / "
+                          f"{condition_name} (Price: ${effective_price:.2f})")
 
     # -----------------------------------------------------------------
     # BUILD FINAL EBAY ADD CSV (PARENT CONTAINERS + CHILD VARIATIONS + SINGLES)
@@ -1364,6 +1404,11 @@ def process_batch_csv(
     add_csv = add_io.getvalue()
 
     total_added_cards = len(staged_singles) + sum(len(c) for c in staged_variations.values())
+
+    # Tallies before the summary, so the counts read as detail leading into it
+    # rather than trailing after the conclusion.
+    _flush_log_tallies(logs, log_tallies)
+    _flush_warn_tallies(logs, warn_tallies)
 
     logs.append({
         "level": "INFO",

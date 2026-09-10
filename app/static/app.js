@@ -1283,6 +1283,12 @@ async function handleBatchUpload(file, mode = "normal") {
             fetchStats();
             fetchSetFilter();
             fetchInventory();
+            // The catalogue just moved, so any existing draft is describing a
+            // diff that no longer applies. Rebuilding here rather than making
+            // it a second button press is the whole point of the drafts page
+            // being the funnel -- and it is why a draft cannot be edited
+            // before the batch that feeds it has run.
+            rebuildDraftAfterBatch();
         }
     } catch (err) {
         logToTerminal("ERROR", `[MODULE A] ${err.message}`);
@@ -2503,10 +2509,17 @@ function renderDraftPlan(detail) {
             i => i.status !== "excluded" && i.validation && i.validation !== "[]"
         );
         const border = invalid ? "border-amber-800/70" : "border-slate-800";
+        // Open by default: a draft is for reviewing, so hiding the rows would
+        // defeat the point. Collapsing matters because one listing can hold a
+        // hundred cards and scrolling past it to reach the next is the common
+        // case once you have checked it.
         return `
-            <div class="glass-card rounded-2xl border ${border} bg-dark-800/40 overflow-hidden">
-                <div class="px-4 py-3 border-b border-slate-800/80 bg-dark-800/60 flex items-center justify-between gap-3">
-                    <div class="min-w-0">
+            <details open class="group glass-card rounded-2xl border ${border} bg-dark-800/40 overflow-hidden">
+                <summary class="cursor-pointer list-none px-4 py-3 border-b border-slate-800/80 bg-dark-800/60 hover:bg-dark-800/90 transition-colors flex items-center gap-3">
+                    <svg class="caret w-4 h-4 shrink-0 text-slate-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5l7 7-7 7" />
+                    </svg>
+                    <div class="min-w-0 flex-1">
                         <p class="text-xs font-bold text-white truncate">${draftGroupTitle(group, groupItems)}</p>
                         <p class="text-[11px] text-slate-500">
                             ${group.item_count} card(s)${group.excluded_count ? `, ${group.excluded_count} left out` : ""}
@@ -2514,7 +2527,7 @@ function renderDraftPlan(detail) {
                         </p>
                     </div>
                     ${invalid ? `<span class="shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-950/80 text-amber-300 border border-amber-800">Needs attention</span>` : ""}
-                </div>
+                </summary>
                 <div class="overflow-x-auto">
                     <table class="w-full text-left border-collapse text-xs">
                         <thead>
@@ -2532,7 +2545,7 @@ function renderDraftPlan(detail) {
                         </tbody>
                     </table>
                 </div>
-            </div>`;
+            </details>`;
     }).join("");
 
     if (footer) footer.classList.remove("hidden");
@@ -2663,6 +2676,41 @@ function setDraftsBadge(count) {
     }
     badge.innerText = count > 999 ? "999+" : String(count);
     badge.classList.remove("hidden");
+}
+
+async function rebuildDraftAfterBatch() {
+    // Reported rather than silent: a rebuild discards the open draft, and if
+    // edits had been made to it those are gone. Saying so is the difference
+    // between a helpful automation and a confusing one.
+    try {
+        const existing = await fetch("/api/plans");
+        const plans = existing.ok ? (await existing.json()).plans || [] : [];
+        const hadDraft = plans.some(p => p.status === "draft");
+
+        const res = await fetch("/api/plans/build", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source: "batch" }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not build a draft");
+
+        logToTerminal(
+            "SUCCESS",
+            `[DRAFTS] ${hadDraft ? "Replaced the open draft. " : ""}`
+                + `Draft ${data.plan_id}: ${data.item_count} change(s) across `
+                + `${data.group_count} listing(s)`
+                + (data.invalid_count ? `, ${data.invalid_count} needing attention` : "")
+        );
+        setDraftsBadge(data.item_count);
+        // Only re-render if the user is looking at it; otherwise the badge is
+        // enough and a fetch would be wasted.
+        if (activeWorkspaceTab === "drafts") await fetchDraftPlan();
+    } catch (err) {
+        // Never fatal to the batch: the upload itself succeeded, and the draft
+        // can be rebuilt by hand.
+        logToTerminal("WARN", `[DRAFTS] Automatic rebuild failed: ${err.message}`);
+    }
 }
 
 async function buildDraftPlan() {
