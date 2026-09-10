@@ -16,7 +16,13 @@ pip install line is therefore silently absent from the image.
 
 import os
 import re
+import sys
 import unittest
+
+# The lexical checker lives beside these tests rather than in the app: it
+# is test tooling, not something the dashboard ships.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from jslint import check_javascript  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -84,6 +90,98 @@ class EditableInstallsReachTheImageTests(unittest.TestCase):
             r"python -c \"import [^\"]*ebay_client",
             "the Dockerfile should end by importing the packages it installed",
         )
+
+
+class JavaScriptParsesTests(unittest.TestCase):
+    """
+    The dashboard's JavaScript is lexically sound.
+
+    This exists because a syntax error shipped. A string literal containing a
+    real newline instead of a \\n escape left it unterminated, and a syntax
+    error anywhere in app.js stops the *whole file* executing -- the page
+    rendered as signed out and the sign-in button did nothing, because no
+    handler had ever been bound. The checks in place at the time verified
+    element ids and handler names, neither of which can catch that.
+
+    `node --check` is strictly better and should be preferred when a
+    JavaScript runtime is available. This runs without one.
+    """
+
+    def source(self, name):
+        return read("app", "static", name)
+
+    def test_app_js_has_no_lexical_errors(self):
+        problems = check_javascript(self.source("app.js"))
+        self.assertEqual(
+            problems, [],
+            "app.js has lexical errors:\n  "
+            + "\n  ".join(str(p) for p in problems),
+        )
+
+    def test_app_js_parses_if_a_javascript_runtime_is_installed(self):
+        """
+        Upgrade path: `node --check` is a real parser and catches everything
+        the lexer cannot -- a stray `else`, a bad arrow function, a reserved
+        word used as an identifier. Skipped rather than failed when node is
+        absent, so installing it strengthens this check with no code change.
+        """
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed; the lexical check ran instead")
+
+        path = os.path.join(PROJECT_ROOT, "app", "static", "app.js")
+        result = subprocess.run(
+            [node, "--check", path], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"node --check rejected app.js:\n{result.stderr.strip()}",
+        )
+
+    def test_the_checker_catches_a_newline_inside_a_string(self):
+        """
+        The specific defect that shipped, so this test cannot rot into a
+        no-op that passes because the checker stopped working.
+        """
+        problems = check_javascript('const a = "line one\nline two";\n')
+        self.assertTrue(problems)
+        self.assertEqual(problems[0].kind, "unterminated string literal")
+
+    def test_the_checker_catches_the_other_easy_ways_to_break_a_file(self):
+        for label, snippet in (
+            ("unclosed template", "const a = `hello ${name};\n"),
+            ("unclosed brace", "function f() {\n  return 1;\n"),
+            ("stray closing brace", "function f() { return 1; }}\n"),
+            ("unclosed block comment", "/* never closed\nconst a = 1;\n"),
+            ("unclosed quote", "const a = 'oops;\nconst b = 1;\n"),
+        ):
+            with self.subTest(case=label):
+                self.assertTrue(check_javascript(snippet), f"{label} not detected")
+
+    def test_the_checker_accepts_the_constructs_this_codebase_uses(self):
+        """
+        A checker that cried wolf would be turned off, so the awkward-but-valid
+        cases are pinned: regex literals next to division, nested template
+        interpolations, and HTML inside a template.
+        """
+        for label, snippet in (
+            ("regex literal", 'const s = t.replace(/"/g, "&quot;");\n'),
+            ("division", "const r = a / b / c;\n"),
+            ("nested template", "const s = `a ${ `b ${c}` } d`;\n"),
+            ("interpolation then slash", "const s = `${a} / 80 ${b}`;\n"),
+            ("html in a template", 'const s = `<div class="x">${v}</div>`;\n'),
+            ("regex after return", "function f() { return /ab+/.test(x); }\n"),
+        ):
+            with self.subTest(case=label):
+                problems = check_javascript(snippet)
+                self.assertEqual(
+                    problems, [],
+                    f"{label} was wrongly reported: "
+                    + "; ".join(str(p) for p in problems),
+                )
 
 
 class ComposePassesConfigurationThroughTests(unittest.TestCase):
