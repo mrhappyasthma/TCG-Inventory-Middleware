@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ebay-client"
+version = "0.1.0"
+description = "Standalone client for the eBay Sell APIs: OAuth, transport and signed notification verification"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Mark", email = "mark@example.com" }
+]
+# Deliberately empty. Everything except signature verification is stdlib, so
+# the library imports on a bare interpreter and its tests need no network and
+# no packages. See the [project.optional-dependencies] note below.
+dependencies = []
+
+[project.optional-dependencies]
+# Verifying an eBay notification signature needs ECDSA, which the standard
+# library does not provide. The import is deferred into
+# ebay_client.notifications so that the OAuth and transport layers stay usable
+# -- and testable -- without it.
+notifications = ["cryptography>=41.0.0"]

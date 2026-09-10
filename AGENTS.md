@@ -8,8 +8,12 @@
 * **Verify Before Committing**: Always run the automated test suites before committing to ensure no regressions:
   ```powershell
   python -m unittest discover -s tcg_engine/tests
+  python -m unittest discover -s ebay_client/tests -t ebay_client
   python -m unittest tests/test_web_app.py
   ```
+  The `-t ebay_client` is required, not cosmetic: run from the project root
+  without it, the outer `ebay_client/` directory shadows the installed package
+  as an empty namespace package and every import of its public API fails.
 * **Conventional Commit Format**: Use clear, descriptive commit messages following conventional commits:
   * `feat: <summary>` for new features or enhancements
   * `fix: <summary>` for bug fixes
@@ -29,9 +33,10 @@
 
 * **Deployment Target**: Synology NAS via Docker / Container Manager (`docker-compose.yml`).
 * **Persistent Storage**: All persistent database storage must be mapped to `/data` in container and volume mounted to host.
-* **Separation of Concerns**:
+* **Separation of Concerns**: three components, and the boundaries are load-bearing.
   * Core engine in [`tcg_engine/`](file:///c:/Users/Mark/Documents/GitHub/SoftSwift-Ebay-CSV-Converter/tcg_engine) MUST remain pure Python with zero web dependencies so it can be extracted to its own repo or executed via CLI.
-  * Web backend in [`app/`](file:///c:/Users/Mark/Documents/GitHub/SoftSwift-Ebay-CSV-Converter/app) imports `tcg_engine`.
+  * eBay API interaction lives in [`ebay_client/`](file:///c:/Users/Mark/Documents/GitHub/SoftSwift-Ebay-CSV-Converter/ebay_client), its own package with its own tests. Never put HTTP calls to eBay inside an `app/main.py` endpoint, and never grow them inside `tcg_engine`. The boundary is a *vocabulary* boundary: the client speaks SKUs, offers, inventory item groups and order line items, and knows nothing about manifest IDs, pricing rules or SortSwift. Translation happens in the layer above so neither model leaks into the other. It is also the only component holding remote credentials, quotas, retries and signed callbacks, and keeping that behind one seam is what makes it testable with no network access.
+  * Web backend in [`app/`](file:///c:/Users/Mark/Documents/GitHub/SoftSwift-Ebay-CSV-Converter/app) imports both. **Import submodules, not the package root** (`from ebay_client.config import EbayConfig`, not `from ebay_client import EbayConfig`): the app puts the project root on `sys.path`, where the outer `tcg_engine/` and `ebay_client/` directories shadow the installed packages as empty namespace packages. A submodule import resolves through the editable-install finder anyway; a package-root import returns an object with no attributes.
 * **Platform Compatibility**: Code is developed on Windows and deployed to Linux (Synology DSM). Path handling must use `os.path` and avoid OS-specific hardcoding. Explicitly close SQLite connections to prevent Windows file locking.
 
 ---
