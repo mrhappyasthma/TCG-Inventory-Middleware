@@ -1081,14 +1081,21 @@
                     <p id="coverPreviewError" class="hidden text-[11px] text-amber-300 mt-1.5">That URL did not load in the browser. eBay may not be able to fetch it either.</p>
                 </div>
 
+                <!--
+                    How the change reaches eBay depends on which path created
+                    the listing, and the two are not interchangeable: File
+                    Exchange cannot revise a listing the Inventory API
+                    manages. Both halves of this box, and the submit button's
+                    label, are rewritten by openCoverModal().
+                -->
                 <div class="p-3 rounded-xl bg-amber-950/40 border border-amber-800/60 text-[11px] text-amber-200">
                     <p class="font-semibold text-amber-100 mb-1">This replaces the listing&rsquo;s whole picture set</p>
-                    <p>eBay does not merge pictures on a revision &mdash; the uploaded set replaces what is there. Saving here records the change and downloads a Revise CSV; the listing only updates once you upload that file to eBay.</p>
+                    <p id="coverModalHowItApplies">eBay does not merge pictures on a revision &mdash; the set sent replaces what is there.</p>
                 </div>
 
                 <div class="flex items-center justify-end gap-2 pt-2 border-t border-slate-700">
                     <button type="button" onclick="closeCoverModal()" class="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">Cancel</button>
-                    <button type="submit" class="px-4 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20">Save &amp; Download Revise CSV</button>
+                    <button type="submit" id="coverModalSubmit" class="px-4 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20">Save</button>
                 </div>
             </form>
         </div>

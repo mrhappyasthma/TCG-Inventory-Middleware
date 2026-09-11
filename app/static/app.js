@@ -2299,6 +2299,22 @@ function openCoverModal(itemId) {
     document.getElementById("coverModalListing").innerText = listing
         ? `eBay #${itemId} - ${listing.set_name || "?"}, ${listing.card_count} card(s)`
         : `eBay #${itemId}`;
+
+    // A listing this app created through the API is corrected in place. A File
+    // Exchange one needs its Revise file uploaded, and File Exchange cannot
+    // touch an API-managed listing -- so saying the wrong thing here sends
+    // someone to Seller Hub with a file that does nothing.
+    const managed = !!(listing && listing.managed);
+    const how = document.getElementById("coverModalHowItApplies");
+    const submit = document.getElementById("coverModalSubmit");
+    if (how) {
+        how.innerHTML = managed
+            ? "eBay does not merge pictures &mdash; the set sent replaces what is there. This listing was created through the eBay API, so saving applies the change immediately."
+            : "eBay does not merge pictures on a revision &mdash; the uploaded set replaces what is there. Saving records the change and downloads a Revise CSV; this listing only updates once you upload that file to eBay.";
+    }
+    if (submit) {
+        submit.textContent = managed ? "Save & apply to eBay" : "Save & Download Revise CSV";
+    }
     document.getElementById("coverUrlInput").value =
         listing ? (listing.cover_image_url || "") : "";
     updateCoverPreview();
@@ -2456,11 +2472,13 @@ async function fetchEbayListings() {
                     </td>
                     <td class="py-3 px-4 text-slate-500 text-[11px] font-mono">${escapeHtml(l.last_synced || "-")}</td>
                     <td class="py-3 px-4">
-                        <button type="button" onclick="refreshListingContents('${escapeHtml(l.ebay_parent_id)}', this)"
-                            title="Re-send this listing's pictures, item specifics, title and description. Cannot change stock or price."
-                            class="text-[10px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-all disabled:opacity-40">
-                            Refresh
-                        </button>
+                        ${l.managed
+                            ? `<button type="button" onclick="refreshListingContents('${escapeHtml(l.ebay_parent_id)}', this)"
+                                title="Re-send this listing's pictures, item specifics, title and description. Cannot change stock or price."
+                                class="text-[10px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-all disabled:opacity-40">
+                                Refresh
+                              </button>`
+                            : `<span class="text-[10px] text-slate-600" title="Created through File Exchange, so the Inventory API cannot see it. Changes go through the Revise CSV.">CSV only</span>`}
                     </td>
                 </tr>`;
         }).join("");

@@ -1219,6 +1219,25 @@ class TestWebApp(unittest.TestCase):
         res = self.client.get(f"/api/plans/{plan_id}/cover-revise.csv")
         self.assertEqual(res.status_code, 409)
 
+    def test_39c2_listings_say_which_path_manages_them(self):
+        """
+        The page has to know, because the two paths are not interchangeable.
+
+        File Exchange cannot revise a listing the Inventory API manages, and
+        the Inventory API cannot see a File Exchange listing. Offering the
+        wrong action hands out a CSV that silently does nothing, or an API
+        call eBay refuses -- and the cover dialog's own wording depends on it.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        listings = self.client.get("/api/ebay-listings").json()["listings"]
+        for listing in listings:
+            with self.subTest(listing=listing["ebay_parent_id"]):
+                self.assertIn("managed", listing)
+                self.assertIsInstance(listing["managed"], bool)
+                # Nothing in this test database was created through the API,
+                # so every listing here is on the CSV path.
+                self.assertFalse(listing["managed"])
+
     def test_39d_inventory_rows_carry_the_card_image(self):
         """
         The dashboard's hover preview needs cdn_image on every inventory row.

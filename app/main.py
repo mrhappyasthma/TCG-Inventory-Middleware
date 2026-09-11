@@ -1062,7 +1062,22 @@ def get_ebay_listings_endpoint(user: Dict[str, Any] = Depends(require_active_use
     Derived rather than stored: the mirror is keyed by card, so this groups by
     eBay item number to show the store the way eBay presents it.
     """
-    return {"listings": db.get_ebay_listings()}
+    # Which path manages each listing, so the page can offer the right
+    # action. A listing created through this API is corrected in place; a File
+    # Exchange one needs a Revise file uploaded, and the two are not
+    # interchangeable -- offering the wrong one hands out a file that silently
+    # does nothing, or an API call eBay refuses.
+    managed = {
+        row["ebay_parent_id"]
+        for row in db.get_managed_listings()
+        if row.get("ebay_parent_id")
+    }
+    return {
+        "listings": [
+            {**listing, "managed": listing["ebay_parent_id"] in managed}
+            for listing in db.get_ebay_listings()
+        ]
+    }
 
 
 @app.post("/api/ebay-listings/{item_id}/cover")
