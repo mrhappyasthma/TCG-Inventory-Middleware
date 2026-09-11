@@ -503,11 +503,70 @@ Revise,227511361186,ID1050-C-1,7.00
   rewrite every listing for no reason.
 * The `CustomLabel` is the one **eBay** reported, never one rebuilt from a
   card's identity.
+* **Listings the Inventory API manages are excluded.** Automatic repricing
+  owns those, and File Exchange cannot revise them anyway - the upload would
+  succeed and change nothing.
 
 When a reprice is pending, an amber **Reprice N** pill appears in the header.
 It is deliberately persistent rather than a toast: the nightly refresh
 finishes with nobody watching, so the signal has to survive until it is acted
 on.
+
+### Automatic repricing
+
+For the listings this application created through the eBay **Inventory API**
+there is no file to download and nobody to upload it: a price can be changed
+directly. That runs once a day, in the same loop iteration as the market price
+refresh, and applies price changes by itself.
+
+It is asymmetric on purpose, because the two directions are not equally safe:
+
+* **A rise applies the same day.** If the market recovers afterwards the card
+  was underpriced anyway, so waiting costs more than acting.
+* **A fall is held.** The current price stays up until the lower computed price
+  has kept being true for the whole **hold window** (14 days by default).
+  Lowering a price gives away margin that only a sale at the higher price
+  could have earned. If the market recovers at any point inside the window the
+  clock resets - the window measures an unbroken run, not a total.
+
+Two thresholds stop it thrashing, and they are the reason it is safe to leave
+unattended:
+
+* **Boundary margin** (10% by default). The pricing tiers are cliffs. On the
+  shipped rules a card at a market price of `$0.249` lists at `$1.99` and one
+  at `$0.251` lists at `$2.49` - a one-cent move producing a **25% price
+  change**, every single day, for any card sitting near an edge. The market
+  therefore has to move 10% *past* a boundary before the card changes tier.
+  This matters more than the hold window does, because it prevents the churn
+  rather than merely delaying it.
+* **Refuse run over** (25% by default). If more than a quarter of eligible
+  cards would change in one run, the whole run is abandoned having written
+  nothing - that pattern is what bad price-feed data looks like, not what a
+  real market does. It is not applied below 20 eligible cards, where the ratio
+  carries no information.
+
+What it will not do, by construction:
+
+* **It sends price and nothing else.** `shipToLocationAvailability` is omitted
+  from the request rather than repeated, so quantity cannot move. Nothing is
+  created, published, revised or ended.
+* **It cannot touch a File Exchange listing.** Eligibility comes from a join
+  against `ebay_managed_listing` plus a stored offer id, so the four legacy
+  listings are not merely skipped - they are unreachable from this path.
+* **It never prices from nothing.** A card with no stored market price, no
+  known eBay price, or a market price no rule covers is left alone and
+  reported, never priced at the floor.
+
+Every verdict - including the holds and the skips - is logged to the terminal
+with a `[reprice]` prefix and written to `reprice_history`, readable at
+`GET /api/pricing/reprice-log`. Holds are logged at `WARN` and shown with an
+amber flag in **Pricing Rules -> Automatic Repricing**: a card priced above
+what the market now supports is the one thing here worth a human glance.
+**Run now** applies a round immediately, after showing what it will change.
+
+All four settings live under **Pricing Rules -> Automatic Repricing**:
+`auto_reprice_enabled`, `price_hold_days`, `price_boundary_margin_percent`
+and `reprice_max_change_percent`.
 
 ### Condition multipliers
 

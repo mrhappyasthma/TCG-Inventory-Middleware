@@ -89,6 +89,12 @@ from tcg_engine.pricing_feed import (
 )
 from tcg_engine.plan_exports import build_plan_exports
 from tcg_engine.push import PushError, push_plan, refresh_listing
+from tcg_engine.repricer import (
+    RepriceError,
+    auto_reprice_enabled,
+    plan_reprice,
+    run_reprice,
+)
 from tcg_engine.plans import (
     PlanError,
     approve_plan,
@@ -780,6 +786,7 @@ def reprice_csv_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
         "reprice_count": result["reprice_count"],
         "unchanged_count": result["unchanged_count"],
         "missing_price_count": result["missing_price_count"],
+        "api_managed_count": result["api_managed_count"],
         "logs": result["logs"],
     }
 
@@ -806,6 +813,173 @@ def price_history_endpoint(
     """Recent market prices for one card, so a surprising reprice is traceable."""
     return {"manifest_id": manifest_id,
             "history": db.get_price_history(manifest_id)}
+
+
+def _reprice_now(user_id: int, dry_run: bool = False) -> Dict[str, Any]:
+    """
+    One repricing round, against the listings the Inventory API can reach.
+
+    Shared by the manual endpoint and the nightly job so there is exactly one
+    code path: a preview the operator ran by hand and the run that happens at
+    three in the morning must reach the same verdicts, or the preview is
+    worthless.
+    """
+    client = get_ebay_client()
+    adapter = None
+    if client is not None and client.oauth.is_connected():
+        adapter = InventoryApiAdapter(client)
+    elif not dry_run:
+        raise RepriceError("Connect the eBay account first.")
+
+    def run():
+        with db.session():
+            return run_reprice(
+                db, adapter, user_id=user_id, dry_run=dry_run,
+                log=lambda level, message: print(
+                    f"[reprice] {level}: {message}", flush=True
+                ),
+            )
+
+    return run()
+
+
+@app.post("/api/pricing/auto-reprice")
+async def auto_reprice_endpoint(
+    dry_run: bool = Form(False),
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Run the repricer now, or preview what it would do.
+
+    The nightly job does this by itself; this exists so the first run can be
+    inspected before being trusted, and so a hold that has just expired can be
+    applied without waiting for the next cycle.
+
+    Runs in a worker thread: it makes outbound calls to eBay in batches of 25,
+    and doing that on the event loop would freeze the dashboard.
+    """
+    try:
+        result = await run_in_threadpool(
+            lambda: _reprice_now(user["id"], dry_run=dry_run)
+        )
+    except RepriceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except EbayError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
+
+
+@app.get("/api/pricing/auto-reprice/preview")
+def auto_reprice_preview_endpoint(
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    What the repricer would change and what it is holding, without eBay.
+
+    Reads nothing but our own database, so the dashboard can show the pending
+    changes and the yellow-flagged holds without a network call or the risk of
+    a stray write.
+    """
+    planned = plan_reprice(db, user_id=user["id"])
+    return {
+        "enabled": auto_reprice_enabled(db, user_id=user["id"]),
+        "considered": planned["considered"],
+        "eligible": planned["eligible"],
+        "change_count": len(planned["changes"]),
+        "hold_count": len(planned["holds"]),
+        "over_cap": planned["over_cap"],
+        "change_share": planned["change_share"],
+        "hold_days": planned["config"]["hold_days"],
+        "changes": [
+            {
+                "manifest_id": d["manifest_id"],
+                "label": d["label"],
+                "verdict": d["verdict"],
+                "market_price": d["market_price"],
+                "current_price": d["current_price"],
+                "target_price": d["target_price"],
+                "reason": d["reason"],
+            }
+            for d in planned["changes"]
+        ],
+        "holds": [
+            {
+                "manifest_id": d["manifest_id"],
+                "label": d["label"],
+                "market_price": d["market_price"],
+                "current_price": d["current_price"],
+                "target_price": d["target_price"],
+                "days_remaining": d["days_remaining"],
+            }
+            for d in planned["holds"]
+        ],
+    }
+
+
+@app.get("/api/pricing/reprice-log")
+def reprice_log_endpoint(
+    limit: int = 200,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    What the repricer has actually done.
+
+    The nightly job logs to the terminal, but a container restart takes that
+    with it, and on a Synology nobody is watching the console anyway. This is
+    the durable record of every verdict, including the holds.
+    """
+    return {"entries": db.get_reprice_history(limit=max(1, min(1000, limit)))}
+
+
+async def _nightly_reprice() -> None:
+    """
+    Reprice the API-managed listings, straight after the market refresh.
+
+    Deliberately part of the same loop iteration rather than a second timer.
+    Repricing is only as good as the prices it reads, so the ordering is not
+    incidental -- a separate schedule would drift and eventually reprice
+    against yesterday's market for no reason anybody could see.
+
+    It runs even when the refresh fetched nothing. A refresh is skipped when
+    TCGCSV has not published since the last one, but the hold windows are
+    measured on the calendar: a fall that has now waited out its window has to
+    be applied on a day with no new data just the same.
+
+    Nothing in here is allowed to be fatal. This runs inside the loop that
+    also keeps market prices current, and an exception would take that with
+    it.
+    """
+    try:
+        if not auto_reprice_enabled(db):
+            print("[reprice] disabled in Listing Rules, skipping", flush=True)
+            return
+
+        owner = user_db.get_owner_user_id()
+        if owner is None:
+            print("[reprice] no admin account to act as, skipping", flush=True)
+            return
+
+        client = get_ebay_client()
+        if client is None or not client.oauth.is_connected():
+            print("[reprice] eBay is not connected, skipping", flush=True)
+            return
+
+        result = await run_in_threadpool(lambda: _reprice_now(owner))
+        if not result.get("attempted"):
+            print(f"[reprice] nothing applied: {result.get('reason')}",
+                  flush=True)
+        else:
+            print(
+                f"[reprice] applied {result['applied']}, "
+                f"held {result['held']}, failed {result['failed']}, "
+                f"skipped {result['skipped']} of {result['considered']}",
+                flush=True,
+            )
+    except RepriceError as exc:
+        print(f"[reprice] refused, no price changed: {exc}", flush=True)
+    except Exception as exc:
+        print(f"[reprice] unexpected error, prices left alone: {exc}",
+              flush=True)
 
 
 @app.on_event("startup")
@@ -845,6 +1019,8 @@ async def start_price_refresh_loop():
                       flush=True)
             except Exception as exc:
                 print(f"[prices] unexpected refresh error: {exc}", flush=True)
+
+            await _nightly_reprice()
             await asyncio.sleep(PRICE_REFRESH_INTERVAL_HOURS * 3600)
 
     asyncio.create_task(loop())

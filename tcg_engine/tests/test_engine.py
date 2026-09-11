@@ -3132,6 +3132,29 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         rows = list(csv.DictReader(io.StringIO(out["csv_content"])))
         self.assertEqual(rows[0]["CustomLabel"], mid + "-FROM_EBAY")
 
+    def test_reprice_leaves_api_managed_listings_to_the_repricer(self):
+        """
+        Two things must not both own a price.
+
+        The automatic repricer reaches API-managed listings directly and holds
+        a falling price for a window before applying it. A Revise row for one
+        of those listings is a second opinion that File Exchange cannot apply
+        anyway -- the upload succeeds and nothing changes, which is the worst
+        of the available outcomes.
+        """
+        self._live_priced_card(market=0.30, ebay_price=1.99)
+        out = build_reprice_csv(self.db)
+        self.assertEqual(out["reprice_count"], 1)
+        self.assertEqual(out["api_managed_count"], 0)
+
+        self.db.upsert_managed_listing("Cosmic Eclipse|Near Mint",
+                                       ebay_parent_id="227511361186")
+        managed = build_reprice_csv(self.db)
+        self.assertEqual(managed["reprice_count"], 0)
+        self.assertEqual(managed["api_managed_count"], 1)
+        self.assertTrue(any("repriced automatically" in lg["message"]
+                            for lg in managed["logs"]))
+
 
 if __name__ == "__main__":
     unittest.main()

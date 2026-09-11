@@ -323,6 +323,7 @@ async function loadPricingRules() {
         updateTestPricePreview();
         loadConditionMultipliers();
         refreshRepriceIndicator();
+        loadAutoReprice();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400">Failed to load rules: ${escapeHtml(err.message)}</td></tr>`;
     }
@@ -602,6 +603,7 @@ async function refreshRepriceIndicator() {
             if (data.reprice_count > 0) parts.push(`${data.reprice_count} to update`);
             if (data.unchanged_count > 0) parts.push(`${data.unchanged_count} already correct`);
             if (data.missing_price_count > 0) parts.push(`${data.missing_price_count} with no market price`);
+            if (data.api_managed_count > 0) parts.push(`${data.api_managed_count} repriced automatically`);
             text.innerText = data.reprice_count > 0
                 ? `Prices differ \u2014 ${parts.join(", ")}.`
                 : `Nothing to reprice \u2014 ${parts.join(", ") || "no live listings"}.`;
@@ -612,6 +614,144 @@ async function refreshRepriceIndicator() {
         // The indicator is advisory; failing to compute it must not surface
         // as an error the operator has to act on.
         console.error("reprice indicator:", err);
+    }
+}
+
+// -- automatic repricing ---------------------------------------------------
+//
+// The nightly job logs to the terminal, which is what was asked for, but a
+// Synology container's console is nobody's dashboard. These read the same
+// decisions the job reaches, so a hold can be reviewed before it expires.
+
+async function loadAutoReprice() {
+    const badge = document.getElementById("autoRepriceBadge");
+    try {
+        const [preview, settings] = await Promise.all([
+            fetch("/api/pricing/auto-reprice/preview").then(r => r.json()),
+            fetch("/api/listing-settings").then(r => r.json()),
+        ]);
+
+        const s = settings.settings || {};
+        document.getElementById("autoRepriceEnabled").checked =
+            String(s.auto_reprice_enabled ?? "true").toLowerCase() !== "false";
+        document.getElementById("priceHoldDays").value = s.price_hold_days || "14";
+        document.getElementById("priceBoundaryMargin").value =
+            s.price_boundary_margin_percent || "10";
+        document.getElementById("repriceMaxChange").value =
+            s.reprice_max_change_percent || "25";
+
+        if (badge) {
+            badge.innerText = preview.enabled ? "On" : "Off";
+            badge.className = preview.enabled
+                ? "text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-emerald-950 text-accent-emerald border border-emerald-800"
+                : "text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700";
+        }
+        renderAutoReprice(preview);
+    } catch (err) {
+        // Advisory, like the reprice indicator: the job runs whether or not
+        // this panel could be drawn.
+        console.error("auto reprice preview:", err);
+    }
+}
+
+function renderAutoReprice(preview) {
+    const box = document.getElementById("autoRepriceSummary");
+    const text = document.getElementById("autoRepriceSummaryText");
+    const holds = document.getElementById("autoRepriceHolds");
+    const changes = document.getElementById("autoRepriceChanges");
+    if (!box || !text || !holds || !changes) return;
+
+    if (!preview.considered) {
+        text.innerText = "No API-managed listing has a price to review yet. Push a plan to eBay and these listings become eligible.";
+        holds.innerHTML = "";
+        changes.innerHTML = "";
+        box.classList.remove("hidden");
+        return;
+    }
+
+    const parts = [`${preview.considered} card(s) reviewed`];
+    if (preview.change_count) parts.push(`${preview.change_count} would change now`);
+    if (preview.hold_count) parts.push(`${preview.hold_count} in a holding window`);
+    text.innerText = preview.over_cap
+        ? `${parts.join(", ")}. That is ${Math.round((preview.change_share || 0) * 100)}% of eligible cards, over the cap — the run would be refused as suspected bad market data.`
+        : `${parts.join(", ")}.`;
+
+    holds.innerHTML = (preview.holds || []).map(h => `
+        <div class="flex items-center gap-2 text-[11px] p-1.5 rounded-lg bg-amber-950/40 border border-amber-800/60">
+            <span class="text-amber-400 shrink-0" title="Held above the market">&#9873;</span>
+            <span class="font-mono text-slate-300 truncate">${escapeHtml(h.label)}</span>
+            <span class="ml-auto font-mono text-slate-200 shrink-0">$${Number(h.current_price).toFixed(2)}
+                <span class="text-slate-500">held vs</span> $${Number(h.target_price).toFixed(2)}</span>
+            <span class="font-mono text-amber-400 shrink-0">${Math.round(h.days_remaining)}d</span>
+        </div>`).join("");
+
+    changes.innerHTML = (preview.changes || []).map(c => `
+        <div class="flex items-center gap-2 text-[11px] p-1.5 rounded-lg bg-dark-800/60 border border-slate-700/60">
+            <span class="${c.verdict === "raise" ? "text-accent-emerald" : "text-rose-400"} shrink-0">${c.verdict === "raise" ? "&uarr;" : "&darr;"}</span>
+            <span class="font-mono text-slate-300 truncate">${escapeHtml(c.label)}</span>
+            <span class="ml-auto font-mono text-slate-200 shrink-0">$${Number(c.current_price).toFixed(2)} &rarr; $${Number(c.target_price).toFixed(2)}</span>
+        </div>`).join("");
+
+    box.classList.remove("hidden");
+}
+
+async function saveRepriceSettings() {
+    const settings = {
+        auto_reprice_enabled:
+            document.getElementById("autoRepriceEnabled").checked ? "true" : "false",
+        price_hold_days: document.getElementById("priceHoldDays").value || "14",
+        price_boundary_margin_percent:
+            document.getElementById("priceBoundaryMargin").value || "10",
+        reprice_max_change_percent:
+            document.getElementById("repriceMaxChange").value || "25",
+    };
+    try {
+        const res = await fetch("/api/listing-settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ settings }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Save failed");
+        logToTerminal("SUCCESS", `[REPRICE] Saved: ${settings.auto_reprice_enabled === "true" ? "on" : "off"}, ${settings.price_hold_days}-day hold, ${settings.price_boundary_margin_percent}% boundary margin, refusing runs over ${settings.reprice_max_change_percent}%.`);
+        await loadAutoReprice();
+    } catch (err) {
+        logToTerminal("ERROR", `[REPRICE] ${err.message}`);
+    }
+}
+
+async function runAutoReprice() {
+    const changes = await fetch("/api/pricing/auto-reprice/preview")
+        .then(r => r.json())
+        .catch(() => null);
+    if (changes && changes.change_count) {
+        const ok = confirm(`Apply ${changes.change_count} price change(s) to your live eBay listings now?\n\nOnly the price is sent — never quantity. ${changes.hold_count || 0} card(s) in a holding window are left alone.`);
+        if (!ok) return;
+    }
+
+    const button = document.getElementById("btnRepriceNow");
+    const label = document.getElementById("btnRepriceNowLabel");
+    button.disabled = true;
+    label.innerText = "Repricing…";
+    try {
+        const res = await fetch("/api/pricing/auto-reprice", {
+            method: "POST", body: new FormData(),
+        });
+        const data = await readJsonResponse(res);
+        if (!res.ok) throw new Error(data.detail || "Reprice failed");
+
+        (data.logs || []).forEach(l => logToTerminal(l.level, `[REPRICE] ${l.message}`));
+        if (!data.attempted && data.reason) {
+            logToTerminal("WARN", `[REPRICE] Nothing applied: ${data.reason}`);
+        }
+        await loadAutoReprice();
+        await refreshRepriceIndicator();
+        await fetchEbayListings();
+    } catch (err) {
+        logToTerminal("ERROR", `[REPRICE] ${err.message}`);
+    } finally {
+        button.disabled = false;
+        label.innerText = "Run now";
     }
 }
 

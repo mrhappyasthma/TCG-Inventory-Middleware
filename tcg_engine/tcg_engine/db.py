@@ -22,6 +22,32 @@ DEFAULT_SHIPPING_PROFILE = "Free Shipping Cards"
 DEFAULT_RETURN_PROFILE = "No Returns"
 DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
 
+# The automatic repricer's policy, as settings so it is adjustable without a
+# redeploy. Stored as strings because listing_settings holds strings; the
+# repricer parses them and falls back to these on anything unreadable.
+#
+# It is on by default, and pushes to eBay by itself. That is a deliberate
+# choice and the reason the other three numbers exist: the two thresholds
+# below are what make an unattended price change safe enough to leave alone.
+DEFAULT_AUTO_REPRICE_ENABLED = "true"
+# How far past a pricing-rule boundary the market has to move before the card
+# changes tier. The tiers are cliffs -- at the shipped rules a card at $0.249
+# prices to $1.99 and one at $0.251 to $2.49 -- so without a margin a one-cent
+# move on TCGplayer produces a 25% price change, and a card sitting on a
+# boundary is rewritten every single day. 10% of the boundary is enough that
+# ordinary daily noise cannot cross it.
+DEFAULT_PRICE_BOUNDARY_MARGIN_PERCENT = "10"
+# How long a lower computed price must keep being true before it is accepted.
+# Raising a price costs nothing if the market recovers; lowering one gives
+# away margin that only a sale at the higher price could have earned, so the
+# two directions are deliberately not symmetric.
+DEFAULT_PRICE_HOLD_DAYS = "14"
+# The share of live cards that may change price in one run before the run is
+# refused outright. A repricer is downstream of a third-party price feed, and
+# the signature of bad feed data is that it moves everything at once. Same
+# reasoning as the delisting cap on the sync path.
+DEFAULT_REPRICE_MAX_CHANGE_PERCENT = "25"
+
 # Pricing rules and listing settings are per-user, so every row in those two
 # tables carries the id of the user who owns it. Scope 0 is the shared baseline
 # that a user inherits until they save a change of their own; no real user can
@@ -288,6 +314,34 @@ class Database:
                 );
                 """,
             )
+            # Every verdict the automatic repricer reached, including the ones
+            # that changed nothing.
+            #
+            # The repricer runs unattended and writes to live listings, so its
+            # own account of what it did is the only way to audit it. The
+            # terminal log is the same information, but a container restart
+            # takes that with it, which is no basis for answering "why is this
+            # card priced at $2.49".
+            #
+            # Holds are recorded too, not just changes: a card whose price is
+            # being kept above the market is precisely the case worth being
+            # able to look back at.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reprice_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_id TEXT NOT NULL,
+                    ebay_parent_id TEXT,
+                    verdict TEXT NOT NULL,
+                    market_price REAL,
+                    old_price REAL,
+                    new_price REAL,
+                    reason TEXT,
+                    applied INTEGER NOT NULL DEFAULT 0,
+                    decided_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+            )
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS condition_multipliers (
@@ -529,6 +583,23 @@ class Database:
                     "ALTER TABLE ebay_variations ADD COLUMN offer_id TEXT"
                 )
 
+            # When the automatic repricer first computed a price *below* what
+            # this variation is listed at. It is the start of a hold: a rise
+            # applies at once, a fall has to keep being true for the whole
+            # hold window before it is accepted, so that a single cheap day
+            # on TCGplayer cannot mark a card down.
+            #
+            # NULL means no fall is pending, which is the normal state. The
+            # anchor the window is measured against is deliberately not stored
+            # alongside it -- that is ``last_known_price``, the price eBay has
+            # confirmed, so lowering a price by hand on eBay is respected
+            # immediately instead of being held up by a figure of ours.
+            cursor.execute("PRAGMA table_info(ebay_variations)")
+            if "hold_since" not in {row["name"] for row in cursor.fetchall()}:
+                cursor.execute(
+                    "ALTER TABLE ebay_variations ADD COLUMN hold_since TIMESTAMP"
+                )
+
             # Which of our listings the Inventory API can actually see.
             #
             # This table is the whole reason two write paths can coexist. A
@@ -598,6 +669,12 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_price_history_manifest
                 ON price_history(manifest_id, fetched_at DESC);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_reprice_history_decided
+                ON reprice_history(decided_at DESC);
                 """
             )
             cursor.execute(
@@ -674,6 +751,14 @@ class Database:
                     ("merchant_location_key", ""),
                     ("marketplace_id", "EBAY_US"),
                     ("cover_image_url", ""),
+                    # The automatic repricer. See REPRICE_DEFAULTS for what
+                    # each of these means and why it has the value it does.
+                    ("auto_reprice_enabled", DEFAULT_AUTO_REPRICE_ENABLED),
+                    ("price_boundary_margin_percent",
+                     DEFAULT_PRICE_BOUNDARY_MARGIN_PERCENT),
+                    ("price_hold_days", DEFAULT_PRICE_HOLD_DAYS),
+                    ("reprice_max_change_percent",
+                     DEFAULT_REPRICE_MAX_CHANGE_PERCENT),
                 ]
                 cursor.executemany(
                     """
@@ -695,6 +780,12 @@ class Database:
                 ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
                 ("default_game", DEFAULT_GAME),
                 ("variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE),
+                ("auto_reprice_enabled", DEFAULT_AUTO_REPRICE_ENABLED),
+                ("price_boundary_margin_percent",
+                 DEFAULT_PRICE_BOUNDARY_MARGIN_PERCENT),
+                ("price_hold_days", DEFAULT_PRICE_HOLD_DAYS),
+                ("reprice_max_change_percent",
+                 DEFAULT_REPRICE_MAX_CHANGE_PERCENT),
             ):
                 cursor.execute(
                     """
@@ -1996,6 +2087,138 @@ class Database:
                 """
             )
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_managed_cards_for_repricing(self) -> List[Dict[str, Any]]:
+        """
+        Cards the Inventory API can reprice, with their hold clock.
+
+        Narrower than get_live_cards_for_repricing in two ways, and both are
+        the point. The card must have an ``offer_id``, because an offer id is
+        the only handle bulkUpdatePriceQuantity accepts, and its listing must
+        have a row in ebay_managed_listing, because that is the record of
+        which listings this application created through the API.
+
+        A File Exchange listing satisfies neither. The Inventory API cannot
+        see it at all -- getOffers returns nothing for its SKUs -- so an
+        automatic reprice must not reach it, which is why this join exists
+        rather than a flag on the card.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
+                       m.printing, m.card_number, m.market_price, m.price,
+                       COALESCE(m.quantity, 0) AS quantity,
+                       v.ebay_parent_id, v.custom_label, v.offer_id,
+                       v.last_known_price, v.last_known_qty, v.hold_since,
+                       g.group_key
+                FROM manifest m
+                JOIN ebay_variations v ON v.manifest_id = m.manifest_id
+                JOIN ebay_managed_listing g
+                     ON TRIM(g.ebay_parent_id) = TRIM(v.ebay_parent_id)
+                WHERE TRIM(COALESCE(v.ebay_parent_id, '')) != ''
+                  AND TRIM(COALESCE(v.offer_id, '')) != ''
+                ORDER BY m.manifest_id
+                """
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def set_variation_known_price(
+        self, manifest_id: str, price: float
+    ) -> None:
+        """
+        Record a price eBay has accepted, and nothing else.
+
+        Deliberately not upsert_variation, which would also write
+        last_known_qty and clear pending_qty. A price change must not disturb
+        either: the quantity would be rewritten from a figure that goes stale
+        the moment a card sells, and clearing pending_qty would discard a
+        quantity change a plan is still waiting to have confirmed.
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE ebay_variations
+                SET last_known_price = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE manifest_id = ?
+                """,
+                (round(float(price), 2), manifest_id),
+            )
+            conn.commit()
+
+    def set_variation_hold_since(
+        self, manifest_id: str, hold_since: Optional[str]
+    ) -> None:
+        """
+        Start, extend or clear a variation's price hold.
+
+        Passing None clears it, which is what happens the moment the computed
+        price stops being below the listed one: the window measures an
+        unbroken run of lower prices, so a single day back at or above the
+        listed price has to reset it rather than being ignored.
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                "UPDATE ebay_variations SET hold_since = ? WHERE manifest_id = ?",
+                (hold_since, manifest_id),
+            )
+            conn.commit()
+
+    def record_reprice(self, entries: List[Dict[str, Any]]) -> int:
+        """Write the repricer's verdicts, applied or not, to the audit log."""
+        if not entries:
+            return 0
+        with self.get_connection() as conn:
+            conn.executemany(
+                """
+                INSERT INTO reprice_history (
+                    manifest_id, ebay_parent_id, verdict, market_price,
+                    old_price, new_price, reason, applied
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        e["manifest_id"],
+                        e.get("ebay_parent_id"),
+                        e["verdict"],
+                        e.get("market_price"),
+                        e.get("old_price"),
+                        e.get("new_price"),
+                        e.get("reason"),
+                        1 if e.get("applied") else 0,
+                    )
+                    for e in entries
+                ],
+            )
+            conn.commit()
+        return len(entries)
+
+    def get_reprice_history(
+        self, limit: int = 200, manifest_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """The most recent repricer verdicts, newest first."""
+        clauses = []
+        params: List[Any] = []
+        if manifest_id:
+            clauses.append("r.manifest_id = ?")
+            params.append(manifest_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT r.*, m.product_name, m.set_name, m.condition
+                FROM reprice_history r
+                LEFT JOIN manifest m ON m.manifest_id = r.manifest_id
+                {where}
+                ORDER BY r.decided_at DESC, r.id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_cards_for_planning(self) -> List[Dict[str, Any]]:
         """

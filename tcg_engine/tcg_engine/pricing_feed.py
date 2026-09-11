@@ -296,9 +296,16 @@ def build_reprice_csv(
     """
     An eBay Revise file that changes price only, built from stored prices.
 
-    This is what makes a price refresh actionable. Module A prices from the
-    columns of the export it is given, so without this there is no way to push
-    a new price without re-uploading a dump.
+    This is what makes a price refresh actionable for the File Exchange
+    listings. Module A prices from the columns of the export it is given, so
+    without this there is no way to push a new price without re-uploading a
+    dump.
+
+    Listings created through the Inventory API are excluded: the automatic
+    repricer owns those, applies a hold window to falling prices, and can
+    reach them directly. A row here for one of them would be a row File
+    Exchange cannot apply and a second opinion on a price that already has an
+    owner.
 
     Rows are emitted only where the computed price differs from the price eBay
     is known to hold, on the same principle as Module A: a file full of
@@ -318,9 +325,25 @@ def build_reprice_csv(
     rows: List[Dict[str, Any]] = []
     unchanged = 0
     unknown_price = 0
+    api_managed = 0
     unpriced_grades = set()
 
+    # Listings the Inventory API manages are the automatic repricer's, and a
+    # Revise row for one of them is worse than useless: File Exchange cannot
+    # revise a listing created through the Inventory API, so the upload
+    # succeeds and changes nothing. This file offered seven such rows before
+    # the repricer existed, which is how the overlap came to light.
+    managed_parents = {
+        str(row["ebay_parent_id"]).strip()
+        for row in db.get_managed_listings()
+        if str(row.get("ebay_parent_id") or "").strip()
+    }
+
     for card in db.get_live_cards_for_repricing():
+        if str(card.get("ebay_parent_id") or "").strip() in managed_parents:
+            api_managed += 1
+            continue
+
         base = float(card.get("market_price") or 0.0)
         if base <= 0:
             # Nothing to price from. Refusing beats emitting the floor price.
@@ -370,6 +393,16 @@ def build_reprice_csv(
                 f"prices first."
             ),
         })
+    if api_managed:
+        logs.append({
+            "level": "INFO",
+            "message": (
+                f"{api_managed} card(s) are on listings this application "
+                f"manages through the eBay API and are repriced "
+                f"automatically, so no Revise row was written for them. "
+                f"File Exchange cannot revise those listings at all."
+            ),
+        })
     if unpriced_grades:
         logs.append({
             "level": "WARN",
@@ -393,5 +426,6 @@ def build_reprice_csv(
         "reprice_count": len(rows),
         "unchanged_count": unchanged,
         "missing_price_count": unknown_price,
+        "api_managed_count": api_managed,
         "logs": logs,
     }

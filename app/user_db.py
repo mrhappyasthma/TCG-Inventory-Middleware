@@ -298,6 +298,31 @@ class UserDatabase:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_owner_user_id(self) -> Optional[int]:
+        """
+        The account an unattended job should act as, or None if there is none.
+
+        Background work has no signed-in user, but pricing rules and listing
+        settings are per-user: a job that fell back to the shared baseline
+        would quietly price from different rules than the ones the operator
+        sees on screen. The oldest active admin is the deployment's owner --
+        the first account ever created is granted admin automatically -- so
+        acting as them is what makes the nightly repricer agree with the
+        Listing Rules panel.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id FROM users
+                WHERE role = 'admin' AND status = 'active'
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            return int(row["id"]) if row else None
+
     def delete_user(self, user_id: int) -> bool:
         with self.get_connection() as conn:
             cursor = conn.cursor()

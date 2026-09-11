@@ -1533,6 +1533,127 @@ class TestWebApp(unittest.TestCase):
         finally:
             user_db.save_ebay_token(None)
 
+    # -- automatic repricing ----------------------------------------------
+
+    def test_48_the_repricer_preview_needs_no_ebay_connection(self):
+        """
+        The preview reads our own database only.
+
+        It is the screen the operator uses to decide whether to trust an
+        unattended job that writes to live listings, so it must be available
+        before -- and independently of -- any connection to eBay.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.get("/api/pricing/auto-reprice/preview")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertTrue(body["enabled"])
+        self.assertEqual(body["hold_days"], 14.0)
+        for key in ("changes", "holds", "change_count", "hold_count",
+                    "over_cap"):
+            self.assertIn(key, body)
+        # Nothing in this database was created through the API, so there is
+        # nothing the repricer may touch.
+        self.assertEqual(body["considered"], 0)
+        self.assertEqual(body["changes"], [])
+
+    def test_49_repricing_without_a_connection_is_refused_not_attempted(self):
+        """
+        A 409, not a 500 and certainly not a silent success.
+
+        This ran unattended long before anybody read its output, so the one
+        thing it must never do is report having repriced when it could not
+        reach eBay at all.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        db.insert_manifest("ID9101", "Pikachu", "Unified Minds", "Near Mint",
+                           "Holofoil", card_number="045/132")
+        db.record_market_prices([("ID9101", 0.60)])
+        db.upsert_variation("ID9101", "227516467787", 2,
+                            custom_label="ID9101", last_known_price=1.99)
+        db.set_variation_offer("ID9101", "263144059011")
+        db.upsert_managed_listing("Unified Minds|Near Mint",
+                                  ebay_parent_id="227516467787")
+        try:
+            res = self.client.post("/api/pricing/auto-reprice")
+            self.assertEqual(res.status_code, 409)
+            self.assertIn("eBay", res.json()["detail"])
+
+            # A preview of the same state still works, and says what it would
+            # have done -- $0.60 falls in the $2.99 tier, up from $1.99.
+            preview = self.client.get(
+                "/api/pricing/auto-reprice/preview"
+            ).json()
+            self.assertEqual(preview["change_count"], 1)
+            change = preview["changes"][0]
+            self.assertEqual(change["verdict"], "raise")
+            self.assertEqual(change["current_price"], 1.99)
+            self.assertEqual(change["target_price"], 2.99)
+
+            # And a dry run is allowed without a connection, because it sends
+            # nothing.
+            dry = self.client.post("/api/pricing/auto-reprice",
+                                   data={"dry_run": "true"})
+            self.assertEqual(dry.status_code, 200)
+            self.assertFalse(dry.json()["attempted"])
+            self.assertEqual(dry.json()["applied"], 0)
+        finally:
+            db.delete_manifest("ID9101")
+
+    def test_49b_the_nightly_job_cannot_take_down_the_refresh_loop(self):
+        """
+        It shares an iteration with the market price refresh.
+
+        An exception escaping the repricer would kill the task that keeps
+        market prices current, so every path out of it -- disabled, no admin,
+        no eBay connection, an outright failure -- has to return rather than
+        raise. The unconnected case is also the normal state on a cold start.
+        """
+        import asyncio
+
+        asyncio.run(main._nightly_reprice())
+
+        with mock.patch(
+            "app.main.auto_reprice_enabled", side_effect=RuntimeError("boom")
+        ):
+            asyncio.run(main._nightly_reprice())
+
+    def test_50_the_reprice_log_is_readable(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.get("/api/pricing/reprice-log?limit=5")
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json()["entries"], list)
+
+    def test_51_the_repricer_endpoints_need_a_session(self):
+        self.client.post("/api/auth/logout")
+        for method, path in (
+            ("get", "/api/pricing/auto-reprice/preview"),
+            ("get", "/api/pricing/reprice-log"),
+            ("post", "/api/pricing/auto-reprice"),
+        ):
+            with self.subTest(path=path):
+                res = getattr(self.client, method)(path)
+                self.assertIn(res.status_code, (401, 403))
+
+    def test_52_the_owner_account_is_the_oldest_active_admin(self):
+        """
+        The nightly job has no session, but pricing rules are per-user.
+
+        Acting as the shared baseline instead would price from rules the
+        operator never sees, so the job resolves an owner and skips the run
+        entirely if it cannot find one.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        owner = user_db.get_owner_user_id()
+        self.assertIsNotNone(owner)
+        users = {u["id"]: u for u in user_db.list_all_users()}
+        self.assertEqual(users[owner]["role"], "admin")
+        self.assertEqual(users[owner]["status"], "active")
+        self.assertEqual(owner, min(
+            u["id"] for u in users.values()
+            if u["role"] == "admin" and u["status"] == "active"
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
