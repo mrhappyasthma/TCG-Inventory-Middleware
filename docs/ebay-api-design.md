@@ -373,7 +373,7 @@ The drafts page therefore arrives at step 4, before any write risk exists.
   STATUS` would have kept two write paths alive indefinitely on listings that
   are a shrinking minority.
 
-  Migration runs from `scripts/migrate_csv_listings.py`, deliberately outside
+  Migration ran from a one-off script, deliberately outside
   the web app: it is irreversible, it runs once, and nothing in the dashboard
   should be able to trigger it. One listing per call rather than eBay's
   permitted five, recording the returned offer ids immediately and verifying

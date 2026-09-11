@@ -658,89 +658,77 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ---
 
-## 🚚 Migrating a File Exchange listing onto the API
+## 🚚 Migration to the API is complete
 
-The store began on File Exchange, and **the Inventory API cannot see those
-listings at all** — `getOffers` returns nothing for their SKUs, so pushes,
-Refresh and automatic repricing cannot reach them. `bulkMigrateListing`
-converts one: it creates the inventory items, offers and inventory item group
-behind a listing that already exists, **keeping the same eBay item id, its
-watchers and its search standing**.
+The store began on File Exchange, whose listings **the Inventory API cannot
+see at all** -- `getOffers` returns nothing for their SKUs, so pushes, Refresh
+and automatic repricing could not reach them. All of them have now been
+migrated with `bulkMigrateListing`, which built the inventory items, offers
+and inventory item groups behind listings that already existed while keeping
+their eBay item ids, watchers and search standing.
 
-It lives in a script, not the dashboard:
+That migration is **irreversible and finished**, so the script that performed
+it has been deleted along with every File Exchange output this project used to
+generate. eBay is now written to exclusively through its APIs; see
+**Automatic repricing** above and **Pushing a plan to eBay** below. Should a
+listing ever need migrating again, the history is in
+`scripts/migrate_csv_listings.py` as of commit `6ae59bf`.
+
+Three things learned doing it are recorded in `AGENTS.md`, because each cost a
+failed attempt: eBay requires an **item-level SKU** on a multi-variation
+listing before it will migrate one (error `25002`), it **re-validates every
+picture** on any change so one undersized image blocks everything, and
+`getOffers` **nests the listing id** where the other calls do not.
+
+### Finding images eBay will refuse
+
+That middle one keeps mattering, so the check outlived the migration:
 
 ```bash
-python scripts/migrate_csv_listings.py                   # preflight, sends nothing
-python scripts/migrate_csv_listings.py --migrate 227511361186
-python scripts/migrate_csv_listings.py --migrate all
+python scripts/check_images.py --url https://example.com/logo.png
+python scripts/check_images.py --listing 227513097221
+python scripts/check_images.py --all
 ```
 
-On the NAS, run it where the app's environment already exists — the eBay
-credentials and `DATABASE_URL` are the container's, and a laptop's point at a
-different database entirely:
+On the NAS, where the databases live:
 
 ```bash
 cd /volume1/docker/tcg-middleware
-docker compose exec tcg-middleware python scripts/migrate_csv_listings.py
+docker compose exec tcg-middleware python scripts/check_images.py --all
 ```
 
 `tcg-middleware` there is the **service** name from `docker-compose.yml`, not
-the container name — `docker compose exec` resolves it, so it keeps working
+the container name -- `docker compose exec` resolves it, so it keeps working
 when the container is recreated under a different name. If you would rather
-use `docker exec`, get the real name first with `docker compose ps` or
-`docker ps --format '{{.Names}}'`; they are not the same string
-(`container_name` is `tcg-ebay-middleware`), and a stale one fails with
-*No such container*.
+use `docker exec`, get the real name first with `docker compose ps`; they are
+not the same string (`container_name` is `tcg-ebay-middleware`), and a stale
+one fails with *No such container*.
 
-**It cannot be undone.** After a listing migrates, File Exchange and the
-Trading API can no longer revise it — every future change goes through this
-application's API path. That is the point, and it is also the whole risk:
-migrate one listing, check it on eBay, then do the next.
+eBay requires **500 pixels on the longest side** and re-validates every
+picture on a listing whenever anything about that listing changes. So one
+undersized image blocks all future changes, including ones with nothing to do
+with pictures -- a 308x164 Google Images search thumbnail in a cover photo
+field blocked two listings completely, and the only symptom was an error
+naming eBay's own copy of the image, which cannot be matched back to anything
+we store.
 
-What the script does that a bare API call would not:
+* `--url` measures a URL **before** you paste it into the cover photo field,
+  and if it is a MediaWiki thumbnail it finds and measures the original too
+  (those state their own width in the path, so `360px-` versions have a
+  1280px sibling).
+* `--listing` and `--all` measure every image we hold: the cover photo plus
+  each card's picture.
+* Whose image it is decides the remedy, so the report says. A **cover photo**
+  is stored against the listing by this application and changed on the eBay
+  Listings tab; a **card image** comes from the export's `CDN Image` column
+  and must be fixed in SortSwift and the export re-uploaded. Fixing either on
+  eBay alone lasts until the next push or Refresh, which sends ours back.
+* An unreadable image is reported as a **warning, never a pass** -- eBay has
+  to fetch the URL too.
 
-* **Preflights first.** Every variation must have a unique, non-blank SKU that
-  our own mirror knows. eBay requires the uniqueness; we require the match,
-  because a migration landing with SKUs we cannot map leaves offers we cannot
-  address.
-* **One listing per call**, though eBay permits five. Per-listing outcomes
-  arrive inside a 200, so a batch of five can be four successes and one
-  failure — and unpicking that after an irreversible operation is not worth a
-  saved round trip.
-* **Records the new offer ids immediately.** They exist nowhere else, and
-  until they are stored the repricer cannot see the listing it just gained.
-* **Records the existing gallery image as the cover.** A Refresh writes the
-  inventory item group as a full replace, so an unrecorded cover is one that
-  the first later repair silently replaces with the first card's photo. That
-  has already happened once.
-* **Verifies the listing is still published** under the same item id before
-  touching another. There is an unresolved report of migrating listings that
-  share an inventory item group key unpublishing all but the first; nothing
-  here shares one, but the check costs a single call.
-* **Detects a listing eBay has already migrated.** The call is irreversible
-  but its reply is not guaranteed to arrive, so "it returned an error" does
-  not mean "nothing happened" — and our own records cannot tell the
-  difference, because they are written only after a success. The preflight
-  asks eBay whether the listing's SKUs have offers, which is true of a
-  migrated listing and no other kind. `--migrate` then **adopts** it rather
-  than migrating twice: the offer ids are read back one SKU at a time with
-  `getOffers`, and nothing is sent to eBay.
+Image headers only: no Pillow, and never a whole file, so a 6 MB photograph
+costs the same as a thumbnail.
 
-eBay refuses the migration unless **all four** of these hold, and none is
-visible to the script, so it prints them before asking for confirmation:
-
-1. the listing is **fixed-price** (auctions cannot be migrated at all);
-2. **every variation has its own SKU**;
-3. it uses **Business Policies** for payment, return and shipping — a listing
-   carrying the legacy per-listing shipping, returns or payment fields is
-   rejected, and File Exchange could write either form, so this is the one to
-   check first;
-4. its **payment policy has immediate payment enabled**.
-
-Each of those produces a bare `400`. If one does, the script now prints
-eBay's `errorId`, its parameters and the raw response body — the first real
-attempt failed with nothing but "returned 400", because the library was
-discarding a refusal whose payload was not in eBay's documented shape.
 
 ## 📌 Revising a variation listing
 

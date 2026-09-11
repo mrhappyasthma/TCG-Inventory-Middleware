@@ -38,9 +38,6 @@ INVENTORY_BASE = "/sell/inventory/v1"
 BULK_INVENTORY_ITEM_LIMIT = 25
 BULK_PRICE_QUANTITY_LIMIT = 25
 BULK_OFFER_LIMIT = 25
-# Migration's ceiling is five, not twenty-five. It is also the only bulk call
-# here that is irreversible, which is why callers are expected to pass one.
-BULK_MIGRATE_LIMIT = 5
 
 # A SKU longer than this is rejected by eBay. Ours are manifest ids with an
 # optional bin suffix, so this should never fire -- but it fires here, naming
@@ -366,45 +363,6 @@ def price_quantity_request(
 
 
 # -- reading the per-record outcome of a bulk call -----------------------
-
-
-def bulk_migrate_listing(
-    transport, listing_ids: Sequence[str]
-) -> List[Dict[str, Any]]:
-    """
-    Convert existing eBay listings into Inventory API objects.
-
-    This is the one call in this module that cannot be undone. It creates the
-    inventory items, offers and -- for a multi-variation listing -- the
-    inventory item group behind a listing that already exists, keeping the
-    same eBay item id, its watchers and its search standing. Afterwards the
-    listing belongs to the Inventory API: the Trading API and File Exchange
-    can no longer revise it.
-
-    At most five listings per call, and callers here pass one. eBay reports
-    per-listing outcomes inside a 200, so a batch of five can be four
-    successes and a failure, and unpicking which is which after an
-    irreversible operation is not worth the saved round trip.
-
-    Each returned row carries ``listingId``, ``statusCode``, an
-    ``inventoryItemGroupKey`` when the listing had variations, and
-    ``inventoryItems`` pairing each ``sku`` with its new ``offerId``. Those
-    offer ids are the only handles that can later change a price, and they
-    exist nowhere else -- losing this response means reading them back with
-    getOffers, one SKU at a time.
-    """
-    if not listing_ids:
-        return []
-    if len(listing_ids) > BULK_MIGRATE_LIMIT:
-        raise ValueError(
-            f"{len(listing_ids)} listings exceeds eBay's limit of "
-            f"{BULK_MIGRATE_LIMIT} per migrate call"
-        )
-    response = transport.post(
-        f"{INVENTORY_BASE}/bulk_migrate_listing",
-        {"requests": [{"listingId": str(i).strip()} for i in listing_ids]},
-    ) or {}
-    return bulk_statuses(response)
 
 
 def bulk_statuses(response: Dict[str, Any]) -> List[Dict[str, Any]]:
