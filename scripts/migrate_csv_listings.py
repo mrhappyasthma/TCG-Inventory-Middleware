@@ -352,6 +352,167 @@ def verify(api_transport, listing, cards):
     return False
 
 
+EBAY_MIN_LONGEST_SIDE = 500
+IMAGE_HEADER_BYTES = 131072
+
+
+def image_dimensions(url):
+    """
+    (width, height) of an image, read from its header alone.
+
+    Parsed by hand rather than with Pillow, which is not a dependency of this
+    project and would be a large one to add for a diagnostic. Only the header
+    is fetched: the dimensions live in the first few bytes of every format
+    here, so a 6 MB photograph costs the same as a thumbnail.
+
+    Returns None when the format is unrecognised or the fetch fails, which
+    the caller must report as "unknown" rather than as "fine" -- the whole
+    point is to find pictures eBay will refuse.
+    """
+    import struct
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "TCG-Inventory-Middleware/1.0"}
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            head = response.read(IMAGE_HEADER_BYTES)
+    except Exception:
+        return None
+
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and len(head) >= 24:
+        return struct.unpack(">II", head[16:24])
+    if head[:6] in (b"GIF87a", b"GIF89a") and len(head) >= 10:
+        return struct.unpack("<HH", head[6:10])
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        if head[12:16] == b"VP8X" and len(head) >= 30:
+            w = int.from_bytes(head[24:27], "little") + 1
+            h = int.from_bytes(head[27:30], "little") + 1
+            return (w, h)
+        if head[12:16] == b"VP8 " and len(head) >= 30:
+            w = int.from_bytes(head[26:28], "little") & 0x3FFF
+            h = int.from_bytes(head[28:30], "little") & 0x3FFF
+            return (w, h)
+        return None
+    if head[:2] == b"\xff\xd8":
+        # Walk the marker chain to a Start Of Frame, which is where a JPEG
+        # states its size. It is not at a fixed offset: EXIF, colour profiles
+        # and an embedded thumbnail can all precede it.
+        index = 2
+        # "<=", not "<": a SOF ending exactly at the last byte of the buffer
+        # is still a SOF, and a minimal JPEG is nothing but SOI and SOF.
+        while index + 9 <= len(head):
+            if head[index] != 0xFF:
+                index += 1
+                continue
+            marker = head[index + 1]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                index += 2
+                continue
+            length = int.from_bytes(head[index + 2:index + 4], "big")
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                height = int.from_bytes(head[index + 5:index + 7], "big")
+                width = int.from_bytes(head[index + 7:index + 9], "big")
+                return (width, height)
+            if length <= 0:
+                return None
+            index += 2 + length
+        return None
+    return None
+
+
+def check_images(db, parent):
+    """
+    Every picture we hold for one listing, with the ones eBay would refuse.
+
+    eBay re-validates pictures on any revise, so a single image below 500
+    pixels on its longest side blocks every future change to a listing --
+    including the item-level SKU that migration requires. It names the
+    offending URL but not which card it belongs to, and its copy lives on
+    i.ebayimg.com under a name that cannot be matched back to a source.
+
+    Checking our own images answers the question that actually matters: if
+    the undersized picture is one of ours, replacing it on eBay alone is
+    temporary, because the next push or Refresh sends it straight back.
+
+    Read-only, and touches eBay not at all.
+    """
+    cards = db.get_cards_for_listing(parent)
+    if not cards:
+        print(f"Nothing recorded for listing #{parent}.")
+        return 1
+
+    targets = []
+    cover = ""
+    for row in db.get_ebay_listings():
+        if str(row["ebay_parent_id"]).strip() == parent:
+            cover = str(row.get("cover_image_url") or "").strip()
+    if cover:
+        targets.append(("cover photo", cover))
+    for card in cards:
+        url = str(card.get("cdn_image") or "").strip()
+        if url:
+            targets.append((f"{card['manifest_id']} {card.get('product_name') or ''}"[:38], url))
+
+    if not targets:
+        print(f"Listing #{parent}: we hold no image URLs for it at all.")
+        return 1
+
+    print(f"\nListing #{parent}: checking {len(targets)} image(s) we hold. "
+          f"eBay requires {EBAY_MIN_LONGEST_SIDE}px on the longest side.\n")
+    too_small = []
+    unknown = []
+    for label, url in targets:
+        size = image_dimensions(url)
+        if size is None:
+            unknown.append((label, url))
+            print(f"  {label:40} {'unreadable':>12}  {url[:70]}")
+            continue
+        width, height = size
+        longest = max(width, height)
+        verdict = "OK" if longest >= EBAY_MIN_LONGEST_SIDE else "TOO SMALL"
+        if verdict == "TOO SMALL":
+            too_small.append((label, url, width, height))
+        print(f"  {label:40} {width:>5}x{height:<6} {verdict:10} {url[:60]}")
+
+    print()
+    if too_small:
+        print(f"  {len(too_small)} of our own image(s) are below eBay's "
+              f"minimum. Fixing them here is the durable fix -- changing them "
+              f"on eBay alone lasts until the next push or Refresh:")
+        for label, url, width, height in too_small:
+            print(f"    {label}: {width}x{height}  {url}")
+        # The two sources need different remedies, and saying the wrong one
+        # sends somebody to re-export their whole inventory for a field that
+        # does not come from the export at all.
+        if any(label == "cover photo" for label, _, _, _ in too_small):
+            print("\n  The cover photo is not from the SortSwift export. It "
+                  "is stored against the listing by this application: change "
+                  "it on the eBay Listings tab, with the photo button on that "
+                  "listing's row.")
+            if any("gstatic.com" in url or "tbn" in url
+                   for _, url, _, _ in too_small):
+                print("  That URL is a Google Images *search thumbnail*, "
+                      "which is always a few hundred pixels and is not a "
+                      "stable link either. Use the card's own image, or any "
+                      "URL at least 500px on its longest side.")
+        if any(label != "cover photo" for label, _, _, _ in too_small):
+            print("\n  Card images come from the export's CDN Image column, "
+                  "so those have to be corrected in SortSwift and the export "
+                  "re-uploaded.")
+    else:
+        print("  Every image we hold meets the minimum. The picture eBay is "
+              "refusing is therefore one it holds and we do not -- an older "
+              "upload still attached to the listing. Remove or replace it in "
+              "Seller Hub; nothing in our catalogue will put it back.")
+    if unknown:
+        print(f"  {len(unknown)} image(s) could not be read, so they are "
+              f"neither confirmed nor cleared.")
+    return 0
+
+
 def verify_report(db, client, parent):
     """
     What eBay holds for one listing, card by card, against what we recorded.
@@ -614,6 +775,12 @@ def main():
              "applies.",
     )
     parser.add_argument(
+        "--check-images", metavar="ITEM_ID", default=None,
+        help="report the pixel size of every image we hold for one listing, "
+             "flagging any below eBay's 500px minimum. Touches eBay not at "
+             "all.",
+    )
+    parser.add_argument(
         "--verify", metavar="ITEM_ID", default=None,
         help="report what eBay holds for one listing's SKUs -- offer ids, "
              "listing ids and statuses -- and what we have recorded. "
@@ -631,6 +798,9 @@ def main():
 
     db = Database(db_path=DATABASE_URL)
     user_db = UserDatabase(db_path=USER_DATABASE_URL)
+
+    if args.check_images:
+        return check_images(db, args.check_images.strip())
 
     if args.verify:
         return verify_report(db, build_client(user_db), args.verify.strip())
