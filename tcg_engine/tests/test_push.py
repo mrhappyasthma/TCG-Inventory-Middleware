@@ -428,6 +428,66 @@ class ResumeTests(PushTestCase):
         self.assertFalse(result["attempted"])
         self.assertIn("no items", result["reason"])
 
+    def test_a_retry_after_a_failure_completes_the_listing(self):
+        """
+        The bug that cost a real push, reproduced.
+
+        The first attempt failed at the bulk inventory-item call, so every card
+        was marked ``failed``. The second attempt -- with the cause fixed --
+        got the items up and created the offers, and then dropped all five
+        cards because they *still said* ``failed`` from last time: this module
+        reads the item's own status to decide whether a card is still in play,
+        and a stale verdict makes that check answer yes before anything has
+        been attempted.
+
+        The result was the worst possible shape: offers created on eBay, no
+        group written, nothing published, nothing marked, and a run reporting
+        "0 pushed, 0 failed".
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+
+        first = push_plan(self.db, FakeEbay(fail_skus={
+            "ID1001": "locale missing", "ID1002": "locale missing",
+        }), plan_id, user_id=SHARED_SCOPE)
+        self.assertEqual(first["failed"], 2)
+
+        # The cause is fixed; nothing else changed.
+        api = FakeEbay()
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["pushed"], 2, result["logs"])
+        self.assertEqual(result["listings_created"], 1)
+        self.assertIn("publish_group", api.kinds())
+        self.assertIsNotNone(
+            self.db.get_managed_listing("Base Set|Near Mint")["ebay_parent_id"]
+        )
+        # And the stale reasons are gone, so the drafts page stops showing a
+        # blocker for a problem that no longer exists.
+        for row in self.db.get_plan_items(plan_id):
+            self.assertEqual(row["status"], STATUS_PUSHED)
+            self.assertIsNone(row["validation"])
+
+    def test_an_error_on_a_retry_is_recorded_rather_than_discarded(self):
+        # The same stale-status hole had a second mouth: the group-level
+        # handler refused to overwrite a verdict that already said failed, so
+        # a retry's own error was thrown away and the run reported nothing.
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(fail_skus={"ID1001": "first reason"}),
+                  plan_id, user_id=SHARED_SCOPE)
+
+        class Exploding(FakeEbay):
+            def upsert_group(self, group_key, payload):
+                raise RuntimeError("second reason")
+
+        result = push_plan(self.db, Exploding(), plan_id, user_id=SHARED_SCOPE)
+        self.assertEqual(result["failed"], 1)
+        item = self.db.get_plan_items(plan_id)[0]
+        self.assertIn("second reason", item["validation"])
+        self.assertNotIn("first reason", item["validation"])
+
     def test_a_draft_cannot_be_pushed(self):
         self.add_card("ID1001", "Charizard", "004/102")
         plan_id = build_plan(self.db, user_id=1)["plan_id"]

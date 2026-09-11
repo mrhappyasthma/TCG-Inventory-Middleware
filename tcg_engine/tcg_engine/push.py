@@ -52,6 +52,7 @@ from .plans import (
     STATUS_DEFERRED,
     STATUS_EXCLUDED,
     STATUS_FAILED,
+    STATUS_PENDING,
     STATUS_PUSHED,
     is_single,
 )
@@ -463,6 +464,24 @@ def push_plan(
             "logs": logs,
         }
 
+    # A retry starts clean. An item still carrying ``failed`` or ``deferred``
+    # from an earlier attempt is about to be tried again, so that verdict is
+    # stale -- and leaving it in place is not cosmetic. This module asks "did
+    # this card fail?" several times while walking a listing, by reading the
+    # item's own status; a status left over from last time makes those checks
+    # answer yes before anything has been attempted.
+    #
+    # That is exactly what happened on the second real push: the inventory
+    # items went up, five offers were created, and then every card was
+    # silently dropped because it still said ``failed`` from the previous
+    # attempt. No group was written, nothing was published, nothing was
+    # marked, and the run reported "0 pushed, 0 failed" -- with five orphaned
+    # offers on eBay and no hint of why.
+    for item in items:
+        if item["status"] in (STATUS_FAILED, STATUS_DEFERRED):
+            db.update_plan_item(item["id"], status=STATUS_PENDING, validation=None)
+            item["status"] = STATUS_PENDING
+
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for item in items:
         groups.setdefault(item.get("group_key") or "", []).append(item)
@@ -514,7 +533,10 @@ def push_plan(
             listings_updated += updated
         except Exception as exc:  # noqa: BLE001 - one listing must not sink the rest
             for item in group_items:
-                if item["status"] not in (STATUS_PUSHED, STATUS_FAILED):
+                # Anything not confirmed pushed carries this run's reason.
+                # Skipping items that already said "failed" meant a retry's
+                # own error was discarded and the run reported nothing.
+                if item["status"] != STATUS_PUSHED:
                     _mark(db, item, STATUS_FAILED, counts, str(exc))
             record("ERROR", f"{group_key or 'ungrouped'}: {exc}")
 
