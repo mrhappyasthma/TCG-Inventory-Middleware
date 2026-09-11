@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import io
@@ -11,6 +12,9 @@ import mimetypes
 from html import escape as escape_html
 import shutil
 import tempfile
+import threading
+import time
+import uuid
 import zipfile
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Literal
@@ -818,8 +822,6 @@ async def start_price_refresh_loop():
     if not PRICE_REFRESH_ENABLED:
         print("[prices] background refresh disabled", flush=True)
         return
-
-    import asyncio
 
     async def loop():
         await asyncio.sleep(120)
@@ -2498,6 +2500,110 @@ def approve_plan_endpoint(
     return {"success": True, **result}
 
 
+# -------------------------------------------------------------------
+# Push jobs
+# -------------------------------------------------------------------
+#
+# A push is long: creating a hundred-card listing is a dozen eBay calls, and a
+# whole plan is several listings of that. Held open as one HTTP request it
+# outlasts the reverse proxy, which answers the browser with its own error page
+# while the push carries on regardless -- and the page, having lost its
+# request, also loses any idea that a push is happening. Switching tabs and
+# back showed nothing in progress.
+#
+# So the request starts a job and returns immediately, and the page follows it
+# by polling. That makes the two problems the same problem, and the fix is that
+# progress lives on the server rather than in one browser request.
+#
+# Deliberately in memory. A job is a few minutes of transient state, and the
+# durable record of what happened is the plan itself -- each card's status and
+# reason are written as eBay answers, which is what a restart or a closed
+# laptop has to be able to rely on. A vanished job is reported as unknown
+# rather than as a failure, because the push it described may well have
+# finished.
+_push_jobs: Dict[str, Dict[str, Any]] = {}
+_push_jobs_lock = threading.Lock()
+
+# Finished jobs are kept long enough for a reload to collect the result.
+PUSH_JOB_RETENTION_SECONDS = 3600
+
+
+def _prune_push_jobs() -> None:
+    cutoff = time.time() - PUSH_JOB_RETENTION_SECONDS
+    for job_id, job in list(_push_jobs.items()):
+        if job["status"] != "running" and job["finished_at"] < cutoff:
+            _push_jobs.pop(job_id, None)
+
+
+def _running_push_job(plan_id: int) -> Optional[str]:
+    """The id of a push already running for this plan, if there is one."""
+    with _push_jobs_lock:
+        for job_id, job in _push_jobs.items():
+            if job["plan_id"] == plan_id and job["status"] == "running":
+                return job_id
+    return None
+
+
+def _push_job_snapshot(job_id: str, since: int = 0) -> Optional[Dict[str, Any]]:
+    """
+    A job's state, with only the log lines the caller has not seen.
+
+    ``since`` is an index rather than a timestamp so that a poller cannot miss
+    a line or replay one, however irregular its own timing is.
+    """
+    with _push_jobs_lock:
+        job = _push_jobs.get(job_id)
+        if job is None:
+            return None
+        logs = job["logs"][since:]
+        return {
+            "job_id": job_id,
+            "plan_id": job["plan_id"],
+            "group_key": job["group_key"],
+            "status": job["status"],
+            "started_at": job["started_at"],
+            "logs": list(logs),
+            "log_count": len(job["logs"]),
+            "result": job["result"],
+            "error": job["error"],
+        }
+
+
+def _run_push_job(job_id: str, plan_id: int, user_id: int, group_keys) -> None:
+    """Run one push to completion, recording progress as it goes."""
+    def note(level: str, message: str) -> None:
+        with _push_jobs_lock:
+            job = _push_jobs.get(job_id)
+            if job is not None:
+                job["logs"].append({"level": level, "message": message})
+        print(f"[push] {level}: {message}", flush=True)
+
+    client = get_ebay_client()
+    adapter = InventoryApiAdapter(client)
+    try:
+        with db.session():
+            result = push_plan(
+                db, adapter, plan_id, user_id=user_id,
+                group_keys=group_keys, log=note,
+            )
+        outcome, error = result, None
+    except (PushError, EbayError) as exc:
+        outcome, error = None, str(exc)
+        note("ERROR", str(exc))
+    except Exception as exc:  # noqa: BLE001 - a job must not die silently
+        outcome, error = None, f"unexpected failure: {exc}"
+        note("ERROR", f"unexpected failure: {exc}")
+
+    with _push_jobs_lock:
+        job = _push_jobs.get(job_id)
+        if job is not None:
+            job["status"] = "failed" if error else "done"
+            job["result"] = outcome
+            job["error"] = error
+            job["finished_at"] = time.time()
+        _prune_push_jobs()
+
+
 class PlanPushRequest(BaseModel):
     """
     Which of a plan's listings to push.
@@ -2519,19 +2625,20 @@ async def push_plan_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
-    Apply an approved plan to eBay.
+    Start pushing an approved plan to eBay, and return the job that is doing it.
 
     The only endpoint in this application that changes a live listing. It acts
     on a *stored* approval rather than on a claim made by this request, so the
     record of who authorised the change exists before the change does.
 
-    Runs in a worker thread: a push walks several eBay calls per listing, each
-    with its own retry budget, and holding the event loop for that would stall
-    every other request including the health check.
+    Returns immediately rather than holding the request open for the minutes a
+    large push takes. Held open, it outlasted the reverse proxy, which answered
+    the browser with an error page while the push carried on -- and the page,
+    having lost its request, lost any sign that a push was running.
 
     Only listings created through this API are touched. Anything made through
-    File Exchange is left for the CSV path and reported as deferred -- pushing
-    it would create a duplicate listing rather than update the live one.
+    File Exchange is left for the CSV path and reported as deferred, since
+    pushing it would create a duplicate rather than update the live one.
     """
     plan = db.get_plan(plan_id)
     if plan is None or plan["user_id"] != user["id"]:
@@ -2556,32 +2663,64 @@ async def push_plan_endpoint(
             ),
         )
 
-    adapter = InventoryApiAdapter(client)
+    # One push per plan at a time. Two running together would race on the same
+    # items and the same listing, and could publish the same group twice.
+    existing = _running_push_job(plan_id)
+    if existing is not None:
+        return {"success": True, "job_id": existing, "already_running": True}
 
     group_keys = None
     if req is not None and req.group_key is not None:
         group_keys = [req.group_key]
 
-    def run():
-        with db.session():
-            return push_plan(
-                db, adapter, plan_id, user_id=user["id"],
-                group_keys=group_keys,
-            )
+    job_id = uuid.uuid4().hex
+    with _push_jobs_lock:
+        _push_jobs[job_id] = {
+            "plan_id": plan_id,
+            "group_key": group_keys[0] if group_keys else None,
+            "status": "running",
+            "logs": [],
+            "result": None,
+            "error": None,
+            "started_at": time.time(),
+            "finished_at": 0.0,
+        }
 
-    try:
-        result = await run_in_threadpool(run)
-    except PushError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except EbayError as exc:
-        # A failure that belongs to the whole push rather than to one card:
-        # credentials, or eBay being unreachable. Reported as such, because
-        # the per-card verdicts inside the result mean something different.
-        raise HTTPException(status_code=502, detail=f"eBay refused: {exc}")
+    asyncio.create_task(run_in_threadpool(
+        _run_push_job, job_id, plan_id, user["id"], group_keys
+    ))
+    return {"success": True, "job_id": job_id, "already_running": False}
 
-    for entry in result.get("logs", []):
-        print(f"[push] {entry['level']}: {entry['message']}", flush=True)
-    return {"success": True, **result}
+
+@app.get("/api/push-jobs/{job_id}")
+def get_push_job(
+    job_id: str,
+    since: int = 0,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    How a push is going, and the log lines not yet collected.
+
+    404 means the job is unknown -- most often because the server restarted,
+    which says nothing about whether the push finished. The plan's own item
+    statuses are the durable answer to that, so the page sends the reader
+    there rather than declaring a failure it cannot know about.
+    """
+    snapshot = _push_job_snapshot(job_id, since=max(0, since))
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "That push is no longer being tracked, which usually means "
+                "the server restarted. Check the eBay Listings tab: the "
+                "push may well have finished."
+            ),
+        )
+    if snapshot["plan_id"] is not None:
+        plan = db.get_plan(snapshot["plan_id"])
+        if plan is not None and plan["user_id"] != user["id"]:
+            raise HTTPException(status_code=404, detail="Job not found.")
+    return snapshot
 
 
 @app.delete("/api/plans/{plan_id}")

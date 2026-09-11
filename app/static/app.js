@@ -2579,6 +2579,8 @@ async function fetchDraftPlan() {
         // of draft, and the no-open-draft state then hides the footer -- so
         // the files appeared and vanished in the same instant.
         renderPlanHistory(plans);
+        // A push started before a tab switch is still running on the server.
+        resumePushJob();
 
         const draft = plans.find(p => p.status === "draft");
         if (!draft) {
@@ -3318,6 +3320,119 @@ async function readJsonResponse(res) {
     }
 }
 
+let activePushPoll = null;
+
+// The push runs as a job on the server and this follows it, so that switching
+// tabs, reloading or losing the connection does not lose sight of it. Held as
+// one long request it outlasted the reverse proxy and the page forgot a push
+// was even happening; progress belongs on the server, and this only watches.
+function rememberPushJob(jobId, planId) {
+    try {
+        sessionStorage.setItem("activePushJob", JSON.stringify({ jobId, planId }));
+    } catch (err) { /* private browsing; polling still works this session */ }
+}
+
+function forgetPushJob() {
+    try { sessionStorage.removeItem("activePushJob"); } catch (err) { /* ignore */ }
+}
+
+// Called whenever the Drafts tab renders, so a push started before a tab
+// switch is picked up again instead of vanishing.
+function resumePushJob() {
+    if (activePushPoll) return;
+    let stored = null;
+    try { stored = JSON.parse(sessionStorage.getItem("activePushJob") || "null"); }
+    catch (err) { stored = null; }
+    if (stored && stored.jobId) {
+        followPushJob(stored.jobId, stored.planId, { resumed: true });
+    }
+}
+
+async function followPushJob(jobId, planId, opts) {
+    const options = opts || {};
+    if (activePushPoll) clearTimeout(activePushPoll);
+    let seen = 0;
+    if (options.resumed) {
+        logToTerminal("INFO", `Rejoining the push of plan ${planId}…`);
+    }
+
+    const tick = async () => {
+        let data;
+        try {
+            const res = await fetch(`/api/push-jobs/${encodeURIComponent(jobId)}?since=${seen}`);
+            data = await readJsonResponse(res);
+            if (res.status === 404) {
+                activePushPoll = null;
+                forgetPushJob();
+                setPushBanner("");
+                logToTerminal("WARN", (data && data.detail)
+                    || "That push is no longer being tracked. Check the eBay Listings tab.");
+                await fetchDraftPlan();
+                return;
+            }
+            if (data === null) throw new Error(`the server answered ${res.status}`);
+        } catch (err) {
+            // A blip in polling says nothing about the push, which is running
+            // on the server either way. Keep watching rather than reporting.
+            activePushPoll = setTimeout(tick, 4000);
+            return;
+        }
+
+        (data.logs || []).forEach(e => logToTerminal(e.level, e.message));
+        seen = data.log_count || seen;
+
+        if (data.status === "running") {
+            const last = (data.logs || []).slice(-1)[0];
+            setPushBanner(`Pushing plan ${data.plan_id}${data.group_key ? ` · ${data.group_key}` : ""}…`,
+                last ? last.message : "");
+            activePushPoll = setTimeout(tick, 2000);
+            return;
+        }
+
+        activePushPoll = null;
+        forgetPushJob();
+        setPushBanner("");
+        const result = data.result;
+        if (data.error) {
+            logToTerminal("ERROR", `Push failed: ${data.error}`);
+        } else if (result && result.attempted === false) {
+            logToTerminal("WARN", `Nothing was sent to eBay. ${result.reason || ""}`);
+        } else if (result) {
+            logToTerminal(result.pushed && !result.failed ? "SUCCESS" : "WARN",
+                `Push complete: ${result.pushed} card(s) pushed, ${result.failed} failed, ${result.deferred} left for CSV`);
+        }
+        expandPlanFilesFor = planId;
+        await fetchDraftPlan();
+        if (typeof fetchEbayListings === "function") fetchEbayListings();
+    };
+
+    tick();
+}
+
+function setPushBanner(title, detail) {
+    const box = document.getElementById("pushBanner");
+    if (!box) return;
+    if (!title) {
+        box.classList.add("hidden");
+        box.innerHTML = "";
+        return;
+    }
+    box.classList.remove("hidden");
+    box.innerHTML = `
+        <div class="flex items-center gap-3">
+            <span class="w-3 h-3 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin"></span>
+            <div class="min-w-0">
+                <p class="text-xs font-semibold text-emerald-200">${escapeHtml(title)}</p>
+                ${detail ? `<p class="text-[11px] text-slate-400 truncate">${escapeHtml(detail)}</p>` : ""}
+            </div>
+            <span class="ml-auto text-[10px] text-slate-500">This continues on the server &mdash; you can switch tabs.</span>
+        </div>`;
+}
+
+// The one action in this dashboard that changes a live eBay listing, so the
+// confirm states what it will do in numbers rather than asking "are you
+// sure?". A partial push is offered again because it is resumable: cards
+// already pushed are skipped, so pressing it twice cannot duplicate a listing.
 async function pushPlan(planId, button, groupKey) {
     const what = groupKey ? `the "${groupKey}" listing from plan ${planId}` : `all of plan ${planId}`;
     if (!confirm(`Push ${what} to eBay now? This creates and updates live listings immediately — there is no draft on eBay's side. Cards already pushed are skipped, and listings made through File Exchange are left for the CSV files.`)) {
@@ -3331,39 +3446,16 @@ async function pushPlan(planId, button, groupKey) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(groupKey ? { group_key: groupKey } : {}),
         });
-        // Creating a large listing can outlast the reverse proxy's patience.
-        // What comes back then is the proxy's own HTML error page, not our
-        // JSON -- and the push itself carries on server-side and usually
-        // finishes. Reading that as "the push failed" is wrong and alarming,
-        // so the two are told apart explicitly.
         const data = await readJsonResponse(res);
-        if (data === null) {
-            logToTerminal("WARN", (
-                `The connection dropped while plan ${planId} was still being pushed `
-                + `(the server answered with a ${res.status} page rather than a result). `
-                + "The push is most likely still running: check eBay Listings in a "
-                + "minute, and press Push again afterwards -- cards already pushed are skipped."
-            ));
-            await fetchDraftPlan();
-            return;
+        if (data === null) throw new Error(`the server answered ${res.status}`);
+        if (!res.ok) throw new Error(data.detail || "The push could not be started");
+        if (data.already_running) {
+            logToTerminal("WARN", "A push for this plan is already running; following that one.");
         }
-        if (!res.ok) throw new Error(data.detail || "The push failed");
-        (data.logs || []).forEach(entry =>
-            logToTerminal(entry.level, entry.message));
-        // Doing nothing must not look like success: that is what sent
-        // someone to eBay's active listings hunting for a listing that was
-        // never attempted.
-        if (data.attempted === false) {
-            logToTerminal("WARN", `Nothing was sent to eBay. ${data.reason || ""}`);
-        } else {
-            logToTerminal(data.pushed && !data.failed ? "SUCCESS" : "WARN",
-                `Push complete: ${data.pushed} card(s) pushed, ${data.failed} failed, ${data.deferred} left for CSV`);
-        }
-        expandPlanFilesFor = planId;
-        await fetchDraftPlan();
-        if (typeof fetchEbayListings === "function") fetchEbayListings();
+        rememberPushJob(data.job_id, planId);
+        followPushJob(data.job_id, planId, {});
     } catch (err) {
-        logToTerminal("ERROR", `Push failed: ${err.message}`);
+        logToTerminal("ERROR", `Push failed to start: ${err.message}`);
         if (button) { button.disabled = false; button.textContent = "Push to eBay"; }
     }
 }

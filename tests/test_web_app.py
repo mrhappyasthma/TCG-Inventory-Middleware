@@ -825,6 +825,22 @@ class TestWebApp(unittest.TestCase):
                 "nothing may be marked pushed when nothing was sent",
             )
 
+    def test_30c2_a_vanished_push_job_is_unknown_rather_than_failed(self):
+        """
+        A restart loses the job, not the answer.
+
+        Job state is in memory because it is a few minutes of transient
+        progress; what actually happened to each card is written on the plan
+        as eBay answers. So an unknown job must not be reported as a failed
+        push -- the push it described may well have finished.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.get("/api/push-jobs/deadbeef")
+        self.assertEqual(res.status_code, 404)
+        detail = res.json()["detail"]
+        self.assertIn("restarted", detail)
+        self.assertIn("may well have finished", detail)
+
     def test_30d_another_users_plan_cannot_be_pushed(self):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         plan_id = self.client.post(
