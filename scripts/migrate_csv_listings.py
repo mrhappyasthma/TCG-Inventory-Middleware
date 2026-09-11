@@ -423,6 +423,58 @@ def image_dimensions(url):
     return None
 
 
+def check_url(url):
+    """
+    Report one image URL's size, and name a bigger version when there is one.
+
+    Added because the question came up twice in a row while choosing cover
+    photos, and the answer is never guessable from the URL -- except in the
+    one case where it is. A MediaWiki thumbnail states its own width in the
+    path (".../thumb/0/01/X.png/360px-X.png"), so a too-small one has a
+    larger sibling: drop "thumb/" and the "NNNpx-" segment for the original.
+    """
+    size = image_dimensions(url)
+    if size is None:
+        print(f"  {url}")
+        print("    could not be read. Either the fetch failed or the format "
+              "is not PNG, JPEG, GIF or WebP. eBay has to fetch it too, so "
+              "treat this as a warning rather than a pass.")
+        return 1
+
+    width, height = size
+    longest = max(width, height)
+    ok = longest >= EBAY_MIN_LONGEST_SIDE
+    print(f"  {url}")
+    print(f"    {width}x{height}, longest side {longest} -- "
+          f"{'OK' if ok else f'TOO SMALL, eBay needs {EBAY_MIN_LONGEST_SIDE}'}")
+
+    ratio = max(width, height) / max(1, min(width, height))
+    if ok and ratio >= 2.0:
+        print(f"    note: {ratio:.1f}:1, so it will letterbox heavily in "
+              f"eBay's square gallery thumbnail. Allowed -- the minimum size "
+              f"is the only hard rule -- but it shows small in search results.")
+
+    # Derived by splitting rather than with a regex: a MediaWiki thumb URL
+    # is "<base>/thumb/<a>/<ab>/<file>/<N>px-<file>", so dropping the last
+    # segment and the "thumb/" marker yields the original.
+    original = url
+    if "/thumb/" in url:
+        head, _, tail = url.rpartition("/")
+        if "px-" in tail:
+            original = head.replace("/thumb/", "/", 1)
+    if original != url:
+        print("    this is a MediaWiki thumbnail. The original:")
+        bigger = image_dimensions(original)
+        if bigger:
+            b_w, b_h = bigger
+            print(f"      {original}")
+            print(f"      {b_w}x{b_h} -- "
+                  f"{'OK' if max(b_w, b_h) >= EBAY_MIN_LONGEST_SIDE else 'still too small'}")
+        else:
+            print(f"      {original}  (could not be read)")
+    return 0 if ok else 1
+
+
 def check_images(db, parent):
     """
     Every picture we hold for one listing, with the ones eBay would refuse.
@@ -775,6 +827,11 @@ def main():
              "applies.",
     )
     parser.add_argument(
+        "--check-url", metavar="URL", default=None,
+        help="report one image URL's pixel size before using it as a cover "
+             "photo, and name the original if it is a MediaWiki thumbnail.",
+    )
+    parser.add_argument(
         "--check-images", metavar="ITEM_ID", default=None,
         help="report the pixel size of every image we hold for one listing, "
              "flagging any below eBay's 500px minimum. Touches eBay not at "
@@ -798,6 +855,10 @@ def main():
 
     db = Database(db_path=DATABASE_URL)
     user_db = UserDatabase(db_path=USER_DATABASE_URL)
+
+    if args.check_url:
+        # Deliberately before the databases are opened: this needs neither.
+        return check_url(args.check_url.strip())
 
     if args.check_images:
         return check_images(db, args.check_images.strip())
