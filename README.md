@@ -706,6 +706,30 @@ What the script does that a bare API call would not:
   touching another. There is an unresolved report of migrating listings that
   share an inventory item group key unpublishing all but the first; nothing
   here shares one, but the check costs a single call.
+* **Detects a listing eBay has already migrated.** The call is irreversible
+  but its reply is not guaranteed to arrive, so "it returned an error" does
+  not mean "nothing happened" — and our own records cannot tell the
+  difference, because they are written only after a success. The preflight
+  asks eBay whether the listing's SKUs have offers, which is true of a
+  migrated listing and no other kind. `--migrate` then **adopts** it rather
+  than migrating twice: the offer ids are read back one SKU at a time with
+  `getOffers`, and nothing is sent to eBay.
+
+eBay refuses the migration unless **all four** of these hold, and none is
+visible to the script, so it prints them before asking for confirmation:
+
+1. the listing is **fixed-price** (auctions cannot be migrated at all);
+2. **every variation has its own SKU**;
+3. it uses **Business Policies** for payment, return and shipping — a listing
+   carrying the legacy per-listing shipping, returns or payment fields is
+   rejected, and File Exchange could write either form, so this is the one to
+   check first;
+4. its **payment policy has immediate payment enabled**.
+
+Each of those produces a bare `400`. If one does, the script now prints
+eBay's `errorId`, its parameters and the raw response body — the first real
+attempt failed with nothing but "returned 400", because the library was
+discarding a refusal whose payload was not in eBay's documented shape.
 
 ## 📌 Revising a variation listing
 

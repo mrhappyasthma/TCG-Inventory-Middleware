@@ -33,6 +33,14 @@ What it does, in order, per listing:
 5. Verifies against eBay that the listing is still published under the same
    item id, and stops before touching another listing if it is not.
 
+And because the call is irreversible while its reply is not guaranteed to
+arrive, the preflight asks eBay whether each listing already has offers --
+which is true of a migrated listing and of no other kind. A listing that
+migrated on an attempt whose reply was lost is therefore detected rather than
+migrated again, and ``--migrate`` **adopts** it instead: the offer ids are
+read back one SKU at a time with ``getOffers``, which is the price of having
+lost the response, and nothing is sent to eBay.
+
 Usage, from the repository root:
 
     python scripts/migrate_csv_listings.py                  # preflight only
@@ -173,6 +181,34 @@ def preflight(db, listing):
     return blockers, notes, cards
 
 
+def already_migrated(api_transport, cards):
+    """
+    Ask eBay whether it already has offers for this listing's SKUs.
+
+    This answers the question a failed migration leaves behind. The call is
+    irreversible and its reply can be lost, so "it returned an error" does not
+    mean "nothing happened" -- and our own records cannot tell the difference,
+    because they are only written after a success. The Inventory API can:
+    offers exist for a migrated listing and for no other kind.
+
+    Returns (migrated, listing_ids) or (None, []) when the question could not
+    be asked, which is deliberately not the same as "no".
+    """
+    if api_transport is None:
+        return None, []
+    sku = next((str(c.get("custom_label") or "").strip() for c in cards
+                if str(c.get("custom_label") or "").strip()), "")
+    if not sku:
+        return None, []
+    try:
+        offers = inventory.get_offers(api_transport, sku)
+    except EbayError:
+        return None, []
+    ids = sorted({str(o.get("listingId") or "").strip() for o in offers
+                  if str(o.get("listingId") or "").strip()})
+    return bool(offers), ids
+
+
 def describe(listing, cards, blockers, notes):
     parent = listing["ebay_parent_id"]
     print(f"\n  Listing #{parent}")
@@ -301,6 +337,71 @@ def verify(api_transport, listing, cards):
     return False
 
 
+def recover_one(db, client, listing, cards):
+    """
+    Adopt a listing eBay has already migrated but we never recorded.
+
+    The irreversible half is done and cannot be done again; what is missing is
+    the offer id per SKU, which is the only handle that can change a price.
+    ``bulkMigrateListing`` would not hand them over a second time, but
+    ``getOffers`` will, one SKU at a time -- which is the price of having lost
+    the reply.
+
+    Writes nothing to eBay.
+    """
+    parent = str(listing["ebay_parent_id"]).strip()
+    print(f"\n  Adopting #{parent}, already migrated at eBay ...")
+
+    group_key = variation_group_key(
+        listing.get("set_name") or "", listing.get("condition") or ""
+    )
+    inventory_group = ""
+    recorded = 0
+    mismatched = []
+
+    for card in cards:
+        sku = str(card.get("custom_label") or "").strip()
+        if not sku:
+            continue
+        try:
+            offers = inventory.get_offers(client.seller, sku)
+        except EbayError as exc:
+            print(f"    WARNING: could not read offers for {sku}: {exc}")
+            continue
+        for offer in offers:
+            offer_id = str(offer.get("offerId") or "").strip()
+            listing_id = str(offer.get("listingId") or "").strip()
+            if listing_id and listing_id != parent:
+                mismatched.append(f"{sku} -> #{listing_id}")
+                continue
+            if offer_id:
+                db.set_variation_offer(card["manifest_id"], offer_id)
+                recorded += 1
+            group = str(offer.get("inventoryItemGroupKey") or "").strip()
+            if group:
+                inventory_group = group
+            break
+
+    db.upsert_managed_listing(
+        group_key,
+        inventory_item_group_key=inventory_group or None,
+        ebay_parent_id=parent,
+        managed_by="api",
+        pushed=True,
+    )
+    print(f"    recorded {recorded} offer id(s) under group key {group_key!r}"
+          + (f", inventory group {inventory_group!r}" if inventory_group else ""))
+    for line in mismatched:
+        print(f"    WARNING: an offer for {line} belongs to a different "
+              f"listing and was left alone")
+    if not inventory_group:
+        print("    note: eBay reported no inventory item group for these "
+              "offers. Check the listing before using Refresh on it, which "
+              "writes the group as a full replace.")
+    record_cover(db, client.seller, listing, inventory_group)
+    return True
+
+
 def report_call_failure(exc):
     """
     Print everything eBay said, not just that it said no.
@@ -367,28 +468,72 @@ def main():
     db = Database(db_path=DATABASE_URL)
     user_db = UserDatabase(db_path=USER_DATABASE_URL)
 
+    # Built up front so the preflight can ask eBay whether a listing is
+    # already migrated. Read-only either way: nothing is written to eBay
+    # without --migrate. A missing connection is not fatal here, because the
+    # rest of the preflight needs only our own database.
+    probe = None
+    try:
+        probe = build_client(user_db).seller
+    except SystemExit as exc:
+        print(f"note: {exc}")
+        print("      The preflight below still runs, but cannot ask eBay "
+              "whether a listing has already been migrated.")
+
     listings = db.get_ebay_listings()
     candidates = []
-    print(f"{len(listings)} live listing(s) in the mirror.")
+    recoverable = []
+    print(f"\n{len(listings)} live listing(s) in the mirror.")
     for listing in listings:
         blockers, notes, cards = preflight(db, listing)
+
+        migrated, ids = already_migrated(probe, cards)
+        if migrated:
+            # Not a migration candidate, but not a dead end either: eBay has
+            # done the irreversible part and only our own record is missing.
+            blockers.append(
+                "eBay already has offers for this listing's SKUs"
+                + (f" under listing {', '.join(ids)}" if ids else "")
+                + ". It is migrated already, so nothing more will be sent to "
+                  "eBay for it -- but we never recorded it. Re-run with "
+                  "--migrate to adopt the existing offers."
+            )
+            recoverable.append((listing, cards))
+        elif migrated is None and probe is not None:
+            notes.append(
+                "could not check with eBay whether it is already migrated"
+            )
+
         describe(listing, cards, blockers, notes)
         if not blockers:
             candidates.append((listing, cards))
 
     if not args.migrate:
         print(f"\nPreflight only. {len(candidates)} listing(s) could be "
-              f"migrated. Nothing was sent to eBay.")
+              f"migrated, {len(recoverable)} already migrated but not "
+              f"recorded. Nothing was written.")
         print("Re-run with --migrate <item id>, or --migrate all, to proceed.")
         return 0
 
     if args.migrate != "all":
+        wanted = args.migrate.strip()
         candidates = [(l, c) for l, c in candidates
-                      if str(l["ebay_parent_id"]).strip() == args.migrate.strip()]
-        if not candidates:
+                      if str(l["ebay_parent_id"]).strip() == wanted]
+        recoverable = [(l, c) for l, c in recoverable
+                       if str(l["ebay_parent_id"]).strip() == wanted]
+        if not candidates and not recoverable:
             print(f"\n{args.migrate} is not a listing that can be migrated. "
                   f"See the report above.")
             return 1
+
+    # Adoption first, and without any of the migration warnings: it sends no
+    # writes to eBay at all, so there is nothing to confirm.
+    if recoverable:
+        client = build_client(user_db)
+        for listing, cards in recoverable:
+            recover_one(db, client, listing, cards)
+        if not candidates:
+            return 0
 
     print("\n" + "=" * 70)
     print("bulkMigrateListing CANNOT BE UNDONE.")
