@@ -75,6 +75,32 @@ VARIATION_ASPECT_NAME = "Card"
 # eBay's ceiling on one bulk call.
 BULK_LIMIT = 25
 
+# The natural language of the values we send. Required *per record* by
+# bulkCreateOrReplaceInventoryItem, and its absence is reported as
+# "Valid SKU and locale information are required for all the InventoryItems in
+# the request" -- which reads like the SKU is the problem when the SKU is
+# present and fine. The Content-Language header the transport already sends is
+# necessary but not sufficient: the header describes the request, this field
+# describes the record.
+LOCALE_BY_MARKETPLACE = {
+    "EBAY_US": "en_US",
+    "EBAY_CA": "en_CA",
+    "EBAY_GB": "en_GB",
+    "EBAY_AU": "en_AU",
+    "EBAY_DE": "de_DE",
+    "EBAY_FR": "fr_FR",
+    "EBAY_IT": "it_IT",
+    "EBAY_ES": "es_ES",
+}
+DEFAULT_LOCALE = "en_US"
+
+
+def locale_for(marketplace_id: str) -> str:
+    """The record locale for a marketplace, defaulting to US English."""
+    return LOCALE_BY_MARKETPLACE.get(
+        str(marketplace_id or "").strip().upper(), DEFAULT_LOCALE
+    )
+
 _DESCRIPTOR_ID_PATTERN = re.compile(r"(\d{4,})")
 
 
@@ -566,6 +592,7 @@ def _push_group(
     for item in changes:
         payloads.append({
             "sku": _sku_for(item),
+            "locale": locale_for(marketplace_id),
             **_inventory_item_payload(
                 item,
                 settings=settings,

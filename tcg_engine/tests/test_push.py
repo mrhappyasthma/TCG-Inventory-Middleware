@@ -225,6 +225,21 @@ class CreateListingTests(PushTestCase):
                          [{"name": "40001", "values": ["400010"]}])
         self.assertEqual(item["condition"], "USED_VERY_GOOD")
 
+    def test_every_bulk_record_carries_its_locale(self):
+        """
+        Required per record, not just per request.
+
+        Without it eBay answers 400 with "Valid SKU and locale information are
+        required for all the InventoryItems in the request", which reads as
+        though the SKU is at fault when the SKU is present and correct. The
+        Content-Language header the transport sends describes the request; this
+        field describes the record, and both are needed.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+        self.assertEqual(api.items["ID1001"]["locale"], "en_US")
+
     def test_aspects_lose_the_csv_column_prefix(self):
         # "C:Game" is File Exchange's column naming. eBay's aspects are
         # unprefixed names mapping to lists.
