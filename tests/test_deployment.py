@@ -143,6 +143,35 @@ class JavaScriptParsesTests(unittest.TestCase):
             "attribute:\n  " + "\n  ".join(offenders),
         )
 
+    def test_a_collapsible_draft_listing_is_not_hardcoded_open(self):
+        """
+        Collapse state must survive a re-render.
+
+        Every edit on the drafts page -- a quantity, an exclusion, a cover
+        photo -- refetches and rebuilds the whole draft, and rebuilding from
+        markup discards the open/closed state of each ``<details>``. With the
+        attribute written literally, setting one cover photo re-expanded every
+        listing the user had just collapsed to get it out of the way.
+
+        Guarded lexically because the alternative needs a DOM: the state lives
+        in a set outside the markup, and a ``toggle`` listener maintains it.
+        That listener must capture, because a ``toggle`` event does not bubble
+        and a listener on ``document`` would otherwise never fire.
+        """
+        source = self.source("app.js")
+        self.assertNotIn(
+            "<details open", source,
+            "a hardcoded 'open' attribute loses the user's collapse state on "
+            "the next re-render; render it from collapsedDraftGroups instead",
+        )
+        self.assertIn("collapsedDraftGroups", source)
+        self.assertRegex(
+            source,
+            r'addEventListener\(\s*"toggle"[\s\S]{0,900}?\}\s*,\s*true\s*\)',
+            "the toggle listener must be registered with capture=true, since "
+            "a <details> toggle event does not bubble",
+        )
+
     def test_app_js_parses_if_a_javascript_runtime_is_installed(self):
         """
         Upgrade path: `node --check` is a real parser and catches everything

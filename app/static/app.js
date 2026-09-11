@@ -2443,6 +2443,29 @@ async function fetchEbayListings() {
 // second round trip for data the PATCH response already returned.
 let currentDraftPlan = null;
 
+// Which listings the user has collapsed, by group key. Kept outside the
+// rendered markup because every edit on this page rebuilds the whole draft
+// from scratch, which discards the open/closed state of each <details>.
+// Storing the collapsed set rather than the open one means a listing that
+// appears for the first time is open, which is the right default for a page
+// whose purpose is review.
+const collapsedDraftGroups = new Set();
+
+// Capture phase, because a <details> toggle event does not bubble: a listener
+// on document would never see it otherwise. Capturing also survives the
+// element being replaced on the next render, which delegation is for.
+document.addEventListener("toggle", (event) => {
+    const details = event.target;
+    if (!details || details.tagName !== "DETAILS") return;
+    const key = details.getAttribute("data-group-key");
+    if (key === null) return;
+    if (details.open) {
+        collapsedDraftGroups.delete(key);
+    } else {
+        collapsedDraftGroups.add(key);
+    }
+}, true);
+
 const DRAFT_ACTION_LABELS = {
     create_listing: { label: "New listing", cls: "bg-emerald-950/80 text-emerald-400 border-emerald-800" },
     update: { label: "Update", cls: "bg-sky-950/80 text-sky-300 border-sky-800" },
@@ -2585,8 +2608,16 @@ function renderDraftPlan(detail) {
         // defeat the point. Collapsing matters because one listing can hold a
         // hundred cards and scrolling past it to reach the next is the common
         // case once you have checked it.
+        //
+        // Which listings are collapsed is remembered across re-renders. Every
+        // edit on this page -- a quantity, a cover photo, an exclusion --
+        // refetches and rebuilds the whole draft, and rebuilding from markup
+        // loses the open/closed state of every <details>. Without this,
+        // setting a cover photo re-expands the six listings you had just
+        // collapsed to get it out of the way.
+        const open = collapsedDraftGroups.has(group.group_key) ? "" : "open";
         return `
-            <details open class="group glass-card rounded-2xl border ${border} bg-dark-800/40 overflow-hidden">
+            <details ${open} data-group-key="${escapeHtml(group.group_key)}" class="group glass-card rounded-2xl border ${border} bg-dark-800/40 overflow-hidden">
                 <summary class="cursor-pointer list-none px-4 py-3 border-b border-slate-800/80 bg-dark-800/60 hover:bg-dark-800/90 transition-colors flex items-center gap-3">
                     <svg class="caret w-4 h-4 shrink-0 text-slate-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5l7 7-7 7" />
