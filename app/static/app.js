@@ -88,6 +88,9 @@ async function initAuth() {
             // nothing at eBay. Done on arrival so Module B's card can point at
             // the automated path without the eBay panel being opened first.
             refreshEbayStatus();
+            // The console starts with what happened while nobody was here,
+            // rather than empty.
+            loadPersistedLogs();
         } else if (data.is_pending) {
             document.getElementById("pendingApprovalBanner").classList.remove("hidden");
         } else {
@@ -3653,44 +3656,178 @@ async function discardDraftPlan() {
 // 4. TERMINAL LOG CONSOLE
 // -------------------------------------------------------------------
 
-function logToTerminal(level, message) {
-    const consoleBox = document.getElementById("terminalLogBox");
-    const now = new Date().toLocaleTimeString();
-    noteConsoleActivity(level);
+// How many lines the on-screen console keeps. Older ones are still there —
+// they are in the database, behind "Full log" — but an unbounded list on a
+// page that stays open for days is a memory leak with a scrollbar.
+const CONSOLE_VISIBLE_LINES = 200;
 
-    let levelColor = "text-slate-400";
-    let badgeClass = "text-slate-400";
+function levelClasses(level) {
+    if (level === "SUCCESS") return ["text-emerald-400", "text-emerald-400 font-bold"];
+    if (level === "WARN") return ["text-amber-400", "text-amber-400 font-bold"];
+    if (level === "ERROR") return ["text-rose-400", "text-rose-400 font-bold"];
+    if (level === "INFO") return ["text-cyan-400", "text-cyan-400"];
+    return ["text-slate-400", "text-slate-400"];
+}
 
-    if (level === "SUCCESS") {
-        levelColor = "text-emerald-400";
-        badgeClass = "text-emerald-400 font-bold";
-    } else if (level === "WARN") {
-        levelColor = "text-amber-400";
-        badgeClass = "text-amber-400 font-bold";
-    } else if (level === "ERROR") {
-        levelColor = "text-rose-400";
-        badgeClass = "text-rose-400 font-bold";
-    } else if (level === "INFO") {
-        levelColor = "text-cyan-400";
-        badgeClass = "text-cyan-400";
-    }
-
-    const logEl = document.createElement("div");
-    logEl.className = `log-entry flex items-start gap-2 ${levelColor}`;
-    logEl.innerHTML = `
-        <span class="text-slate-600 select-none">[${now}]</span>
-        <span class="${badgeClass}">[${escapeHtml(level)}]</span>
+// One line, as both the live console and the full-log dialog render it. The
+// stamp is passed in rather than read from the clock, because a stored line's
+// time is the time it happened, not the time it was drawn.
+function logLineElement(level, message, stamp, source) {
+    const [levelColor, badgeClass] = levelClasses(level);
+    const el = document.createElement("div");
+    el.className = `log-entry flex items-start gap-2 ${levelColor}`;
+    el.innerHTML = `
+        <span class="text-slate-600 select-none shrink-0">[${escapeHtml(stamp)}]</span>
+        <span class="${badgeClass} shrink-0">[${escapeHtml(level)}]</span>
+        ${source ? `<span class="text-slate-600 shrink-0">${escapeHtml(source)}</span>` : ""}
         <span class="text-slate-300 break-words flex-1">${escapeHtml(message)}</span>
     `;
+    return el;
+}
 
-    consoleBox.appendChild(logEl);
+// Stored timestamps are SQLite's UTC "YYYY-MM-DD HH:MM:SS". Rendered in local
+// time, with the date shown only when the line is not from today — a log you
+// scroll back through needs to say which day it is talking about.
+function formatLogStamp(value) {
+    if (!value) return "";
+    const parsed = new Date(String(value).replace(" ", "T") + "Z");
+    if (isNaN(parsed.getTime())) return String(value);
+    const sameDay = parsed.toDateString() === new Date().toDateString();
+    return sameDay
+        ? parsed.toLocaleTimeString()
+        : `${parsed.toLocaleDateString()} ${parsed.toLocaleTimeString()}`;
+}
+
+function logToTerminal(level, message) {
+    const consoleBox = document.getElementById("terminalLogBox");
+    noteConsoleActivity(level);
+    consoleBox.appendChild(
+        logLineElement(level, message, new Date().toLocaleTimeString(), "")
+    );
+    while (consoleBox.childElementCount > CONSOLE_VISIBLE_LINES) {
+        consoleBox.removeChild(consoleBox.firstElementChild);
+    }
     consoleBox.scrollTop = consoleBox.scrollHeight;
+}
+
+// The lines the server recorded: the nightly price refresh, the repricer, and
+// any push that outlived the page that started it. Without this the console
+// could only ever show what this tab had personally witnessed.
+async function loadPersistedLogs() {
+    const consoleBox = document.getElementById("terminalLogBox");
+    if (!consoleBox) return;
+    try {
+        const res = await fetch(`/api/logs?limit=${CONSOLE_VISIBLE_LINES}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const entries = (data.entries || []).slice().reverse();
+        if (!entries.length) return;
+
+        consoleBox.innerHTML = "";
+        entries.forEach(e => consoleBox.appendChild(
+            logLineElement(e.level, e.message, formatLogStamp(e.created_at), e.source)
+        ));
+        const note = document.createElement("div");
+        note.className = "text-slate-600 pt-1";
+        note.innerText = data.total > entries.length
+            ? `[SYSTEM] Showing the last ${entries.length} of ${data.total} recorded lines. Open Full log to scroll further back.`
+            : `[SYSTEM] ${entries.length} recorded line(s).`;
+        consoleBox.appendChild(note);
+        consoleBox.scrollTop = consoleBox.scrollHeight;
+
+        const count = document.getElementById("consoleStoredCount");
+        if (count) count.innerText = `${data.total} stored`;
+    } catch (err) {
+        console.error("persisted logs:", err);
+    }
 }
 
 function clearConsoleLogs() {
     const consoleBox = document.getElementById("terminalLogBox");
-    consoleBox.innerHTML = `<div class="text-slate-500">[SYSTEM] Terminal logs cleared.</div>`;
+    consoleBox.innerHTML = `<div class="text-slate-500">[SYSTEM] View cleared. The recorded history is kept &mdash; open Full log to read it.</div>`;
     clearConsoleUnread();
+}
+
+// -- the full log ----------------------------------------------------------
+
+let fullLogOldestId = null;
+let fullLogLevels = "";
+
+function openFullLog() {
+    document.getElementById("fullLogModal").classList.remove("hidden");
+    syncModalScrollLock();
+    fullLogOldestId = null;
+    document.getElementById("fullLogBody").innerHTML = "";
+    loadFullLogPage();
+}
+
+function closeFullLog() {
+    document.getElementById("fullLogModal").classList.add("hidden");
+    syncModalScrollLock();
+}
+
+function setFullLogFilter(levels) {
+    fullLogLevels = levels;
+    document.querySelectorAll("[data-log-filter]").forEach(button => {
+        const active = button.getAttribute("data-log-filter") === levels;
+        button.className = "px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors "
+            + (active
+                ? "bg-brand-600 border-brand-500 text-white"
+                : "bg-dark-800 border-slate-700 text-slate-300 hover:bg-slate-700");
+    });
+    fullLogOldestId = null;
+    document.getElementById("fullLogBody").innerHTML = "";
+    loadFullLogPage();
+}
+
+async function loadFullLogPage() {
+    const body = document.getElementById("fullLogBody");
+    const more = document.getElementById("fullLogMore");
+    const status = document.getElementById("fullLogStatus");
+    if (!body) return;
+
+    try {
+        const params = new URLSearchParams({ limit: "500" });
+        if (fullLogOldestId) params.set("before_id", String(fullLogOldestId));
+        if (fullLogLevels) params.set("level", fullLogLevels);
+
+        const res = await fetch(`/api/logs?${params.toString()}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not read the log");
+
+        const entries = data.entries || [];
+        // Newest first from the server; newest first on screen too, so
+        // "load older" appends downwards and nothing already read jumps.
+        entries.forEach(e => body.appendChild(
+            logLineElement(e.level, e.message, formatLogStamp(e.created_at), e.source)
+        ));
+        if (entries.length) fullLogOldestId = data.oldest_id;
+
+        if (status) {
+            status.innerText = `${body.childElementCount} line(s) shown of ${data.total} recorded`;
+        }
+        if (more) more.classList.toggle("hidden", entries.length < 500);
+        if (!body.childElementCount) {
+            body.innerHTML = `<div class="text-slate-500">Nothing recorded yet at this level.</div>`;
+        }
+    } catch (err) {
+        body.innerHTML = `<div class="text-rose-400">${escapeHtml(err.message)}</div>`;
+    }
+}
+
+async function clearStoredLogs() {
+    if (!confirm("Delete the recorded log history?\n\nThis is the record of what the nightly jobs did to your live listings. The on-screen Clear button does not do this.")) return;
+    try {
+        const res = await fetch("/api/logs/clear", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not clear the log");
+        logToTerminal("WARN", `Recorded log history deleted (${data.removed} line(s)).`);
+        fullLogOldestId = null;
+        document.getElementById("fullLogBody").innerHTML = "";
+        loadFullLogPage();
+    } catch (err) {
+        logToTerminal("ERROR", err.message);
+    }
 }
 
 // Deliberately a function declaration, not a const arrow: it is defined at the

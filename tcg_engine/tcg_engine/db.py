@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from datetime import datetime
 from contextlib import contextmanager
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Sequence, Tuple
 
 
 # Default seller details used when generating eBay Add files. The policy names
@@ -47,6 +47,12 @@ DEFAULT_PRICE_HOLD_DAYS = "14"
 # the signature of bad feed data is that it moves everything at once. Same
 # reasoning as the delisting cap on the sync path.
 DEFAULT_REPRICE_MAX_CHANGE_PERCENT = "25"
+
+# How many console lines the operational log keeps. The console is the
+# only record of what an unattended job did, so it has to reach back far
+# enough to cover the days nobody looked -- but it is still a log, not an
+# archive, and an unbounded one on a NAS is a disk that fills up quietly.
+RUN_LOG_MAX_ROWS = 20000
 
 # Pricing rules and listing settings are per-user, so every row in those two
 # tables carries the id of the user who owns it. Scope 0 is the shared baseline
@@ -311,6 +317,28 @@ class Database:
                     market_price REAL NOT NULL,
                     source TEXT,
                     fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+            )
+            # The operational log, as the console shows it.
+            #
+            # The console used to exist only in the browser: it showed what
+            # this tab had done since it was opened, and a reload discarded
+            # it. Everything that runs unattended -- the nightly price
+            # refresh, the repricer, a push that outlived the page -- logged
+            # into a void as far as the dashboard was concerned, and the only
+            # copy was the container's stdout, which a restart takes with it.
+            #
+            # Low volume by nature: tens to hundreds of lines a day, pruned
+            # by age and by count.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    level TEXT NOT NULL DEFAULT 'INFO',
+                    source TEXT,
+                    message TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """,
             )
@@ -675,6 +703,12 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_reprice_history_decided
                 ON reprice_history(decided_at DESC);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_run_log_id
+                ON run_log(id DESC);
                 """
             )
             cursor.execute(
@@ -2164,6 +2198,99 @@ class Database:
                 (hold_since, manifest_id),
             )
             conn.commit()
+
+    def record_log_entries(
+        self,
+        entries: Sequence[Dict[str, str]],
+        source: str = "",
+        prune_to: int = RUN_LOG_MAX_ROWS,
+    ) -> int:
+        """
+        Append console lines, oldest first, and keep the table bounded.
+
+        Takes the same ``[{"level", "message"}]`` shape the pipelines already
+        return, so a caller records exactly what it is about to show or print
+        rather than a second, paraphrased version of it.
+
+        The prune is a single DELETE against the id order and runs on every
+        append. At this volume that is cheaper than deciding when to run it,
+        and it means the table cannot grow without bound between restarts.
+        """
+        rows = [
+            (
+                str(e.get("level") or "INFO").upper()[:16],
+                source[:64],
+                str(e.get("message") or ""),
+            )
+            for e in entries
+            if str(e.get("message") or "").strip()
+        ]
+        if not rows:
+            return 0
+        with self.get_connection() as conn:
+            conn.executemany(
+                "INSERT INTO run_log (level, source, message) VALUES (?, ?, ?)",
+                rows,
+            )
+            if prune_to and prune_to > 0:
+                conn.execute(
+                    """
+                    DELETE FROM run_log
+                    WHERE id <= (
+                        SELECT MAX(id) - ? FROM run_log
+                    )
+                    """,
+                    (int(prune_to),),
+                )
+            conn.commit()
+        return len(rows)
+
+    def get_log_entries(
+        self,
+        limit: int = 200,
+        before_id: Optional[int] = None,
+        levels: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Console lines, newest first, optionally older than a known id.
+
+        Newest first because that is what a page of scrollback needs: the
+        caller asks for the most recent N, then for the N before the oldest it
+        holds. Paging on the id rather than an offset keeps the window stable
+        while new lines are still arriving at the other end.
+        """
+        clauses = []
+        params: List[Any] = []
+        if before_id:
+            clauses.append("id < ?")
+            params.append(int(before_id))
+        if levels:
+            wanted = [str(l).upper() for l in levels]
+            clauses.append(f"level IN ({','.join('?' for _ in wanted)})")
+            params.extend(wanted)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT * FROM run_log {where} ORDER BY id DESC LIMIT ?",
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def count_log_entries(self) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) AS count FROM run_log")
+            return int(cursor.fetchone()["count"])
+
+    def clear_log_entries(self) -> int:
+        """Discard the stored console history."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM run_log")
+            conn.commit()
+            return cursor.rowcount
 
     def record_reprice(self, entries: List[Dict[str, Any]]) -> int:
         """Write the repricer's verdicts, applied or not, to the audit log."""

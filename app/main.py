@@ -17,7 +17,7 @@ import time
 import uuid
 import zipfile
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Literal
+from typing import Optional, Dict, Any, List, Literal, Sequence
 
 # Ensure project root is in sys.path when running as direct script
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -768,7 +768,9 @@ async def refresh_prices_endpoint(
     try:
         result = await run_in_threadpool(run)
     except PriceFeedError as exc:
+        record_logs([{"level": "ERROR", "message": str(exc)}], "prices")
         raise HTTPException(status_code=502, detail=str(exc))
+    record_logs(result.get("logs") or [], "prices")
     return result
 
 
@@ -815,6 +817,24 @@ def price_history_endpoint(
             "history": db.get_price_history(manifest_id)}
 
 
+def record_logs(logs: Sequence[Dict[str, str]], source: str) -> None:
+    """
+    Persist a pipeline's console lines, never at the cost of the work.
+
+    The console is the only record of what an unattended job did, and until
+    this existed it lived in the browser tab that happened to be open. But a
+    log that can fail the operation it describes is worse than no log, so
+    every error here is swallowed after being printed.
+    """
+    if not logs:
+        return
+    try:
+        with db.session():
+            db.record_log_entries(logs, source=source)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[log] could not record the {source} log: {exc}", flush=True)
+
+
 def _reprice_now(user_id: int, dry_run: bool = False) -> Dict[str, Any]:
     """
     One repricing round, against the listings the Inventory API can reach.
@@ -823,6 +843,11 @@ def _reprice_now(user_id: int, dry_run: bool = False) -> Dict[str, Any]:
     code path: a preview the operator ran by hand and the run that happens at
     three in the morning must reach the same verdicts, or the preview is
     worthless.
+
+    Its lines are printed as they happen -- the container log is still the
+    first place to look when something is wrong -- and persisted in one write
+    at the end, from a ``finally`` so that a run which raises part-way through
+    still leaves the account of how far it got.
     """
     client = get_ebay_client()
     adapter = None
@@ -831,16 +856,19 @@ def _reprice_now(user_id: int, dry_run: bool = False) -> Dict[str, Any]:
     elif not dry_run:
         raise RepriceError("Connect the eBay account first.")
 
-    def run():
+    collected: List[Dict[str, str]] = []
+
+    def log(level: str, message: str) -> None:
+        print(f"[reprice] {level}: {message}", flush=True)
+        collected.append({"level": level, "message": message})
+
+    try:
         with db.session():
             return run_reprice(
-                db, adapter, user_id=user_id, dry_run=dry_run,
-                log=lambda level, message: print(
-                    f"[reprice] {level}: {message}", flush=True
-                ),
+                db, adapter, user_id=user_id, dry_run=dry_run, log=log,
             )
-
-    return run()
+    finally:
+        record_logs(collected, "reprice")
 
 
 @app.post("/api/pricing/auto-reprice")
@@ -931,6 +959,57 @@ def reprice_log_endpoint(
     return {"entries": db.get_reprice_history(limit=max(1, min(1000, limit)))}
 
 
+# The console shows this many lines; the dialog pages back through the rest.
+CONSOLE_RECENT_LINES = 200
+CONSOLE_PAGE_LINES = 500
+
+
+@app.get("/api/logs")
+def get_logs_endpoint(
+    limit: int = CONSOLE_RECENT_LINES,
+    before_id: Optional[int] = None,
+    level: Optional[str] = None,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    The operational log, newest first.
+
+    The console used to be whatever this browser tab had seen since it was
+    opened, which meant everything that runs unattended -- the nightly price
+    refresh, the repricer, a push that outlived the page -- was invisible to
+    it, and a reload threw away the rest.
+
+    ``before_id`` pages backwards from a line the caller already holds, rather
+    than by offset, so the window stays stable while new lines arrive at the
+    other end.
+    """
+    levels = [part for part in (level or "").split(",") if part.strip()]
+    entries = db.get_log_entries(
+        limit=max(1, min(2000, limit)),
+        before_id=before_id,
+        levels=levels or None,
+    )
+    return {
+        "entries": entries,
+        "total": db.count_log_entries(),
+        "oldest_id": entries[-1]["id"] if entries else None,
+    }
+
+
+@app.post("/api/logs/clear")
+def clear_logs_endpoint(user: Dict[str, Any] = Depends(require_admin_user)):
+    """
+    Discard the stored console history.
+
+    Admin-only and separate from the console's own Clear button, which only
+    empties the view. This is the record of what the unattended jobs did to
+    live listings, so throwing it away is a deliberate act rather than a side
+    effect of tidying the screen.
+    """
+    removed = db.clear_log_entries()
+    return {"success": True, "removed": removed}
+
+
 async def _nightly_reprice() -> None:
     """
     Reprice the API-managed listings, straight after the market refresh.
@@ -949,19 +1028,26 @@ async def _nightly_reprice() -> None:
     also keeps market prices current, and an exception would take that with
     it.
     """
+    def skip(reason: str) -> None:
+        print(f"[reprice] {reason}, skipping", flush=True)
+        record_logs([{
+            "level": "INFO",
+            "message": f"Nightly repricing skipped: {reason}.",
+        }], "reprice")
+
     try:
         if not auto_reprice_enabled(db):
-            print("[reprice] disabled in Listing Rules, skipping", flush=True)
+            skip("disabled in Listing Rules")
             return
 
         owner = user_db.get_owner_user_id()
         if owner is None:
-            print("[reprice] no admin account to act as, skipping", flush=True)
+            skip("no admin account to act as")
             return
 
         client = get_ebay_client()
         if client is None or not client.oauth.is_connected():
-            print("[reprice] eBay is not connected, skipping", flush=True)
+            skip("eBay is not connected")
             return
 
         result = await run_in_threadpool(lambda: _reprice_now(owner))
@@ -1006,6 +1092,7 @@ async def start_price_refresh_loop():
                         return refresh_market_prices(db)
 
                 result = await run_in_threadpool(run)
+                record_logs(result.get("logs") or [], "prices")
                 if result.get("skipped"):
                     print(f"[prices] already current ({result.get('snapshot')})",
                           flush=True)
@@ -1017,8 +1104,16 @@ async def start_price_refresh_loop():
                 # stored price exactly as it was.
                 print(f"[prices] refresh failed, prices unchanged: {exc}",
                       flush=True)
+                record_logs([{
+                    "level": "WARN",
+                    "message": f"Price refresh failed, prices unchanged: {exc}",
+                }], "prices")
             except Exception as exc:
                 print(f"[prices] unexpected refresh error: {exc}", flush=True)
+                record_logs([{
+                    "level": "ERROR",
+                    "message": f"Unexpected price refresh error: {exc}",
+                }], "prices")
 
             await _nightly_reprice()
             await asyncio.sleep(PRICE_REFRESH_INTERVAL_HOURS * 3600)
@@ -2782,6 +2877,14 @@ def _run_push_job(job_id: str, plan_id: int, user_id: int, group_keys) -> None:
             job["error"] = error
             job["finished_at"] = time.time()
         _prune_push_jobs()
+
+    # A push outlives the page that started it by design, and the job registry
+    # is memory that a restart clears. This is the copy that is still there
+    # tomorrow.
+    with _push_jobs_lock:
+        job = _push_jobs.get(job_id)
+        lines = list(job["logs"]) if job else []
+    record_logs(lines, "push")
 
 
 class PlanPushRequest(BaseModel):

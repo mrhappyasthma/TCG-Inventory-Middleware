@@ -1635,6 +1635,95 @@ class TestWebApp(unittest.TestCase):
                 res = getattr(self.client, method)(path)
                 self.assertIn(res.status_code, (401, 403))
 
+    # -- the operational log ----------------------------------------------
+
+    def test_53_the_console_reads_back_what_a_job_recorded(self):
+        """
+        The console was whatever this browser tab had witnessed.
+
+        Everything that runs unattended -- the nightly price refresh, the
+        repricer, a push that outlived the page -- was therefore invisible to
+        it, and a reload discarded the rest. These lines are the same ones
+        printed to stdout, which a container restart takes with it.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        main.record_logs([
+            {"level": "INFO", "message": "reprice line one"},
+            {"level": "WARN", "message": "HOLD ID9101 keeping $2.49"},
+        ], "reprice")
+
+        body = self.client.get("/api/logs?limit=50").json()
+        messages = [e["message"] for e in body["entries"]]
+        # Newest first, which is what a page of scrollback needs.
+        self.assertEqual(messages[0], "HOLD ID9101 keeping $2.49")
+        self.assertIn("reprice line one", messages)
+        self.assertEqual(body["entries"][0]["source"], "reprice")
+        self.assertGreaterEqual(body["total"], 2)
+
+        held = self.client.get("/api/logs?level=WARN").json()["entries"]
+        self.assertTrue(held)
+        self.assertTrue(all(e["level"] == "WARN" for e in held))
+
+    def test_53b_paging_walks_backwards_from_a_known_line(self):
+        """
+        On an id, not an offset: new lines keep arriving at the other end
+        while the operator is reading, and an offset would show a line twice
+        or skip one.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        main.record_logs(
+            [{"level": "INFO", "message": f"page line {i}"} for i in range(10)],
+            "test",
+        )
+        first = self.client.get("/api/logs?limit=4").json()
+        self.assertEqual(len(first["entries"]), 4)
+
+        older = self.client.get(
+            f"/api/logs?limit=4&before_id={first['oldest_id']}"
+        ).json()
+        self.assertEqual(len(older["entries"]), 4)
+        overlap = ({e["id"] for e in first["entries"]}
+                   & {e["id"] for e in older["entries"]})
+        self.assertEqual(overlap, set())
+
+    def test_53c_a_failure_to_record_never_fails_the_work(self):
+        """A log that can break the operation it describes is worse than none."""
+        with mock.patch.object(
+            main.db, "record_log_entries", side_effect=RuntimeError("disk full")
+        ):
+            main.record_logs([{"level": "INFO", "message": "x"}], "test")
+
+    def test_53d_clearing_the_stored_history_is_admin_only(self):
+        """
+        It is the record of what the unattended jobs did to live listings, so
+        it is deliberately not what the console's own Clear button does.
+        """
+        self.sign_in("google-sub-second", "second@example.com", "Second User")
+        self.assertEqual(
+            self.client.post("/api/logs/clear").status_code, 403
+        )
+
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        main.record_logs([{"level": "INFO", "message": "to be deleted"}], "test")
+        res = self.client.post("/api/logs/clear")
+        self.assertEqual(res.status_code, 200)
+        self.assertGreater(res.json()["removed"], 0)
+        self.assertEqual(self.client.get("/api/logs").json()["total"], 0)
+
+    def test_53e_the_log_is_bounded(self):
+        """
+        An unbounded log on a NAS is a disk that fills up quietly.
+        """
+        main.db.clear_log_entries()
+        main.db.record_log_entries(
+            [{"level": "INFO", "message": f"line {i}"} for i in range(30)],
+            source="test", prune_to=10,
+        )
+        self.assertLessEqual(main.db.count_log_entries(), 10)
+        # And it keeps the newest, not the first ten it happened to see.
+        newest = main.db.get_log_entries(limit=1)[0]
+        self.assertEqual(newest["message"], "line 29")
+
     def test_52_the_owner_account_is_the_oldest_active_admin(self):
         """
         The nightly job has no session, but pricing rules are per-user.

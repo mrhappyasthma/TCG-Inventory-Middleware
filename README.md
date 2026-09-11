@@ -1313,6 +1313,37 @@ log lines that arrived while you were elsewhere, and the badge turns red if any
 of them was an error — otherwise a failure could land on an invisible tab and go
 unnoticed. Opening the tab clears it.
 
+#### The log persists
+
+The console used to be whatever *that browser tab* had witnessed since it was
+opened, and a reload discarded it. That made the jobs most worth reading about
+invisible to it: the nightly price refresh, the automatic repricer and a push
+that outlives the page all run with nobody watching, and their only other copy
+is the container's stdout, which a restart takes with it.
+
+So those lines are now recorded server-side and the console opens on them
+rather than on an empty box:
+
+* The panel shows the **most recent 200 lines**. It is capped on purpose — an
+  unbounded list on a page left open for days is a memory leak with a
+  scrollbar.
+* **Full log** opens the rest, newest first, 500 at a time, filterable to
+  warnings, errors or completions. Paging walks backwards from a line you
+  already hold rather than by offset, so nothing is shown twice while new
+  lines are still arriving.
+* Timestamps are stored in UTC and rendered locally, with the **date** shown
+  on anything not from today.
+* **Clear view** empties the screen only. Deleting the recorded history is a
+  separate, admin-only action in the dialog, because it is the record of what
+  the unattended jobs did to live listings.
+* The table is capped at 20,000 lines and pruned on every write. A log that
+  could fill a NAS disk quietly is not an improvement, and neither is one that
+  can fail the operation it describes — every error while recording is
+  swallowed after being printed.
+
+Lines that only ever existed in the browser (a form that would not load, say)
+are still ephemeral. What is recorded is what the server did.
+
 ### Drafts
 
 Staging for everything eBay-bound. A **draft plan** is the difference between
