@@ -184,10 +184,17 @@ def get_offers(transport, sku: str) -> List[Dict[str, Any]]:
     """
     Every offer against one SKU.
 
-    Returns an empty list for a SKU eBay has no offers for -- including every
-    SKU whose listing was created through File Exchange and never migrated,
-    which is the single most confusing result this API gives. An empty list
-    means "not visible in this model", not "not on sale".
+    An empty list means "not visible in this model", not "not on sale". A SKU
+    whose listing was created through File Exchange and never migrated has no
+    offers in the Inventory API's world even though the listing is live.
+
+    That case does not necessarily arrive as an empty list, though: eBay has
+    been observed answering **404** for a SKU it holds no inventory item for
+    at all, which is what an unmigrated File Exchange SKU looks like from
+    here. This function does not flatten that into an empty list, because the
+    two are different facts -- a caller asking "has this been migrated" wants
+    the 404 as a definitive *no*, while a caller asking "what is this SKU
+    priced at" wants the error. ``ApiError.status_code`` distinguishes them.
     """
     response = transport.get(
         f"{INVENTORY_BASE}/offer", {"sku": validate_sku(sku)}

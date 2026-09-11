@@ -52,6 +52,7 @@ at the keyboard unless ``--yes`` is given.
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -67,10 +68,11 @@ from app.user_db import UserDatabase  # noqa: E402
 from ebay_client import inventory  # noqa: E402
 from ebay_client.client import EbayClient  # noqa: E402
 from ebay_client.config import EbayConfig  # noqa: E402
-from ebay_client.errors import EbayError  # noqa: E402
+from ebay_client.errors import ApiError, EbayError  # noqa: E402
 from ebay_client.oauth import TokenStore  # noqa: E402
 from tcg_engine.db import Database  # noqa: E402
 from tcg_engine.plans import variation_group_key  # noqa: E402
+from tcg_engine.push import inventory_group_key  # noqa: E402
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
 USER_DATABASE_URL = os.environ.get("USER_DATABASE_URL", "data/users.db")
@@ -202,6 +204,15 @@ def already_migrated(api_transport, cards):
         return None, []
     try:
         offers = inventory.get_offers(api_transport, sku)
+    except ApiError as exc:
+        # A 404 is the definitive *no*, not a failure to ask. eBay has no
+        # inventory item for the SKU at all, which is precisely what an
+        # unmigrated File Exchange listing looks like from this API. Reported
+        # as "could not check" it made the four remaining listings look
+        # unverified when they had in fact been verified.
+        if exc.status_code == 404:
+            return False, []
+        return None, []
     except EbayError:
         return None, []
     ids = sorted({str(o.get("listingId") or "").strip() for o in offers
@@ -337,6 +348,65 @@ def verify(api_transport, listing, cards):
     return False
 
 
+def sku_fix_rows(listings):
+    """
+    A File Exchange Revise that gives each parent an item-level SKU.
+
+    eBay refuses to migrate a multi-variation listing whose *listing-level*
+    SKU is empty -- error 25002, "The listing SKU cannot be null or empty" --
+    even when every variation has one. Our own sync already recorded that
+    these listings have exactly that shape: ``AGENTS.md`` notes the Active
+    Inventory report carries "a blank SKU at the item level" for a
+    multi-variation listing, which is the convention for a parent row.
+
+    The label is derived the same way a push derives an inventory item group
+    key: a slug of "<set>|<condition>" plus a hash, so it is deterministic,
+    unique across the store, within eBay's 50 characters, and impossible to
+    confuse with a manifest id occupying a variation's SKU.
+
+    The file carries no variation columns at all. File Exchange revises the
+    fields present and leaves the rest alone, so the variation structure --
+    which a malformed Revise *can* damage, and which is why this project
+    documents the parent-row rule at all -- is not addressed by it.
+    """
+    rows = []
+    for listing in listings:
+        group_key = variation_group_key(
+            listing.get("set_name") or "", listing.get("condition") or ""
+        )
+        rows.append({
+            "Action": "Revise",
+            "ItemID": str(listing["ebay_parent_id"]).strip(),
+            "CustomLabel": inventory_group_key(group_key),
+        })
+    return rows
+
+
+def write_sku_fix(listings, path):
+    rows = sku_fix_rows(listings)
+    if not rows:
+        print("\nNothing needs an item-level SKU.")
+        return
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["Action", "ItemID", "CustomLabel"],
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nWrote {len(rows)} row(s) to {path}:\n")
+    print("Action,ItemID,CustomLabel")
+    for row in rows:
+        print(f"{row['Action']},{row['ItemID']},{row['CustomLabel']}")
+    print(
+        "\nUpload that through File Exchange, wait for eBay to report it "
+        "applied, then re-run the preflight. It sets only the listing-level "
+        "SKU -- no variation column is present, so the variations are not "
+        "addressed by it."
+    )
+
+
 def recover_one(db, client, listing, cards):
     """
     Adopt a listing eBay has already migrated but we never recorded.
@@ -463,6 +533,14 @@ def main():
         help="do not ask before each listing. Every other safeguard still "
              "applies.",
     )
+    parser.add_argument(
+        "--sku-fix", metavar="PATH", nargs="?", const="ebay_listing_sku_fix.csv",
+        default=None,
+        help="write a File Exchange Revise file giving each migratable "
+             "listing an item-level SKU, which eBay requires before it will "
+             "migrate a multi-variation listing (error 25002). Sends nothing "
+             "to eBay.",
+    )
     args = parser.parse_args()
 
     db = Database(db_path=DATABASE_URL)
@@ -487,18 +565,32 @@ def main():
     for listing in listings:
         blockers, notes, cards = preflight(db, listing)
 
+        # Whether *we* have a record of managing it, which the preflight has
+        # already reported as a blocker if so.
+        recorded = db.get_managed_listing_by_parent(
+            str(listing["ebay_parent_id"]).strip()
+        ) is not None
+
         migrated, ids = already_migrated(probe, cards)
-        if migrated:
+        if migrated and not recorded:
             # Not a migration candidate, but not a dead end either: eBay has
             # done the irreversible part and only our own record is missing.
             blockers.append(
                 "eBay already has offers for this listing's SKUs"
                 + (f" under listing {', '.join(ids)}" if ids else "")
-                + ". It is migrated already, so nothing more will be sent to "
-                  "eBay for it -- but we never recorded it. Re-run with "
-                  "--migrate to adopt the existing offers."
+                + ", but we have no record of managing it. Re-run with "
+                  "--migrate to adopt the existing offers; nothing will be "
+                  "sent to eBay."
             )
             recoverable.append((listing, cards))
+        elif migrated and recorded:
+            # The normal state of a listing this application created itself.
+            # Saying "we never recorded it" here was simply false, and it
+            # said it about seven healthy listings.
+            notes.append(
+                "confirmed with eBay: the Inventory API can see it, which is "
+                "what being managed means"
+            )
         elif migrated is None and probe is not None:
             notes.append(
                 "could not check with eBay whether it is already migrated"
@@ -508,11 +600,20 @@ def main():
         if not blockers:
             candidates.append((listing, cards))
 
+    if args.sku_fix:
+        # Only the ones that pass every other check: a listing already
+        # migrated, or blocked for a different reason, does not need this.
+        write_sku_fix([l for l, _ in candidates], args.sku_fix)
+        return 0
+
     if not args.migrate:
         print(f"\nPreflight only. {len(candidates)} listing(s) could be "
               f"migrated, {len(recoverable)} already migrated but not "
               f"recorded. Nothing was written.")
         print("Re-run with --migrate <item id>, or --migrate all, to proceed.")
+        print("If eBay refuses with error 25002 (\"The listing SKU cannot be "
+              "null or empty\"), re-run with --sku-fix to get the File "
+              "Exchange Revise file that fixes it.")
         return 0
 
     if args.migrate != "all":
