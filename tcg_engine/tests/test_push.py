@@ -8,8 +8,8 @@ of them is a way a push can *appear* to succeed:
 
 * eBay answers HTTP 200 to a bulk call and reports failure per SKU inside the
   body, so one card failing must not mark its neighbours pushed;
-* a listing created through File Exchange is invisible to this API, so pushing
-  its cards would create a duplicate rather than update it;
+* a listing this API cannot see is invisible to it, so pushing its cards
+  would create a duplicate rather than update it;
 * a card already pushed must not be pushed again, or a second listing appears;
 * the mirror is written from what eBay confirmed, never from what we intended.
 """
@@ -369,14 +369,18 @@ class PartialFailureTests(PushTestCase):
 
 
 class LegacyListingTests(PushTestCase):
-    def test_a_file_exchange_listing_is_left_for_the_csv_path(self):
+    def test_a_listing_this_api_cannot_see_is_skipped(self):
         """
         The guard that stops a push duplicating a live listing.
 
         eBay has the listing, but the Inventory API cannot see it, so writing
         a group for these SKUs would publish a *second* listing beside the one
-        already selling. Deferring is the only safe answer until it is
-        migrated -- and the CSV files still cover it meanwhile.
+        already selling. Skipping is the only safe answer.
+
+        Every listing has now been migrated, so this should never fire in
+        practice. It stays because the cost of being wrong is a duplicate live
+        listing, and because a listing created outside this application would
+        look exactly like this.
         """
         self.add_card("ID1001", "Charizard", "004/102", qty=5)
         # Module B has linked this card to a listing we did not create.
@@ -394,7 +398,8 @@ class LegacyListingTests(PushTestCase):
             self.items_by_sku(plan_id)["ID1001"]["status"], STATUS_DEFERRED
         )
         self.assertTrue(
-            any("File Exchange" in entry["message"] for entry in result["logs"])
+            any("would create a duplicate" in entry["message"]
+                for entry in result["logs"])
         )
 
     def test_a_listing_we_created_is_updated_rather_than_recreated(self):
@@ -964,7 +969,7 @@ class RefreshTests(PushTestCase):
             "https://cdn.example.com/seller-set.jpg",
         )
 
-    def test_a_csv_listing_cannot_be_refreshed(self):
+    def test_an_unmanaged_listing_cannot_be_refreshed(self):
         # It is invisible to this API; pushing at it would create a duplicate.
         self.add_card("ID1001", "Charizard", "004/102")
         self.db.upsert_variation("ID1001", "227511361186", 2,
@@ -972,7 +977,7 @@ class RefreshTests(PushTestCase):
         with self.assertRaises(PushError) as caught:
             refresh_listing(self.db, FakeEbay(), "227511361186",
                             user_id=SHARED_SCOPE)
-        self.assertIn("CSV path", str(caught.exception))
+        self.assertIn("not managed through this API", str(caught.exception))
 
 
 class DraftEditTests(unittest.TestCase):

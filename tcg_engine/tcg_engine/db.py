@@ -577,12 +577,16 @@ class Database:
                     "ALTER TABLE ebay_variations ADD COLUMN custom_label TEXT"
                 )
 
-            # The quantity Module A last asked eBay for, which is not the same
-            # thing as the quantity eBay reports. Module A must not write
-            # last_known_qty: until the Revise file is actually uploaded and an
-            # Active Listings sync run, eBay knows nothing about it, and
-            # claiming otherwise hides exactly the drift the two columns exist
-            # to show. NULL means nothing is outstanding.
+            # Vestigial, and kept only because dropping a column in SQLite
+            # means rebuilding the table for no gain. Nothing reads or writes
+            # it.
+            #
+            # It recorded the quantity a generated Revise file had asked eBay
+            # for, which was genuinely different from the quantity eBay
+            # reported: the file might sit in a Downloads folder for a week,
+            # so "asked" and "applied" were separate states and the table
+            # showed the pending one in amber. The API push confirms in the
+            # same call, so that gap no longer exists.
             cursor.execute("PRAGMA table_info(ebay_variations)")
             if "pending_qty" not in {row["name"] for row in cursor.fetchall()}:
                 cursor.execute(
@@ -1269,25 +1273,6 @@ class Database:
                 "last_known_qty": qty,
                 "last_known_price": price,
             }
-
-    def set_pending_quantity(self, manifest_id: str, quantity: int) -> None:
-        """
-        Record the quantity Module A last asked eBay for.
-
-        Deliberately separate from ``last_known_qty``: that column means "what
-        eBay reports", and only an Active Listings sync may set it. Writing the
-        intended quantity there would make the dashboard claim eBay had been
-        updated the moment a CSV was generated, before it had been uploaded.
-
-        Only touches rows that already exist, because a card that is not linked
-        to a listing has nothing pending against it.
-        """
-        with self.get_connection() as conn:
-            conn.execute(
-                "UPDATE ebay_variations SET pending_qty = ? WHERE manifest_id = ?",
-                (int(quantity), manifest_id.strip()),
-            )
-            conn.commit()
 
     def get_live_variations(self) -> List[Dict[str, Any]]:
         """

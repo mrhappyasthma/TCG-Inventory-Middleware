@@ -1,9 +1,10 @@
 """
 Push an approved plan to eBay.
 
-The last step of the migration away from "generate a CSV and upload it by
-hand". Everything upstream of this -- the catalogue, the diff, the drafts
-page, the approval -- existed to make this call safe to make.
+The only thing in this project that writes to eBay. Everything upstream --
+the catalogue, the diff, the drafts page, the approval -- exists to make this
+call safe to make, and the "generate a CSV and upload it by hand" path it
+replaced has been deleted.
 
 Four properties matter more than the size of this module.
 
@@ -14,12 +15,13 @@ the store mirror then disagrees with eBay with nothing to show why. So each
 plan item ends as ``pushed`` or ``failed`` with eBay's own message against it,
 and one card's failure never fails its neighbours.
 
-**Only listings the Inventory API can see are pushed.** A listing created
-through File Exchange is invisible to this API -- ``getOffers`` returns
-nothing for its SKUs -- so pushing its cards would not update it, it would
-create a *second* listing beside the live one. Those items are left
-``deferred`` with the reason, and the CSV files still cover them. That is the
-whole purpose of ``ebay_managed_listing``.
+**Only listings the Inventory API can see are pushed.** A listing this API
+cannot see -- ``getOffers`` returns nothing for its SKUs -- would not be
+updated by a push; a *second* listing would be created beside the live one.
+Those items are left ``deferred`` with the reason. Every listing has now been
+migrated, so this should never fire, which is exactly why it stays: the cost
+of being wrong is a duplicate live listing. That is the whole purpose of
+``ebay_managed_listing``.
 
 **What eBay says happened is written down immediately.** Item numbers, offer
 ids and the group key are recorded as they arrive, before the next call. A
@@ -61,16 +63,15 @@ from .plans import (
     is_single,
 )
 
-# eBay's item condition for an ungraded card. Its numeric equivalent is 4000,
-# which is what the CSV path writes into ConditionID -- the same fact in the
-# two vocabularies. LIKE_NEW (2750) is the graded counterpart, which this
-# project does not support yet.
+# eBay's item condition for an ungraded card. Its numeric equivalent is
+# ConditionID 4000 -- the same fact in eBay's two vocabularies. LIKE_NEW
+# (2750) is the graded counterpart, which this project does not support yet.
 UNGRADED_ITEM_CONDITION = "USED_VERY_GOOD"
 
 # The Card Condition condition descriptor. Its value is a numeric id such as
 # 400010 for "Near mint or better"; eBay requires this one descriptor on an
-# ungraded card and rejects prose here, which is why the CSV path's
-# human-readable rendering cannot be reused.
+# ungraded card and rejects prose here, even though its own CSV template
+# accepted the human-readable form.
 CARD_CONDITION_DESCRIPTOR_ID = "40001"
 
 # The variation axis. It matches the attribute name the File Exchange files
@@ -563,18 +564,19 @@ def push_plan(
     for group_key, group_items in sorted(groups.items()):
         managed = db.get_managed_listing(group_key)
 
-        # A listing eBay already has but this API cannot see. Pushing it would
-        # not update it -- it would create a second listing beside the live
-        # one -- so it stays on the CSV path, and says so.
+        # A listing eBay already has but this API cannot see. Pushing it
+        # would not update it -- it would create a second listing beside the
+        # live one -- so it is skipped, and says so.
         legacy = [i for i in group_items if i.get("ebay_parent_id")]
         if managed is None and legacy:
             for item in group_items:
                 _mark(db, item, STATUS_DEFERRED, counts)
             record("WARN", (
-                f"{group_key or 'ungrouped'}: {len(group_items)} card(s) left "
-                f"for the CSV path. This listing was created through File "
-                f"Exchange, so the Inventory API cannot see it and a push "
-                f"would create a duplicate. Migrate it first."
+                f"{group_key or 'ungrouped'}: {len(group_items)} card(s) "
+                f"skipped. The Inventory API cannot see listing "
+                f"#{legacy[0]['ebay_parent_id']}, so a push would create a "
+                f"duplicate beside it. Sync from eBay; if it stays "
+                f"unmanaged, it was not created through this API."
             ))
             continue
 
@@ -620,7 +622,7 @@ def push_plan(
     level = "SUCCESS" if counts["pushed"] and not counts["failed"] else "WARN"
     record(level, (
         f"{counts['pushed']} card(s) pushed, {counts['failed']} failed, "
-        f"{counts['deferred']} left for CSV; {listings_created} listing(s) "
+        f"{counts['deferred']} skipped; {listings_created} listing(s) "
         f"created, {listings_updated} updated"
     ))
     return {
@@ -1127,8 +1129,7 @@ def _uniform_aspects(
 
     A variation listing carries one set of listing-level aspects, so a value
     differing between cards (Card Name, Card Number) cannot be stated there --
-    the variation axis expresses it instead. This mirrors the CSV path's
-    ``_uniform_item_specifics`` for exactly the same reason.
+    the variation axis expresses it instead.
     """
     per_card = []
     default_game = (settings.get("default_game") or "").strip()
@@ -1251,8 +1252,8 @@ def refresh_listing(
     managed = db.get_managed_listing_by_parent(ebay_parent_id)
     if managed is None:
         raise PushError(
-            f"listing #{ebay_parent_id} was not created through this API, so "
-            f"its contents cannot be refreshed. It is on the CSV path."
+            f"listing #{ebay_parent_id} is not managed through this API, so "
+            f"its contents cannot be refreshed. Sync from eBay first."
         )
 
     cards = db.get_cards_for_listing(ebay_parent_id)

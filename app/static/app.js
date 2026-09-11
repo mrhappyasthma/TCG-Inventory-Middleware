@@ -1719,16 +1719,12 @@ function renderInventoryTable(items, total, offset) {
             ? 'bg-amber-950/80 text-amber-300 border border-amber-800'
             : 'bg-slate-900 text-slate-400 border border-slate-800';
 
-        // What Module A last asked eBay for. eBay has not been told until the
-        // Revise file is uploaded and a sync run, so showing this separately
-        // is what makes the gap explicable instead of mysterious.
-        const pending = item.pending_qty;
-        const hasPending = pending !== null && pending !== undefined
-            && pending !== item.last_known_qty;
-        const driftTitle = hasPending
-            ? `You hold ${qty}. eBay reports ${item.last_known_qty}. The generated Revise file asks eBay for ${pending} \u2014 upload it to eBay, then run a Module B sync.`
-            : drifted
-            ? `You hold ${qty}, eBay reports ${item.last_known_qty}. Run Module A to generate a Revise file, or Module B to re-sync.`
+        // The gap between the two figures is what the draft proposes to
+        // change. There is no third "asked for" state any more: a push
+        // confirms in the same call, so eBay's figure is either stale or
+        // current, never in flight.
+        const driftTitle = drifted
+            ? `You hold ${qty}, eBay reports ${item.last_known_qty}. Rebuild the draft to push the difference, or run Module B to re-sync.`
             : 'Your count matches what eBay reports.';
 
         return `
@@ -1769,7 +1765,6 @@ function renderInventoryTable(items, total, offset) {
                     <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${stockBadge}">
                         ${item.last_known_qty}
                     </span>
-                    ${hasPending ? `<span class="ml-1 text-[10px] font-mono text-amber-400" title="Pending: the Revise file asks for ${pending}">&rarr;${pending}</span>` : ""}
                 </td>
                 <td class="py-3 px-4 text-right">
                     <button onclick="deleteCard('${item.manifest_id}')" class="text-slate-500 hover:text-rose-400 p-1 transition-colors" title="Delete Card">

@@ -405,17 +405,17 @@ class RunTests(unittest.TestCase):
         self.assertFalse(result["attempted"])
         self.assertEqual(result["reason"], "no eligible cards")
 
-    def test_a_pending_quantity_request_survives_a_price_change(self):
-        # set_variation_known_price exists for exactly this: upsert_variation
-        # would clear pending_qty and rewrite the quantity.
+    def test_a_price_change_does_not_disturb_the_quantity(self):
+        # set_variation_known_price exists for exactly this. upsert_variation
+        # would rewrite last_known_qty from whatever the caller passed, and
+        # that figure goes stale the moment a card sells -- so a reprice would
+        # quietly overwrite eBay's own number with an older one.
         self.add("ID0001", 0.60, 1.99)
-        self.db.set_pending_quantity("ID0001", 7)
         run_reprice(self.db, FakeEbay())
 
         row = next(v for v in self.db.get_live_variations()
                    if v["manifest_id"] == "ID0001")
-        self.assertEqual(row["pending_qty"], 7)
-        self.assertEqual(row["last_known_qty"], 2)
+        self.assertEqual(row["last_known_qty"], 2, "quantity must be untouched")
         self.assertEqual(row["last_known_price"], 2.99)
 
     def test_the_settings_drive_the_thresholds(self):
