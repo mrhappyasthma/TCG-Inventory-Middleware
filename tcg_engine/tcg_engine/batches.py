@@ -21,52 +21,6 @@ from .db import (
 # identifier.
 REVISE_HEADERS = ["Action", "ItemID", "CustomLabel", "Quantity", "Price"]
 
-# A cover-photo revision only needs to identify the listing and supply the
-# picture. Sending the minimum avoids overwriting fields we were not asked to
-# touch.
-COVER_REVISE_HEADERS = ["Action", "ItemID", "PicURL"]
-
-
-def build_cover_photo_revise_csv(item_id: str, cover_image_url: str) -> str:
-    """
-    Build a File Exchange Revise file that sets one listing's photo.
-
-    Note that eBay REPLACES a listing's whole picture set on revision -- "you
-    must upload and replace the whole set for one item" -- so this is a
-    replacement, not an addition. It also ignores an image whose URL matches one
-    already uploaded to that listing, so re-sending the same URL is a no-op.
-    """
-    return build_cover_photo_revise_rows([
-        {"ebay_parent_id": item_id, "cover_image_url": cover_image_url}
-    ])
-
-
-def build_cover_photo_revise_rows(rows: List[Dict[str, Any]]) -> str:
-    """
-    Build one Revise file that sets the cover photo on several listings.
-
-    Used by an approved plan, where covers are chosen per listing and applied
-    together. Rows with no item id are dropped rather than emitted blank: a
-    File Exchange row without an identifier addresses nothing, and a plan can
-    legitimately carry a cover for a listing that does not exist yet -- that
-    one belongs in the Add file at creation, not here.
-    """
-    output = io.StringIO()
-    writer = csv.DictWriter(
-        output, fieldnames=COVER_REVISE_HEADERS, lineterminator="\n"
-    )
-    writer.writeheader()
-    for row in rows:
-        item_id = str(row.get("ebay_parent_id") or "").strip()
-        url = str(row.get("cover_image_url") or "").strip()
-        if not item_id or not url:
-            continue
-        writer.writerow({
-            "Action": "Revise",
-            "ItemID": item_id,
-            "PicURL": url,
-        })
-    return output.getvalue()
 # eBay requires a Condition Descriptor for trading cards. For ungraded cards
 # the descriptor is "Card Condition", ID 40001, so the column is "CD:40001".
 CONDITION_DESCRIPTOR_COLUMN = "CD:40001"

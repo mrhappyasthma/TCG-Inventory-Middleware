@@ -76,18 +76,14 @@ from tcg_engine.orders import (
 )
 from tcg_engine.batches import (
     process_batch_csv,
-    build_cover_photo_revise_csv,
-    build_cover_photo_revise_rows,
     QUANTITY_MODE_SET,
     QUANTITY_MODES,
 )
 from tcg_engine.sync import sync_active_listings_csv
 from tcg_engine.pricing_feed import (
     refresh_market_prices,
-    build_reprice_csv,
     PriceFeedError,
 )
-from tcg_engine.plan_exports import build_plan_exports
 from tcg_engine.push import PushError, push_plan, refresh_listing
 from tcg_engine.repricer import (
     RepriceError,
@@ -774,39 +770,6 @@ async def refresh_prices_endpoint(
     return result
 
 
-@app.get("/api/pricing/reprice")
-def reprice_csv_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """
-    Summarise the eBay Revise file that current prices would produce.
-
-    Separate from the download so the dashboard can say how many listings
-    would change before anyone commits to a file, and so the indicator can
-    appear without triggering a browser download.
-    """
-    result = build_reprice_csv(db, user_id=user["id"])
-    return {
-        "reprice_count": result["reprice_count"],
-        "unchanged_count": result["unchanged_count"],
-        "missing_price_count": result["missing_price_count"],
-        "api_managed_count": result["api_managed_count"],
-        "logs": result["logs"],
-    }
-
-
-@app.get("/api/pricing/reprice.csv")
-def reprice_csv_download(user: Dict[str, Any] = Depends(require_active_user)):
-    """The Revise file itself, priced by the caller's own rules."""
-    result = build_reprice_csv(db, user_id=user["id"])
-    return StreamingResponse(
-        iter([result["csv_content"]]),
-        media_type="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition":
-                "attachment; filename=ebay_reprice_updates.csv"
-        },
-    )
-
-
 @app.get("/api/pricing/history/{manifest_id}")
 def price_history_endpoint(
     manifest_id: str,
@@ -1389,43 +1352,56 @@ async def set_listing_cover(
 
     saved = db.set_listing_cover_image(item_id, url)
 
-    # An API-managed listing can be corrected on the spot. Recorded first, so
-    # that a failure here still leaves the choice stored and retryable.
-    if db.get_managed_listing_by_parent(item_id) is not None:
-        client = get_ebay_client()
-        if client is not None and client.oauth.is_connected():
-            adapter = InventoryApiAdapter(client)
+    # The choice is recorded first, so that a failure to apply it still leaves
+    # it stored and retryable with the listing's Refresh button.
+    if db.get_managed_listing_by_parent(item_id) is None:
+        return {
+            "success": True,
+            "ebay_parent_id": item_id,
+            "cover_image_url": saved,
+            "applied": False,
+            "reason": (
+                "Saved, but this listing is not managed through the eBay API, "
+                "so there is no way to apply it. Sync from eBay, then press "
+                "Refresh on the listing."
+            ),
+        }
 
-            def run():
-                with db.session():
-                    return refresh_listing(
-                        db, adapter, item_id, user_id=user["id"]
-                    )
+    client = get_ebay_client()
+    if client is None or not client.oauth.is_connected():
+        return {
+            "success": True,
+            "ebay_parent_id": item_id,
+            "cover_image_url": saved,
+            "applied": False,
+            "reason": (
+                "Saved, but eBay is not connected, so it has not been applied "
+                "yet. Connect the account and press Refresh on the listing."
+            ),
+        }
 
-            try:
-                result = await run_in_threadpool(run)
-            except (PushError, EbayError) as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"The cover was saved but eBay refused the update: "
-                        f"{exc}. Press Refresh on the listing to try again."
-                    ),
-                )
-            return {
-                "success": True,
-                "ebay_parent_id": item_id,
-                "cover_image_url": saved,
-                "applied": True,
-                "refreshed": result.get("refreshed", 0),
-            }
+    adapter = InventoryApiAdapter(client)
 
+    def run():
+        with db.session():
+            return refresh_listing(db, adapter, item_id, user_id=user["id"])
+
+    try:
+        result = await run_in_threadpool(run)
+    except (PushError, EbayError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The cover was saved but eBay refused the update: {exc}. "
+                f"Press Refresh on the listing to try again."
+            ),
+        )
     return {
         "success": True,
         "ebay_parent_id": item_id,
         "cover_image_url": saved,
-        "applied": False,
-        "csv_content": build_cover_photo_revise_csv(item_id, saved),
+        "applied": True,
+        "refreshed": result.get("refreshed", 0),
     }
 
 
@@ -2588,170 +2564,6 @@ def set_plan_cover(
         "success": True,
         "groups": db.get_plan_groups(plan_id),
     }
-
-
-def _plan_for_download(plan_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
-    plan = db.get_plan(plan_id)
-    if plan is None or plan["user_id"] != user["id"]:
-        raise HTTPException(status_code=404, detail="Plan not found.")
-    if plan["status"] == "draft":
-        raise HTTPException(
-            status_code=409,
-            detail="Approve the draft before downloading its files.",
-        )
-    return plan
-
-
-@app.get("/api/plans/{plan_id}/files")
-def get_plan_file_summary(
-    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
-):
-    """
-    What an approved plan's files contain, without downloading them.
-
-    Lets the dashboard offer only the files that have rows in them, and show
-    the listing count so it can be checked against what was on screen.
-    """
-    _plan_for_download(plan_id, user)
-    try:
-        built = build_plan_exports(db, plan_id, user_id=user["id"])
-    except PlanError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    return {
-        "listing_count": built["listing_count"],
-        "variation_listing_count": built["variation_listing_count"],
-        "single_listing_count": built["single_listing_count"],
-        "add_card_count": built["add_card_count"],
-        "revise_count": built["revise_count"],
-        "unlistable": built["unlistable"],
-        "cover_count": len(db.get_plan_cover_revisions(plan_id)),
-        # A cover staged for a listing that does not exist yet cannot be
-        # revised onto anything, so it rides in the Add file instead. Reported
-        # separately because otherwise it looks like the choice was dropped.
-        "add_cover_count": built["add_cover_count"],
-        # Changes these files deliberately do not carry, so the page can say
-        # where they go instead: through Push, not through Seller Hub.
-        "pushed_count": built["pushed_count"],
-        "api_managed_count": built["api_managed_count"],
-        # One row per listing, so the page can offer a single listing to be
-        # pushed rather than only all of them. "managed" is the distinction
-        # that decides whether the API can touch it at all: a listing made
-        # through File Exchange is invisible to the Inventory API and a push
-        # would duplicate it rather than update it.
-        "groups": [
-            {
-                "group_key": group["group_key"],
-                "set_name": group.get("set_name") or "",
-                "condition": group.get("condition") or "",
-                "item_count": group.get("item_count") or 0,
-                "excluded_count": group.get("excluded_count") or 0,
-                "ebay_parent_id": group.get("ebay_parent_id") or "",
-                "managed": db.get_managed_listing(group["group_key"]) is not None,
-            }
-            for group in db.get_plan_groups(plan_id)
-        ],
-    }
-
-
-@app.get("/api/plans/{plan_id}/add.csv")
-def download_plan_add_csv(
-    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
-):
-    """
-    The Add file an approved plan authorised: one listing per group.
-
-    Built from the plan rather than from the original upload, so a regrouped
-    card, an edited price and an excluded card all land in the file. Module A's
-    own download predates every one of those edits.
-    """
-    _plan_for_download(plan_id, user)
-    try:
-        built = build_plan_exports(db, plan_id, user_id=user["id"])
-    except PlanError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    if not built["add_card_count"]:
-        raise HTTPException(
-            status_code=404, detail="This plan creates no new listings."
-        )
-    return StreamingResponse(
-        io.StringIO(built["add_csv"]),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="ebay_new_additions_plan_{plan_id}.csv"'
-            )
-        },
-    )
-
-
-@app.get("/api/plans/{plan_id}/revise.csv")
-def download_plan_revise_csv(
-    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
-):
-    """The Revise file: quantity and price changes to existing listings."""
-    _plan_for_download(plan_id, user)
-    try:
-        built = build_plan_exports(db, plan_id, user_id=user["id"])
-    except PlanError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    if not built["revise_count"]:
-        raise HTTPException(
-            status_code=404, detail="This plan revises no existing listings."
-        )
-    return StreamingResponse(
-        io.StringIO(built["revise_csv"]),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="ebay_inventory_updates_plan_{plan_id}.csv"'
-            )
-        },
-    )
-
-
-@app.get("/api/plans/{plan_id}/cover-revise.csv")
-def download_plan_cover_revise(
-    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
-):
-    """
-    The cover-photo Revise file for an approved plan.
-
-    Approved only: the file exists to be uploaded, and generating it from a
-    draft would hand out something that had not been authorised.
-
-    Note that revising PicURL replaces a listing's whole picture set rather
-    than adding to it, which is why this is a deliberate, separate file rather
-    than something folded silently into another export.
-    """
-    plan = db.get_plan(plan_id)
-    if plan is None or plan["user_id"] != user["id"]:
-        raise HTTPException(status_code=404, detail="Plan not found.")
-    if plan["status"] == "draft":
-        raise HTTPException(
-            status_code=409,
-            detail="Approve the draft before downloading its files.",
-        )
-
-    rows = db.get_plan_cover_revisions(plan_id)
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "No cover photo changes in this plan apply to an existing "
-                "listing. A cover for a listing that does not exist yet is "
-                "carried into its creation instead."
-            ),
-        )
-    csv_content = build_cover_photo_revise_rows(rows)
-    return StreamingResponse(
-        io.StringIO(csv_content),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="ebay_cover_photos_plan_{plan_id}.csv"'
-            )
-        },
-    )
 
 
 @app.post("/api/plans/{plan_id}/approve")

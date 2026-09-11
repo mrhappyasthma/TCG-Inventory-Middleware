@@ -3100,7 +3100,7 @@ class Database:
         """
         Every cover photo staged in a plan, keyed by group.
 
-        Deliberately unfiltered, unlike ``get_plan_cover_revisions``: a cover
+        Deliberately unfiltered: a cover
         for a listing that does not exist yet cannot be revised onto anything,
         but it is exactly what the Add file's parent row has to carry. Both
         halves are needed, and each one alone loses covers silently.
@@ -3120,47 +3120,6 @@ class Database:
                 row["group_key"]: row["cover_image_url"].strip()
                 for row in cursor.fetchall()
             }
-
-    def get_plan_cover_revisions(self, plan_id: int) -> List[Dict[str, Any]]:
-        """
-        Staged covers that can be applied to an existing listing.
-
-        Restricted to groups that map onto a live listing, because a cover for
-        a listing that does not exist yet is carried into its creation rather
-        than revised onto it. Also skips a staged URL identical to what the
-        listing already has: eBay ignores a PicURL it already holds, so the row
-        would be a no-op that still costs an upload.
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT g.group_key,
-                       g.cover_image_url,
-                       MAX(NULLIF(TRIM(COALESCE(v.ebay_parent_id, '')), ''))
-                           AS ebay_parent_id,
-                       MAX(NULLIF(TRIM(COALESCE(o.cover_image_url, '')), ''))
-                           AS current_cover
-                FROM listing_plan_group g
-                JOIN listing_plan_item i
-                     ON i.plan_id = g.plan_id
-                    AND COALESCE(i.group_key, '') = g.group_key
-                LEFT JOIN ebay_variations v ON v.manifest_id = i.manifest_id
-                LEFT JOIN ebay_listing_overrides o
-                       ON o.ebay_parent_id = v.ebay_parent_id
-                WHERE g.plan_id = ?
-                  AND TRIM(COALESCE(g.cover_image_url, '')) != ''
-                GROUP BY g.group_key, g.cover_image_url
-                ORDER BY g.group_key
-                """,
-                (int(plan_id),),
-            )
-            rows = [dict(r) for r in cursor.fetchall()]
-        return [
-            r
-            for r in rows
-            if r["ebay_parent_id"] and r["cover_image_url"] != r["current_cover"]
-        ]
 
     def export_all_manifest(self) -> List[Dict[str, Any]]:
         """Export all master manifest rows."""

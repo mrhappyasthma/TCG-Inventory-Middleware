@@ -1,6 +1,11 @@
 """
-Refresh market prices from TCGCSV, and regenerate an eBay Revise file from
-the stored prices.
+Refresh the stored market prices from TCGCSV.
+
+This module only *fetches* prices. What is done with them belongs elsewhere:
+``repricer`` decides which listings should change and applies it through the
+eBay API. It used to also build a File Exchange Revise file from these
+numbers, which is gone -- every listing is now managed through the API, and
+such a file would upload cleanly and change nothing.
 
 TCGCSV is a free daily mirror of TCGplayer's own catalogue and price data. We
 use it because TCGplayer's official API has been closed to new applicants for
@@ -33,8 +38,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .db import (
     Database,
     SHARED_SCOPE,
-    apply_condition_multiplier,
-    apply_pricing_rules,
 )
 
 # The catalogue and price endpoints live under /tcgplayer; the daily
@@ -53,11 +56,6 @@ USER_AGENT = (
 
 REQUEST_SPACING_SECONDS = 0.1
 REQUEST_TIMEOUT_SECONDS = 30
-
-# A reprice touches price only. Quantity is deliberately absent rather than
-# blank: sending the column at all risks changing stock on a file whose whole
-# purpose is not to.
-REPRICE_HEADERS = ["Action", "ItemID", "CustomLabel", "Price"]
 
 
 class PriceFeedError(RuntimeError):
@@ -286,146 +284,5 @@ def refresh_market_prices(
         "updated": len(updates),
         "unmatched": len(unmatched),
         "groups_fetched": len(needed),
-        "logs": logs,
-    }
-
-
-def build_reprice_csv(
-    db: Database, user_id: int = SHARED_SCOPE
-) -> Dict[str, Any]:
-    """
-    An eBay Revise file that changes price only, built from stored prices.
-
-    This is what makes a price refresh actionable for the File Exchange
-    listings. Module A prices from the columns of the export it is given, so
-    without this there is no way to push a new price without re-uploading a
-    dump.
-
-    Listings created through the Inventory API are excluded: the automatic
-    repricer owns those, applies a hold window to falling prices, and can
-    reach them directly. A row here for one of them would be a row File
-    Exchange cannot apply and a second opinion on a price that already has an
-    owner.
-
-    Rows are emitted only where the computed price differs from the price eBay
-    is known to hold, on the same principle as Module A: a file full of
-    unchanged rows tells the operator nothing and asks eBay to rewrite every
-    listing for no reason.
-    """
-    import csv
-    import io
-
-    logs: List[Dict[str, str]] = []
-    rules = db.get_pricing_rules(user_id=user_id)
-    multipliers = {
-        m["condition_key"]: m["multiplier"]
-        for m in db.get_condition_multipliers(user_id=user_id)
-    }
-
-    rows: List[Dict[str, Any]] = []
-    unchanged = 0
-    unknown_price = 0
-    api_managed = 0
-    unpriced_grades = set()
-
-    # Listings the Inventory API manages are the automatic repricer's, and a
-    # Revise row for one of them is worse than useless: File Exchange cannot
-    # revise a listing created through the Inventory API, so the upload
-    # succeeds and changes nothing. This file offered seven such rows before
-    # the repricer existed, which is how the overlap came to light.
-    managed_parents = {
-        str(row["ebay_parent_id"]).strip()
-        for row in db.get_managed_listings()
-        if str(row.get("ebay_parent_id") or "").strip()
-    }
-
-    for card in db.get_live_cards_for_repricing():
-        if str(card.get("ebay_parent_id") or "").strip() in managed_parents:
-            api_managed += 1
-            continue
-
-        base = float(card.get("market_price") or 0.0)
-        if base <= 0:
-            # Nothing to price from. Refusing beats emitting the floor price.
-            unknown_price += 1
-            continue
-
-        adjusted, factor = apply_condition_multiplier(
-            base, card.get("condition"), multipliers
-        )
-        if factor is None and card.get("condition"):
-            unpriced_grades.add(str(card["condition"]))
-        price, _ = apply_pricing_rules(rules, adjusted)
-
-        known = card.get("last_known_price")
-        if known is not None and round(float(known), 2) == round(price, 2):
-            unchanged += 1
-            continue
-
-        label = (card.get("custom_label") or "").strip() or card["manifest_id"]
-        rows.append({
-            "Action": "Revise",
-            "ItemID": str(card["ebay_parent_id"]).strip(),
-            "CustomLabel": label,
-            "Price": f"{price:.2f}",
-        })
-
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=REPRICE_HEADERS,
-                            lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(rows)
-
-    if unchanged:
-        logs.append({
-            "level": "INFO",
-            "message": (
-                f"{unchanged} listing(s) already match the price your rules "
-                f"compute, so no row was written for them."
-            ),
-        })
-    if unknown_price:
-        logs.append({
-            "level": "WARN",
-            "message": (
-                f"{unknown_price} listing(s) have no stored market price and "
-                f"were skipped rather than priced from nothing. Refresh "
-                f"prices first."
-            ),
-        })
-    if api_managed:
-        logs.append({
-            "level": "INFO",
-            "message": (
-                f"{api_managed} card(s) are on listings this application "
-                f"manages through the eBay API and are repriced "
-                f"automatically, so no Revise row was written for them. "
-                f"File Exchange cannot revise those listings at all."
-            ),
-        })
-    if unpriced_grades:
-        logs.append({
-            "level": "WARN",
-            "message": (
-                "No condition multiplier is configured for: "
-                + ", ".join(sorted(unpriced_grades))
-                + ". Those were priced at full market value."
-            ),
-        })
-    logs.append({
-        "level": "SUCCESS" if rows else "INFO",
-        "message": (
-            f"Reprice file ready: {len(rows)} listing(s) to update."
-            if rows else
-            "Nothing to reprice: every listing already matches your rules."
-        ),
-    })
-
-    return {
-        "csv_content": buffer.getvalue(),
-        "reprice_count": len(rows),
-        "unchanged_count": unchanged,
-        "missing_price_count": unknown_price,
-        "api_managed_count": api_managed,
         "logs": logs,
     }

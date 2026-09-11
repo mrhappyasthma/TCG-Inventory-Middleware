@@ -40,8 +40,11 @@ from .batches import (
     generate_variation_title,
     resolve_condition_descriptor,
 )
-from .db import SHARED_SCOPE, Database
-from .plan_exports import DEFAULT_VARIATION_OPTION_TEMPLATE, _derived_specifics
+from .db import (
+    DEFAULT_VARIATION_OPTION_TEMPLATE,
+    SHARED_SCOPE,
+    Database,
+)
 from .plans import (
     ACTION_END,
     ACTION_REMOVE,
@@ -70,9 +73,28 @@ UNGRADED_ITEM_CONDITION = "USED_VERY_GOOD"
 # human-readable rendering cannot be reused.
 CARD_CONDITION_DESCRIPTOR_ID = "40001"
 
-# The variation axis, matching the CSV path's "Card=..." attribute so a
-# migrated listing and a created one look the same to a buyer.
+# The variation axis. It matches the attribute name the File Exchange files
+# used, so a listing migrated from that era and one created here look the same
+# to a buyer -- and to the inventory item group, which is keyed on it.
 VARIATION_ASPECT_NAME = "Card"
+
+# Item specifics readable off the card's own stored columns, for cards
+# catalogued before the export's "C:" columns were persisted. Translates
+# nothing: each value is the column, passed through.
+#
+# A floor, not a substitute. Around thirteen of the specifics eBay marks
+# required on a card listing (Card Type, Manufacturer, Graded, Card Size,
+# Character, Stage, both Country fields, Age Level, Year Manufactured,
+# Autographed, Material, Attribute) exist nowhere but the export, which is why
+# a card with no persisted specifics is a blocker in ``plans.validate_card``
+# rather than something this quietly papers over.
+DERIVED_SPECIFICS = (
+    ("C:Set", "set_name"),
+    ("C:Card Name", "product_name"),
+    ("C:Card Number", "card_number"),
+    ("C:Language", "language"),
+    ("C:Finish", "printing"),
+)
 
 # eBay's ceiling on one bulk call.
 BULK_LIMIT = 25
@@ -95,6 +117,16 @@ LOCALE_BY_MARKETPLACE = {
     "EBAY_ES": "es_ES",
 }
 DEFAULT_LOCALE = "en_US"
+
+
+def _derived_specifics(item: Dict[str, Any]) -> Dict[str, str]:
+    """The specifics readable from the card's own stored columns."""
+    derived: Dict[str, str] = {}
+    for column, source in DERIVED_SPECIFICS:
+        value = str(item.get(source) or "").strip()
+        if value:
+            derived[column] = value
+    return derived
 
 
 def locale_for(marketplace_id: str) -> str:

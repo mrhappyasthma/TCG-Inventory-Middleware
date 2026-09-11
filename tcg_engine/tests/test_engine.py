@@ -11,9 +11,7 @@ from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import process_batch_csv
 from tcg_engine.sync import sync_active_listings_csv
 from tcg_engine.relink import relink_from_active_listings, parse_option_name
-from tcg_engine.pricing_feed import (refresh_market_prices,
-                                     build_reprice_csv,
-                                     PriceFeedError)
+from tcg_engine.pricing_feed import refresh_market_prices, PriceFeedError
 
 
 class TestTCGEngine(unittest.TestCase):
@@ -1770,21 +1768,6 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         sync_active_listings_csv(report, self.db)
         self.assertEqual(self.db.get_listing_cover_image(item), "https://cdn/cover.jpg")
 
-    def test_cover_revise_csv_uses_the_upload_column_names(self):
-        from tcg_engine.batches import build_cover_photo_revise_csv
-
-        text = build_cover_photo_revise_csv("227511361186", "https://cdn/cover.jpg")
-        lines = text.strip().splitlines()
-        # ItemID, not "Item Number": the latter is the Active Listings report's
-        # name for it and is not a File Exchange upload column.
-        self.assertEqual(lines[0], "Action,ItemID,PicURL")
-
-        row = list(csv.DictReader(io.StringIO(text)))[0]
-        self.assertEqual(row["Action"], "Revise")
-        self.assertEqual(row["ItemID"], "227511361186")
-        self.assertEqual(row["PicURL"], "https://cdn/cover.jpg")
-        self.assertEqual(len(lines), 2, "one listing, one row")
-
     def test_revise_output_uses_itemid_not_item_number(self):
         """The batch Revise file is an upload, so it must use ItemID."""
         self.db.insert_manifest("ID1001", "Gengar", "Fossil", "NM", "Holofoil")
@@ -3049,112 +3032,6 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual([round(h["market_price"], 2) for h in history],
                          [0.19, 0.13], "newest first, nothing lost")
         self.assertIn("SNAP-2", history[0]["source"])
-
-    # -- reprice file ------------------------------------------------------
-
-    def _live_priced_card(self, market=0.30, ebay_price=1.99, cond="NM"):
-        dump = chr(10).join([
-            self.PRICED_DUMP_HEADER,
-            self._priced_row("Ledyba", "004/198", 241651, "Normal",
-                             market=str(market), cond=cond),
-        ]) + chr(10)
-        process_batch_csv(dump, self.db, source_name="p.csv")
-        mid = self.db.get_inventory(limit=5)[0]["manifest_id"]
-        self.db.upsert_variation(mid, "227511361186", 1,
-                                 custom_label=mid + "-C-1",
-                                 last_known_price=ebay_price)
-        return mid
-
-    def test_reprice_emits_only_listings_whose_price_changed(self):
-        """
-        A file of unchanged rows tells the operator nothing and asks eBay to
-        rewrite every listing for no reason.
-        """
-        # 0.30 -> the 0.25-0.50 tier -> 2.49, but eBay holds 1.99.
-        self._live_priced_card(market=0.30, ebay_price=1.99)
-        out = build_reprice_csv(self.db)
-        self.assertEqual(out["reprice_count"], 1)
-        rows = list(csv.DictReader(io.StringIO(out["csv_content"])))
-        self.assertEqual(rows[0]["Price"], "2.49")
-        self.assertEqual(rows[0]["Action"], "Revise")
-
-        # Once eBay agrees, nothing is emitted.
-        self.db.upsert_variation(rows[0]["CustomLabel"].split("-")[0],
-                                 "227511361186", 1,
-                                 custom_label=rows[0]["CustomLabel"],
-                                 last_known_price=2.49)
-        settled = build_reprice_csv(self.db)
-        self.assertEqual(settled["reprice_count"], 0)
-        self.assertEqual(settled["unchanged_count"], 1)
-
-    def test_reprice_file_carries_no_quantity_column(self):
-        """
-        A reprice must not touch stock. An absent column is "leave it alone";
-        sending it at all risks changing the very thing this file avoids.
-        """
-        self._live_priced_card()
-        out = build_reprice_csv(self.db)
-        header = out["csv_content"].splitlines()[0]
-        self.assertEqual(header, "Action,ItemID,CustomLabel,Price")
-        self.assertNotIn("Quantity", header)
-
-    def test_reprice_skips_cards_with_no_market_price(self):
-        """Pricing from nothing would emit the floor price for real stock."""
-        mid = self._live_priced_card(market=0.30)
-        with self.db.get_connection() as conn:
-            conn.execute("UPDATE manifest SET market_price = 0")
-            conn.commit()
-
-        out = build_reprice_csv(self.db)
-        self.assertEqual(out["reprice_count"], 0)
-        self.assertEqual(out["missing_price_count"], 1)
-        self.assertTrue(any("no stored market price" in lg["message"]
-                            for lg in out["logs"]))
-
-    def test_reprice_applies_the_condition_multiplier(self):
-        """The grade discount belongs in a reprice as much as in a batch."""
-        self._live_priced_card(market=10.00, ebay_price=1.99, cond="MP")
-        out = build_reprice_csv(self.db)
-        rows = list(csv.DictReader(io.StringIO(out["csv_content"])))
-        # 10.00 x 0.70 = 7.00, which is the 1.00+ tier -> +3.00 = 10.00.
-        self.assertEqual(rows[0]["Price"], "10.00")
-
-    def test_reprice_uses_the_label_ebay_knows(self):
-        """
-        A label rebuilt from a card's identity would address a variation that
-        does not exist; the stored one came from eBay's own report.
-        """
-        mid = self._live_priced_card()
-        self.db.upsert_variation(mid, "227511361186", 1,
-                                 custom_label=mid + "-FROM_EBAY",
-                                 last_known_price=1.99)
-        out = build_reprice_csv(self.db)
-        rows = list(csv.DictReader(io.StringIO(out["csv_content"])))
-        self.assertEqual(rows[0]["CustomLabel"], mid + "-FROM_EBAY")
-
-    def test_reprice_leaves_api_managed_listings_to_the_repricer(self):
-        """
-        Two things must not both own a price.
-
-        The automatic repricer reaches API-managed listings directly and holds
-        a falling price for a window before applying it. A Revise row for one
-        of those listings is a second opinion that File Exchange cannot apply
-        anyway -- the upload succeeds and nothing changes, which is the worst
-        of the available outcomes.
-        """
-        self._live_priced_card(market=0.30, ebay_price=1.99)
-        out = build_reprice_csv(self.db)
-        self.assertEqual(out["reprice_count"], 1)
-        self.assertEqual(out["api_managed_count"], 0)
-
-        self.db.upsert_managed_listing("Cosmic Eclipse|Near Mint",
-                                       ebay_parent_id="227511361186")
-        managed = build_reprice_csv(self.db)
-        self.assertEqual(managed["reprice_count"], 0)
-        self.assertEqual(managed["api_managed_count"], 1)
-        self.assertTrue(any("repriced automatically" in lg["message"]
-                            for lg in managed["logs"]))
-
 
 if __name__ == "__main__":
     unittest.main()

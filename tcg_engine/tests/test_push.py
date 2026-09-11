@@ -975,6 +975,148 @@ class RefreshTests(PushTestCase):
         self.assertIn("CSV path", str(caught.exception))
 
 
+class DraftEditTests(unittest.TestCase):
+    """
+    An edit made on the drafts page is what reaches eBay.
+
+    This is the entire point of the approval gate, and it used to be tested
+    through the Add file -- so when the File Exchange output was deleted the
+    property lost its only test. It belongs here: the destination changed, the
+    invariant did not. Before the gate existed, Module A built its files at
+    upload time, *before* the draft, so a regrouped card, an edited price or
+    an excluded card could never reach eBay at all.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "edits.db"))
+        self.db.set_listing_settings(COMPLETE_SETTINGS, user_id=SHARED_SCOPE)
+        for manifest_id, name, number in (
+            ("ID1001", "Charizard", "004/102"),
+            ("ID1002", "Blastoise", "002/102"),
+        ):
+            self.db.insert_manifest(
+                manifest_id, name, "Base Set", "Near Mint", "Holofoil",
+                card_number=number, language="English",
+                cdn_image=f"https://cdn.example.com/{manifest_id}.jpg",
+            )
+            self.db.set_manifest_quantity(manifest_id, 2)
+            with self.db.get_connection() as conn:
+                conn.execute("UPDATE manifest SET price = 1.99 "
+                             "WHERE manifest_id = ?", (manifest_id,))
+                conn.commit()
+            self.db.set_manifest_ebay_fields(manifest_id, {
+                "item_specifics": {"C:Graded": "No"},
+            })
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_an_edited_quantity_and_price_are_what_get_sent(self):
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        target = next(i for i in self.db.get_plan_items(plan_id)
+                      if i["manifest_id"] == "ID1001")
+        self.db.update_plan_item(target["id"], proposed_qty=7,
+                                 proposed_price=3.50)
+        approve_plan(self.db, plan_id, approved_by=1)
+
+        api = FakeEbay()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        item = api.items["ID1001"]
+        self.assertEqual(
+            item["availability"]["shipToLocationAvailability"]["quantity"], 7
+        )
+        offer = next(o for o in api.offers.values() if o["sku"] == "ID1001")
+        self.assertEqual(offer["pricingSummary"]["price"]["value"], "3.50")
+
+        # The card that was not edited keeps the catalogue's figures, so an
+        # edit cannot leak sideways onto its neighbours.
+        other = api.items["ID1002"]
+        self.assertEqual(
+            other["availability"]["shipToLocationAvailability"]["quantity"], 2
+        )
+
+    def test_an_excluded_card_is_not_sent_at_all(self):
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        target = next(i for i in self.db.get_plan_items(plan_id)
+                      if i["manifest_id"] == "ID1001")
+        self.db.update_plan_item(target["id"], status="excluded")
+        approve_plan(self.db, plan_id, approved_by=1)
+
+        api = FakeEbay()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertNotIn("ID1001", api.items)
+        self.assertIn("ID1002", api.items)
+
+
+class DerivedSpecificsTests(unittest.TestCase):
+    """
+    The specifics a card's own columns can supply, on the inventory item.
+
+    These used to be tested through the File Exchange Add file, which no
+    longer exists; the derivation moved here with the only path that still
+    uses it. Worth keeping because eBay marks around twenty specifics
+    required on a card listing and silently accepts a listing missing them --
+    the failure is a listing nobody finds, not an error.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "specifics.db"))
+        self.db.set_listing_settings(COMPLETE_SETTINGS, user_id=SHARED_SCOPE)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def push_one(self, specifics):
+        self.db.insert_manifest(
+            "ID1001", "Charizard", "Base Set", "Near Mint", "Holofoil",
+            card_number="004/102", language="English",
+            cdn_image="https://cdn.example.com/ID1001.jpg",
+        )
+        self.db.set_manifest_quantity("ID1001", 1)
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE manifest SET price = 25.00 "
+                         "WHERE manifest_id = ?", ("ID1001",))
+            conn.commit()
+        self.db.set_manifest_ebay_fields("ID1001", {
+            "item_specifics": specifics,
+        })
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        approve_plan(self.db, plan_id, approved_by=1)
+        api = FakeEbay()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        return api.items["ID1001"]["product"]["aspects"]
+
+    def test_the_card_supplies_what_the_export_did_not(self):
+        aspects = self.push_one({"C:Graded": "No"})
+        # Unprefixed names mapping to lists, which is eBay's shape.
+        self.assertEqual(aspects["Set"], ["Base Set"])
+        self.assertEqual(aspects["Card Name"], ["Charizard"])
+        self.assertEqual(aspects["Card Number"], ["004/102"])
+        self.assertEqual(aspects["Language"], ["English"])
+        self.assertEqual(aspects["Finish"], ["Holofoil"])
+        self.assertEqual(aspects["Graded"], ["No"])
+
+    def test_the_export_wins_where_they_disagree(self):
+        # The export is eBay's own vocabulary; our columns are SortSwift's.
+        # Overriding it would reintroduce the mapping table this project
+        # deliberately does not keep.
+        aspects = self.push_one({
+            "C:Set": "Base Set (Shadowless)", "C:Graded": "No",
+        })
+        self.assertEqual(aspects["Set"], ["Base Set (Shadowless)"])
+        # And the derived ones still fill the gaps around it.
+        self.assertEqual(aspects["Card Number"], ["004/102"])
+
+    def test_the_configured_game_overrides_the_export(self):
+        # eBay only accepts Game values from its own per-category list.
+        aspects = self.push_one({"C:Game": "Pokemon", "C:Graded": "No"})
+        self.assertEqual(aspects["Game"], ["Pokémon TCG"])
+
+
 class GroupKeyTests(unittest.TestCase):
     def test_the_ebay_group_key_is_stable_and_path_safe(self):
         # Rebuilding a draft must map to the same eBay group, or a push would
