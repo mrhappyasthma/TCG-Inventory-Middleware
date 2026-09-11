@@ -393,6 +393,41 @@ class ResumeTests(PushTestCase):
         self.assertEqual(result["pushed"], 0)
         self.assertEqual(api.calls, [])
 
+    def test_a_push_that_does_nothing_says_so_and_says_why(self):
+        """
+        Doing nothing must never report success.
+
+        "0 pushed, 0 failed" logged as SUCCESS is indistinguishable from a
+        push that worked, and it sent someone to eBay's active listings
+        hunting for a listing that had never been attempted. The reason has to
+        come with it, because the three causes -- everything already pushed,
+        everything excluded, an empty plan -- need different responses.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+
+        api = FakeEbay()
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        self.assertFalse(result["attempted"])
+        self.assertIn("already pushed", result["reason"])
+        self.assertEqual(api.calls, [])
+        self.assertTrue(
+            all(entry["level"] != "SUCCESS" for entry in result["logs"]),
+            result["logs"],
+        )
+
+    def test_an_empty_plan_reports_that_rather_than_succeeding(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = self.approved_plan()
+        # The cards a plan referred to can leave the catalogue between
+        # approval and push, which empties the plan without emptying the
+        # table it is stored in.
+        self.db.delete_manifest("ID1001")
+        result = push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+        self.assertFalse(result["attempted"])
+        self.assertIn("no items", result["reason"])
+
     def test_a_draft_cannot_be_pushed(self):
         self.add_card("ID1001", "Charizard", "004/102")
         plan_id = build_plan(self.db, user_id=1)["plan_id"]

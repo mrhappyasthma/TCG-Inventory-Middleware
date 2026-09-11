@@ -420,10 +420,48 @@ def push_plan(
     # Already-pushed items are skipped rather than repeated. A push that died
     # halfway has to be resumable, and repeating a create is exactly how a
     # duplicate listing appears.
+    all_items = db.get_plan_items(plan_id)
     items = [
-        item for item in db.get_plan_items(plan_id)
+        item for item in all_items
         if item["status"] not in (STATUS_EXCLUDED, STATUS_PUSHED)
     ]
+
+    # A push that considers nothing must say why, and must not say SUCCESS.
+    # Reporting "0 pushed, 0 failed" as a success is indistinguishable from a
+    # push that worked, and it sent someone to eBay's active listings looking
+    # for a listing that was never attempted. The three causes need different
+    # responses, so they are named separately.
+    if not items:
+        already = sum(1 for row in all_items if row["status"] == STATUS_PUSHED)
+        excluded = sum(1 for row in all_items if row["status"] == STATUS_EXCLUDED)
+        if not all_items:
+            reason = (
+                "this plan has no items at all. Either it was built when "
+                "nothing had changed, or the cards it referred to are no "
+                "longer in the catalogue. Rebuild the draft."
+            )
+        elif already and not excluded:
+            reason = (
+                f"all {already} card(s) in this plan were already pushed. "
+                f"Rebuild the draft to pick up anything that has changed since."
+            )
+        else:
+            reason = (
+                f"nothing is left to push: {already} card(s) already pushed, "
+                f"{excluded} left out."
+            )
+        record("WARN", f"Nothing was sent to eBay -- {reason}")
+        return {
+            "plan_id": plan_id,
+            "pushed": 0,
+            "failed": 0,
+            "deferred": 0,
+            "listings_created": 0,
+            "listings_updated": 0,
+            "attempted": False,
+            "reason": reason,
+            "logs": logs,
+        }
 
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for item in items:
@@ -494,7 +532,10 @@ def push_plan(
     elif counts["pushed"]:
         db.set_plan_status(plan_id, PLAN_PUSHED)
 
-    record("SUCCESS" if not counts["failed"] else "WARN", (
+    # SUCCESS only when something actually reached eBay. Anything else is at
+    # best a partial outcome and must not read like a completed push.
+    level = "SUCCESS" if counts["pushed"] and not counts["failed"] else "WARN"
+    record(level, (
         f"{counts['pushed']} card(s) pushed, {counts['failed']} failed, "
         f"{counts['deferred']} left for CSV; {listings_created} listing(s) "
         f"created, {listings_updated} updated"
@@ -506,6 +547,7 @@ def push_plan(
         "deferred": counts["deferred"],
         "listings_created": listings_created,
         "listings_updated": listings_updated,
+        "attempted": True,
         "logs": logs,
     }
 

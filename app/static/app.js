@@ -3255,8 +3255,15 @@ async function pushPlan(planId, button, groupKey) {
         if (!res.ok) throw new Error(data.detail || "The push failed");
         (data.logs || []).forEach(entry =>
             logToTerminal(entry.level, entry.message));
-        logToTerminal(data.failed ? "WARN" : "SUCCESS",
-            `Push complete: ${data.pushed} card(s) pushed, ${data.failed} failed, ${data.deferred} left for CSV`);
+        // Doing nothing must not look like success: that is what sent
+        // someone to eBay's active listings hunting for a listing that was
+        // never attempted.
+        if (data.attempted === false) {
+            logToTerminal("WARN", `Nothing was sent to eBay. ${data.reason || ""}`);
+        } else {
+            logToTerminal(data.pushed && !data.failed ? "SUCCESS" : "WARN",
+                `Push complete: ${data.pushed} card(s) pushed, ${data.failed} failed, ${data.deferred} left for CSV`);
+        }
         expandPlanFilesFor = planId;
         await fetchDraftPlan();
         if (typeof fetchEbayListings === "function") fetchEbayListings();
