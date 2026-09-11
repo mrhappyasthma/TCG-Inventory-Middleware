@@ -796,6 +796,45 @@ class TestWebApp(unittest.TestCase):
         # And it is gone for good rather than merely hidden.
         self.assertEqual(self.client.get(f"/api/plans/{plan_id}").status_code, 404)
 
+    def test_30c_pushing_is_refused_for_a_draft_and_without_a_connection(self):
+        """
+        The push is the only endpoint that changes a live listing, so its
+        preconditions are checked before anything is sent.
+
+        A draft has no approval behind it, and an unconnected account means
+        acting as a seller who has not consented -- eBay would refuse, but
+        finding out from a 403 halfway through a 400-card push is far worse
+        than refusing up front.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        res = self.client.post(f"/api/plans/{plan_id}/push")
+        self.assertEqual(res.status_code, 409, res.text)
+        self.assertIn("Approve", res.json()["detail"])
+
+        # Approved, but no eBay account is connected in this test database.
+        approved = self.client.post(f"/api/plans/{plan_id}/approve")
+        if approved.status_code == 200:
+            res = self.client.post(f"/api/plans/{plan_id}/push")
+            self.assertIn(res.status_code, (409, 503), res.text)
+            self.assertNotEqual(
+                self.client.get(f"/api/plans/{plan_id}").json()["plan"]["status"],
+                "pushed",
+                "nothing may be marked pushed when nothing was sent",
+            )
+
+    def test_30d_another_users_plan_cannot_be_pushed(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        other = self.approved_non_admin_client()
+        self.assertEqual(
+            other.post(f"/api/plans/{plan_id}/push").status_code, 404
+        )
+
     def test_31_plan_item_edits_are_validated(self):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         plan_id = self.client.post(

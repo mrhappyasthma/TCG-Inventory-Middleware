@@ -2980,6 +2980,12 @@ function renderPlanHistory(plans) {
                         class="ml-auto text-[11px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all">
                         Files
                     </button>
+                    ${p.status === "approved" || p.status === "partial"
+                        ? `<button type="button" onclick="pushPlan(${p.id}, this)"
+                            class="text-[11px] font-semibold px-2 py-1 rounded-lg bg-emerald-900/60 hover:bg-emerald-800 border border-emerald-800 text-emerald-200 transition-all">
+                            Push to eBay
+                        </button>`
+                        : ""}
                     ${p.status === "approved"
                         ? `<button type="button" onclick="deletePlan(${p.id})" title="Delete this plan"
                             class="text-[11px] font-bold w-6 h-6 leading-none rounded-lg bg-slate-800 hover:bg-rose-900 border border-slate-700 hover:border-rose-700 text-slate-400 hover:text-rose-200 transition-all">
@@ -3049,6 +3055,32 @@ async function loadPlanFiles(planId) {
             </div>`;
     } catch (err) {
         box.innerHTML = `<p class="text-[11px] text-rose-400">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+// The one action in this dashboard that changes a live eBay listing, so the
+// confirm states what it will do in numbers rather than asking "are you
+// sure?". A partial push is offered again because it is resumable: cards
+// already pushed are skipped, so pressing it twice cannot duplicate a listing.
+async function pushPlan(planId, button) {
+    if (!confirm(`Push plan ${planId} to eBay now? This creates and updates live listings. Cards already pushed are skipped, and listings made through File Exchange are left for the CSV files.`)) {
+        return;
+    }
+    if (button) { button.disabled = true; button.textContent = "Pushing…"; }
+    logToTerminal("INFO", `Pushing plan ${planId} to eBay…`);
+    try {
+        const res = await fetch(`/api/plans/${planId}/push`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "The push failed");
+        (data.logs || []).forEach(entry =>
+            logToTerminal(entry.level, entry.message));
+        logToTerminal(data.failed ? "WARN" : "SUCCESS",
+            `Push complete: ${data.pushed} card(s) pushed, ${data.failed} failed, ${data.deferred} left for CSV`);
+        await fetchDraftPlan();
+        if (typeof fetchEbayListings === "function") fetchEbayListings();
+    } catch (err) {
+        logToTerminal("ERROR", `Push failed: ${err.message}`);
+        if (button) { button.disabled = false; button.textContent = "Push to eBay"; }
     }
 }
 

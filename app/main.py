@@ -84,6 +84,7 @@ from tcg_engine.pricing_feed import (
     PriceFeedError,
 )
 from tcg_engine.plan_exports import build_plan_exports
+from tcg_engine.push import PushError, push_plan
 from tcg_engine.plans import (
     PlanError,
     approve_plan,
@@ -120,6 +121,7 @@ try:
         download_active_inventory_report,
         report_outline,
     )
+    from app.ebay_push import InventoryApiAdapter
 
     EBAY_CLIENT_AVAILABLE = True
 except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
@@ -2255,6 +2257,69 @@ def approve_plan_endpoint(
         result = approve_plan(db, plan_id, approved_by=user["id"])
     except PlanError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    return {"success": True, **result}
+
+
+@app.post("/api/plans/{plan_id}/push")
+async def push_plan_endpoint(
+    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """
+    Apply an approved plan to eBay.
+
+    The only endpoint in this application that changes a live listing. It acts
+    on a *stored* approval rather than on a claim made by this request, so the
+    record of who authorised the change exists before the change does.
+
+    Runs in a worker thread: a push walks several eBay calls per listing, each
+    with its own retry budget, and holding the event loop for that would stall
+    every other request including the health check.
+
+    Only listings created through this API are touched. Anything made through
+    File Exchange is left for the CSV path and reported as deferred -- pushing
+    it would create a duplicate listing rather than update the live one.
+    """
+    plan = db.get_plan(plan_id)
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan["status"] == "draft":
+        raise HTTPException(
+            status_code=409, detail="Approve the draft before pushing it."
+        )
+
+    client = get_ebay_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="eBay is not configured, so nothing can be pushed.",
+        )
+    if not client.oauth.is_connected():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Connect the eBay account first: a push acts as the seller "
+                "and needs their consent."
+            ),
+        )
+
+    adapter = InventoryApiAdapter(client)
+
+    def run():
+        with db.session():
+            return push_plan(db, adapter, plan_id, user_id=user["id"])
+
+    try:
+        result = await run_in_threadpool(run)
+    except PushError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except EbayError as exc:
+        # A failure that belongs to the whole push rather than to one card:
+        # credentials, or eBay being unreachable. Reported as such, because
+        # the per-card verdicts inside the result mean something different.
+        raise HTTPException(status_code=502, detail=f"eBay refused: {exc}")
+
+    for entry in result.get("logs", []):
+        print(f"[push] {entry['level']}: {entry['message']}", flush=True)
     return {"success": True, **result}
 
 

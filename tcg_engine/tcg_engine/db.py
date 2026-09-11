@@ -517,6 +517,45 @@ class Database:
                     "ALTER TABLE ebay_variations ADD COLUMN last_known_price REAL"
                 )
 
+            # The offer backing this SKU on eBay, for listings we created
+            # through the Inventory API. An offer id is the only handle that
+            # can change a price, and it cannot be derived from anything else
+            # we hold -- eBay generates it. NULL means either a listing made
+            # through File Exchange, which has no offer in this model at all,
+            # or a card eBay has never seen.
+            cursor.execute("PRAGMA table_info(ebay_variations)")
+            if "offer_id" not in {row["name"] for row in cursor.fetchall()}:
+                cursor.execute(
+                    "ALTER TABLE ebay_variations ADD COLUMN offer_id TEXT"
+                )
+
+            # Which of our listings the Inventory API can actually see.
+            #
+            # This table is the whole reason two write paths can coexist. A
+            # listing created through File Exchange is invisible to the
+            # Inventory API -- getOffers returns nothing for its SKUs -- so it
+            # has no row here and stays on the CSV path. A listing we created
+            # ourselves has a row, and can be pushed. Without the distinction
+            # a push would silently create a *second* listing for cards that
+            # are already on sale.
+            #
+            # Keyed by our own group key rather than by eBay's item number,
+            # because the row has to exist between deciding to create a
+            # listing and eBay telling us what its item number is.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ebay_managed_listing (
+                    group_key TEXT PRIMARY KEY,
+                    inventory_item_group_key TEXT,
+                    ebay_parent_id TEXT,
+                    managed_by TEXT NOT NULL DEFAULT 'api',
+                    last_pushed_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+
             # Per-user scoping migration for databases created before pricing
             # rules and listing settings became per-user. Both tables gain a
             # user_id defaulting to 0, so every row that already exists becomes
@@ -621,6 +660,19 @@ class Database:
                     ("payment_profile_name", DEFAULT_PAYMENT_PROFILE),
                     ("default_game", DEFAULT_GAME),
                     ("variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE),
+                    # The API push addresses business policies by *id*, not by
+                    # the names File Exchange uses, and an offer cannot be
+                    # published without an inventory location. Both are
+                    # readable from the seller's own account (the connection
+                    # already holds the sell.account.readonly scope) but must
+                    # be chosen, so they start empty: a push then fails with
+                    # eBay's own message rather than silently listing against
+                    # a default nobody picked.
+                    ("shipping_policy_id", ""),
+                    ("return_policy_id", ""),
+                    ("payment_policy_id", ""),
+                    ("merchant_location_key", ""),
+                    ("marketplace_id", "EBAY_US"),
                     ("cover_image_url", ""),
                 ]
                 cursor.executemany(
@@ -2293,7 +2345,7 @@ class Database:
                        m.card_number, m.language, m.quantity AS catalogued_qty,
                        m.price AS catalogued_price, m.market_price,
                        m.cdn_image, m.remarks, m.ebay_fields_json,
-                       v.ebay_parent_id, v.custom_label,
+                       v.ebay_parent_id, v.custom_label, v.offer_id,
                        v.last_known_qty, v.last_known_price
                 FROM listing_plan_item i
                 JOIN manifest m ON m.manifest_id = i.manifest_id
@@ -2539,6 +2591,115 @@ class Database:
                     """,
                     (int(plan_id), group_key, cleaned),
                 )
+            conn.commit()
+
+    # -- listings the Inventory API can see -----------------------------
+
+    def get_managed_listing(self, group_key: str) -> Optional[Dict[str, Any]]:
+        """
+        What we know about one listing we manage through the API.
+
+        None means the Inventory API cannot see this listing: either it does
+        not exist yet, or it was created through File Exchange. Both stay on
+        the CSV path, and a caller must not assume the second case is the
+        first -- pushing a legacy listing's cards would create a duplicate
+        listing beside the live one.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM ebay_managed_listing WHERE group_key = ?",
+                (str(group_key),),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_managed_listings(self) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM ebay_managed_listing ORDER BY group_key"
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def upsert_managed_listing(
+        self,
+        group_key: str,
+        inventory_item_group_key: Optional[str] = None,
+        ebay_parent_id: Optional[str] = None,
+        managed_by: str = "api",
+        pushed: bool = False,
+    ) -> None:
+        """
+        Record or update a listing we manage through the API.
+
+        Every optional field COALESCEs, so a later call that knows only the
+        eBay item number cannot erase the group key that made the listing
+        addressable. That mattered the first time a push published
+        successfully and the follow-up write dropped the key.
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO ebay_managed_listing
+                    (group_key, inventory_item_group_key, ebay_parent_id,
+                     managed_by, last_pushed_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?,
+                        CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(group_key) DO UPDATE SET
+                    inventory_item_group_key = COALESCE(
+                        excluded.inventory_item_group_key,
+                        ebay_managed_listing.inventory_item_group_key),
+                    ebay_parent_id = COALESCE(
+                        excluded.ebay_parent_id,
+                        ebay_managed_listing.ebay_parent_id),
+                    managed_by = excluded.managed_by,
+                    last_pushed_at = COALESCE(
+                        excluded.last_pushed_at,
+                        ebay_managed_listing.last_pushed_at),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    str(group_key),
+                    inventory_item_group_key,
+                    ebay_parent_id,
+                    managed_by,
+                    1 if pushed else 0,
+                ),
+            )
+            conn.commit()
+
+    def set_variation_offer(self, manifest_id: str, offer_id: str) -> None:
+        """
+        Remember the offer eBay created for this card's SKU.
+
+        Written during a push, not by Module B: the Active Inventory report
+        carries no offer ids, so this is the only chance to record one -- and
+        the offer id is the only handle that can later change a price.
+
+        Inserts a row when the card has none, with an empty
+        ``ebay_parent_id``. An offer exists before the listing it will belong
+        to does, and losing the id in that window would make the next push
+        create a *second* offer for a SKU that already has one, which eBay
+        refuses. An empty parent already reads as "not live on eBay"
+        everywhere that matters -- ``get_live_variations`` and the planner's
+        own ``_is_live`` both require a non-blank value -- so the placeholder
+        cannot make a card look listed when it is not.
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO ebay_variations
+                    (manifest_id, ebay_parent_id, last_known_qty, offer_id,
+                     updated_at)
+                VALUES (?, '', 0, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(manifest_id) DO UPDATE SET
+                    offer_id = excluded.offer_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (manifest_id.strip(), str(offer_id)),
+            )
             conn.commit()
 
     def get_plan_group_covers(self, plan_id: int) -> Dict[str, str]:

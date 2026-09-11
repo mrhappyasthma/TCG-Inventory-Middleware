@@ -1,0 +1,422 @@
+"""
+Tests for pushing an approved plan to eBay.
+
+Driven by a fake standing in for the eBay library, which is why the push takes
+its API surface as an argument. The behaviours under test are the ones that
+decide whether the store and our mirror still agree afterwards, and every one
+of them is a way a push can *appear* to succeed:
+
+* eBay answers HTTP 200 to a bulk call and reports failure per SKU inside the
+  body, so one card failing must not mark its neighbours pushed;
+* a listing created through File Exchange is invisible to this API, so pushing
+  its cards would create a duplicate rather than update it;
+* a card already pushed must not be pushed again, or a second listing appears;
+* the mirror is written from what eBay confirmed, never from what we intended.
+"""
+
+import os
+import tempfile
+import unittest
+
+from tcg_engine.db import Database, SHARED_SCOPE
+from tcg_engine.plans import (
+    ACTION_UPDATE,
+    STATUS_DEFERRED,
+    STATUS_FAILED,
+    STATUS_PUSHED,
+    approve_plan,
+    build_plan,
+)
+from tcg_engine.push import PushError, inventory_group_key, push_plan
+
+COMPLETE_SETTINGS = {
+    "category_id": "183454",
+    "seller_postal_code": "94305",
+    "default_game": "Pokémon TCG",
+    "shipping_profile_name": "Free Shipping Cards",
+    "return_profile_name": "No Returns",
+    "payment_profile_name": "Immediate Payment",
+    "variation_title_template": "{set_name}: Pick Your Card - {condition}",
+}
+
+
+class FakeEbay:
+    """
+    Stands in for the eBay Inventory API.
+
+    Records every call so a test can assert on ordering -- items before
+    offers, offers before the group -- and can be told to fail a specific SKU
+    the way eBay does: inside a 200 response, per record.
+    """
+
+    def __init__(self, fail_skus=None, offer_error_skus=None):
+        self.fail_skus = dict(fail_skus or {})
+        self.offer_error_skus = set(offer_error_skus or ())
+        self.calls = []
+        self.items = {}
+        self.offers = {}
+        self.groups = {}
+        self.withdrawn = []
+        self.next_offer = 1000
+        self.next_listing = 220000
+
+    # -- the surface push_plan expects ---------------------------------
+
+    def upsert_items(self, items):
+        self.calls.append(("upsert_items", [i["sku"] for i in items]))
+        rows = []
+        for entry in items:
+            sku = entry["sku"]
+            if sku in self.fail_skus:
+                rows.append({
+                    "sku": sku, "statusCode": 400,
+                    "errors": [{"errorId": 25002,
+                                "longMessage": self.fail_skus[sku]}],
+                })
+                continue
+            self.items[sku] = entry
+            rows.append({"sku": sku, "statusCode": 200})
+        return rows
+
+    def create_offer(self, payload):
+        sku = payload["sku"]
+        self.calls.append(("create_offer", sku))
+        if sku in self.offer_error_skus:
+            raise RuntimeError(f"offer refused for {sku}")
+        self.next_offer += 1
+        offer_id = str(self.next_offer)
+        self.offers[offer_id] = payload
+        return offer_id
+
+    def update_price_quantity(self, requests):
+        self.calls.append(("update_price_quantity", [r["sku"] for r in requests]))
+        rows = []
+        for request in requests:
+            sku = request["sku"]
+            if sku in self.fail_skus:
+                rows.append({
+                    "sku": sku, "statusCode": 400,
+                    "errors": [{"longMessage": self.fail_skus[sku]}],
+                })
+            else:
+                rows.append({"sku": sku, "statusCode": 200})
+        return rows
+
+    def upsert_group(self, group_key, payload):
+        self.calls.append(("upsert_group", group_key))
+        self.groups[group_key] = payload
+
+    def publish_group(self, group_key):
+        self.calls.append(("publish_group", group_key))
+        self.next_listing += 1
+        return str(self.next_listing)
+
+    def publish_offer(self, offer_id):
+        self.calls.append(("publish_offer", offer_id))
+        self.next_listing += 1
+        return str(self.next_listing)
+
+    def withdraw_offer(self, offer_id):
+        self.calls.append(("withdraw_offer", offer_id))
+        self.withdrawn.append(offer_id)
+
+    def failures(self, rows):
+        out = []
+        for row in rows:
+            code = row.get("statusCode")
+            if isinstance(code, int) and not 200 <= code < 300:
+                message = "; ".join(
+                    str(e.get("longMessage") or e.get("message"))
+                    for e in row.get("errors") or []
+                )
+                out.append((row.get("sku"), message or "rejected"))
+        return out
+
+    def kinds(self):
+        return [name for name, _ in self.calls]
+
+
+class PushTestCase(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "push.db"))
+        self.db.set_listing_settings(COMPLETE_SETTINGS, user_id=SHARED_SCOPE)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def add_card(self, manifest_id, name, card_number, price=1.99, qty=2):
+        self.db.insert_manifest(
+            manifest_id, name, "Base Set", "Near Mint", "Holofoil",
+            card_number=card_number, language="English",
+            cdn_image=f"https://cdn.example.com/{manifest_id}.jpg",
+        )
+        self.db.set_manifest_quantity(manifest_id, qty)
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE manifest SET price = ? WHERE manifest_id = ?",
+                (price, manifest_id),
+            )
+            conn.commit()
+        self.db.set_manifest_ebay_fields(manifest_id, {
+            "item_specifics": {"C:Card Type": "Pokémon", "C:Graded": "No"},
+            "condition_descriptor": "Near mint or better - (ID: 400010)",
+        })
+
+    def approved_plan(self):
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        approve_plan(self.db, plan_id, approved_by=1)
+        return plan_id
+
+    def items_by_sku(self, plan_id):
+        return {
+            (row.get("custom_label") or row["manifest_id"]): row
+            for row in self.db.get_plan_items(plan_id)
+        }
+
+
+class CreateListingTests(PushTestCase):
+    def test_a_new_variation_listing_is_created_in_order(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+        api = FakeEbay()
+
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["pushed"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["listings_created"], 1)
+        # Items, then offers, then the group, then publish. The group is what
+        # makes the listing visible, so anything it references must exist by
+        # the time it is written.
+        self.assertEqual(
+            api.kinds(),
+            ["upsert_items", "create_offer", "create_offer",
+             "upsert_group", "publish_group"],
+        )
+
+        # The listing is now ours to manage through the API, and the eBay item
+        # number is on record -- without which the next push could not tell an
+        # update from a create.
+        managed = self.db.get_managed_listing("Base Set|Near Mint")
+        self.assertEqual(managed["ebay_parent_id"], "220001")
+        self.assertEqual(
+            managed["inventory_item_group_key"],
+            inventory_group_key("Base Set|Near Mint"),
+        )
+        self.assertEqual(managed["managed_by"], "api")
+
+        # And the mirror carries what eBay confirmed.
+        live = {row["manifest_id"]: row for row in self.db.get_live_variations()}
+        self.assertEqual(live["ID1001"]["ebay_parent_id"], "220001")
+        self.assertEqual(live["ID1001"]["last_known_qty"], 2)
+
+    def test_the_card_condition_descriptor_is_sent_as_a_numeric_id(self):
+        # File Exchange accepts "Near mint or better - (ID: 400010)". The API
+        # rejects prose and wants the bare id, so the stored CSV rendering
+        # cannot simply be forwarded.
+        self.add_card("ID1001", "Charizard", "004/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        item = api.items["ID1001"]
+        self.assertEqual(item["conditionDescriptors"],
+                         [{"name": "40001", "values": ["400010"]}])
+        self.assertEqual(item["condition"], "USED_VERY_GOOD")
+
+    def test_aspects_lose_the_csv_column_prefix(self):
+        # "C:Game" is File Exchange's column naming. eBay's aspects are
+        # unprefixed names mapping to lists.
+        self.add_card("ID1001", "Charizard", "004/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        aspects = api.items["ID1001"]["product"]["aspects"]
+        self.assertEqual(aspects["Game"], ["Pokémon TCG"])
+        self.assertNotIn("C:Game", aspects)
+
+    def test_a_group_states_only_the_aspects_every_card_shares(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        group = api.groups[inventory_group_key("Base Set|Near Mint")]
+        self.assertEqual(group["aspects"]["Set"], ["Base Set"])
+        # Card Name differs between the two cards, so the variation axis
+        # expresses it rather than the listing.
+        self.assertNotIn("Card Name", group["aspects"])
+        self.assertEqual(sorted(group["variantSKUs"]), ["ID1001", "ID1002"])
+
+
+class PartialFailureTests(PushTestCase):
+    def test_one_card_failing_inside_a_200_does_not_push_the_others(self):
+        """
+        The failure mode the whole module is arranged around.
+
+        eBay reports per-SKU outcomes inside a 200. Read as a single verdict,
+        every card is marked pushed while some kept their old state, and the
+        mirror then disagrees with the store with nothing to explain why.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+        api = FakeEbay(fail_skus={"ID1002": "Invalid aspect: Card Size"})
+
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["pushed"], 1)
+        self.assertEqual(result["failed"], 1)
+        items = self.items_by_sku(plan_id)
+        self.assertEqual(items["ID1001"]["status"], STATUS_PUSHED)
+        self.assertEqual(items["ID1002"]["status"], STATUS_FAILED)
+        # eBay's own words are kept against the card, because they are the
+        # only thing that says what to fix.
+        self.assertIn("Card Size", items["ID1002"]["validation"])
+        # The failed card is not in the listing, and its mirror row was never
+        # written -- claiming eBay holds it would be a lie.
+        group = api.groups[inventory_group_key("Base Set|Near Mint")]
+        self.assertEqual(group["variantSKUs"], ["ID1001"])
+        self.assertEqual(
+            [r["manifest_id"] for r in self.db.get_live_variations()], ["ID1001"]
+        )
+
+    def test_an_offer_that_cannot_be_created_fails_only_its_own_card(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+        api = FakeEbay(offer_error_skus={"ID1001"})
+
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual((result["pushed"], result["failed"]), (1, 1))
+        items = self.items_by_sku(plan_id)
+        self.assertEqual(items["ID1001"]["status"], STATUS_FAILED)
+        self.assertEqual(items["ID1002"]["status"], STATUS_PUSHED)
+
+    def test_a_partial_push_leaves_the_plan_partial(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(fail_skus={"ID1002": "nope"}), plan_id,
+                  user_id=SHARED_SCOPE)
+        self.assertEqual(self.db.get_plan(plan_id)["status"], "partial")
+
+    def test_a_clean_push_leaves_the_plan_pushed(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+        self.assertEqual(self.db.get_plan(plan_id)["status"], "pushed")
+
+
+class LegacyListingTests(PushTestCase):
+    def test_a_file_exchange_listing_is_left_for_the_csv_path(self):
+        """
+        The guard that stops a push duplicating a live listing.
+
+        eBay has the listing, but the Inventory API cannot see it, so writing
+        a group for these SKUs would publish a *second* listing beside the one
+        already selling. Deferring is the only safe answer until it is
+        migrated -- and the CSV files still cover it meanwhile.
+        """
+        self.add_card("ID1001", "Charizard", "004/102", qty=5)
+        # Module B has linked this card to a listing we did not create.
+        self.db.upsert_variation("ID1001", "227511361186", 2,
+                                 custom_label="ID1001", last_known_price=1.99)
+        plan_id = self.approved_plan()
+        api = FakeEbay()
+
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["deferred"], 1)
+        self.assertEqual(result["pushed"], 0)
+        self.assertEqual(api.calls, [], "nothing should have been sent to eBay")
+        self.assertEqual(
+            self.items_by_sku(plan_id)["ID1001"]["status"], STATUS_DEFERRED
+        )
+        self.assertTrue(
+            any("File Exchange" in entry["message"] for entry in result["logs"])
+        )
+
+    def test_a_listing_we_created_is_updated_rather_than_recreated(self):
+        self.add_card("ID1001", "Charizard", "004/102", qty=2)
+        first = self.approved_plan()
+        api = FakeEbay()
+        push_plan(self.db, api, first, user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing("Base Set|Near Mint")["ebay_parent_id"]
+
+        # Stock changes, so a second plan proposes an update.
+        self.db.set_manifest_quantity("ID1001", 7)
+        second = self.approved_plan()
+        api2 = FakeEbay()
+        result = push_plan(self.db, api2, second, user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["listings_created"], 0)
+        self.assertEqual(result["listings_updated"], 1)
+        self.assertNotIn("publish_group", api2.kinds())
+        # The existing offer is reused: a second offer for the same SKU is an
+        # error, and the offer id is the only way to change a price.
+        self.assertNotIn("create_offer", api2.kinds())
+        self.assertIn("update_price_quantity", api2.kinds())
+        live = {r["manifest_id"]: r for r in self.db.get_live_variations()}
+        self.assertEqual(live["ID1001"]["last_known_qty"], 7)
+        self.assertEqual(live["ID1001"]["ebay_parent_id"], listing_id)
+
+
+class ResumeTests(PushTestCase):
+    def test_an_already_pushed_card_is_not_pushed_twice(self):
+        # A push that died halfway must be resumable. Repeating a create is
+        # how a duplicate listing appears.
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+
+        api = FakeEbay()
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        self.assertEqual(result["pushed"], 0)
+        self.assertEqual(api.calls, [])
+
+    def test_a_draft_cannot_be_pushed(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        with self.assertRaises(PushError):
+            push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+
+
+class ZeroOutTests(PushTestCase):
+    def test_a_zero_out_does_not_touch_the_price(self):
+        # Out of stock is not a sale. Sending a price here would reprice a
+        # card on its way off the shelf.
+        self.add_card("ID1001", "Charizard", "004/102", qty=3)
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        self.db.set_manifest_quantity("ID1001", 0)
+        plan_id = self.approved_plan()
+        items = self.db.get_plan_items(plan_id)
+        self.assertTrue(items)
+        api2 = FakeEbay()
+        push_plan(self.db, api2, plan_id, user_id=SHARED_SCOPE)
+
+        sent = [c for c in api2.calls if c[0] == "update_price_quantity"]
+        self.assertTrue(sent)
+        request = api2.calls[[c[0] for c in api2.calls].index(
+            "update_price_quantity")]
+        self.assertEqual(request[1], ["ID1001"])
+
+
+class GroupKeyTests(unittest.TestCase):
+    def test_the_ebay_group_key_is_stable_and_path_safe(self):
+        # Rebuilding a draft must map to the same eBay group, or a push would
+        # create a second listing for one that already exists.
+        first = inventory_group_key("ME01: Mega Evolution|NM")
+        self.assertEqual(first, inventory_group_key("ME01: Mega Evolution|NM"))
+        self.assertNotIn("|", first)
+        self.assertNotIn(" ", first)
+        self.assertNotEqual(first, inventory_group_key("ME01: Mega Evolution|LP"))
+
+
+if __name__ == "__main__":
+    unittest.main()
