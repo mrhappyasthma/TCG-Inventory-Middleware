@@ -743,7 +743,7 @@ class TestWebApp(unittest.TestCase):
             "approved",
         )
 
-    def test_30_an_approved_plan_can_no_longer_be_edited_or_discarded(self):
+    def test_30_an_approved_plan_can_no_longer_be_edited(self):
         """
         Approval is the authorisation record for an eBay write. Editing after
         it would change what gets pushed, making the approval a record of
@@ -762,7 +762,39 @@ class TestWebApp(unittest.TestCase):
             f"/api/plans/items/{items[0]['id']}", json={"proposed_qty": 9}
         )
         self.assertEqual(res.status_code, 409)
-        self.assertEqual(self.client.delete(f"/api/plans/{plan_id}").status_code, 409)
+
+    def test_30b_an_approved_plan_can_be_deleted_but_a_pushed_one_cannot(self):
+        """
+        The line is whether the plan reached eBay, not whether it was approved.
+
+        An approval nobody acted on is a decision that was changed, and the
+        drafts page accumulates them. A pushed plan is the only record of who
+        authorised a live change, so deleting it would destroy the audit trail
+        the approval exists to create.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        approved = [
+            p for p in self.client.get("/api/plans").json()["plans"]
+            if p["status"] == "approved"
+        ]
+        self.assertTrue(approved, "test 29 should have left an approved plan")
+        plan_id = approved[0]["id"]
+
+        # Pretend it was pushed. Refused, and the reason says why.
+        db.set_plan_status(plan_id, "pushed")
+        res = self.client.delete(f"/api/plans/{plan_id}")
+        self.assertEqual(res.status_code, 409, res.text)
+        self.assertIn("reached eBay", res.json()["detail"])
+
+        # Back to approved: now it goes, and it goes out of the listing too.
+        db.set_plan_status(plan_id, "approved")
+        self.assertEqual(self.client.delete(f"/api/plans/{plan_id}").status_code, 200)
+        remaining = [
+            p["id"] for p in self.client.get("/api/plans").json()["plans"]
+        ]
+        self.assertNotIn(plan_id, remaining)
+        # And it is gone for good rather than merely hidden.
+        self.assertEqual(self.client.get(f"/api/plans/{plan_id}").status_code, 404)
 
     def test_31_plan_item_edits_are_validated(self):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")

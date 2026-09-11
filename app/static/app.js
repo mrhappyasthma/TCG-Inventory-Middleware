@@ -2980,6 +2980,12 @@ function renderPlanHistory(plans) {
                         class="ml-auto text-[11px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all">
                         Files
                     </button>
+                    ${p.status === "approved"
+                        ? `<button type="button" onclick="deletePlan(${p.id})" title="Delete this plan"
+                            class="text-[11px] font-bold w-6 h-6 leading-none rounded-lg bg-slate-800 hover:bg-rose-900 border border-slate-700 hover:border-rose-700 text-slate-400 hover:text-rose-200 transition-all">
+                            &times;
+                        </button>`
+                        : ""}
                 </div>
                 <div id="planFiles${p.id}" class="hidden mt-2"></div>
             </div>`).join("")}`;
@@ -3043,6 +3049,25 @@ async function loadPlanFiles(planId) {
             </div>`;
     } catch (err) {
         box.innerHTML = `<p class="text-[11px] text-rose-400">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+// Deleting an approved plan from the history list. The files it produced are
+// rebuilt from the plan on demand rather than stored, so this also throws away
+// the only way to regenerate them -- hence naming that in the prompt rather
+// than asking a bare "are you sure?".
+async function deletePlan(planId) {
+    if (!confirm(`Delete plan ${planId}? Its Add and Revise files are built from it on demand, so they go too. Anything already uploaded to eBay stays as it is.`)) {
+        return;
+    }
+    try {
+        const res = await fetch(`/api/plans/${planId}`, { method: "DELETE" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not delete this plan");
+        logToTerminal("INFO", `Plan ${planId} deleted`);
+        await fetchDraftPlan();
+    } catch (err) {
+        logToTerminal("ERROR", `Delete failed: ${err.message}`);
     }
 }
 

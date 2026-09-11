@@ -2262,14 +2262,25 @@ def approve_plan_endpoint(
 def discard_plan_endpoint(
     plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
 ):
-    """Throw a plan away. Only a draft; an approved plan is a record."""
+    """
+    Throw a plan away: a draft, or an approved plan nothing acted on.
+
+    The line is drawn at whether the plan reached eBay, not at whether it was
+    approved. An approval that was never pushed is a decision the user changed
+    their mind about, and the drafts page fills up with them; a plan that was
+    pushed is the only record of who authorised a live change and what it did,
+    so it stays.
+    """
     plan = db.get_plan(plan_id)
     if plan is None or plan["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Plan not found.")
-    if plan["status"] != "draft":
+    if plan["status"] not in ("draft", "approved"):
         raise HTTPException(
             status_code=409,
-            detail=f"A {plan['status']} plan is a record and cannot be discarded.",
+            detail=(
+                f"Plan {plan_id} is {plan['status']} -- it reached eBay, so it "
+                f"is the record of that change and cannot be deleted."
+            ),
         )
     db.delete_plan(plan_id)
     return {"success": True}
