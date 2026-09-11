@@ -260,6 +260,35 @@ class BulkOutcomeTests(unittest.TestCase):
         self.assertEqual(opener.calls, [])
 
 
+class OfferListingIdTests(unittest.TestCase):
+    """
+    Where getOffers puts the listing id, which is not where the other calls
+    put it. Reading the wrong level reported a successful migration as a
+    failure.
+    """
+
+    def test_the_id_is_read_from_the_nested_listing(self):
+        offer = {
+            "offerId": "9001",
+            "status": "PUBLISHED",
+            "listing": {"listingId": "227513097221", "listingStatus": "ACTIVE"},
+        }
+        self.assertEqual(inventory.offer_listing_id(offer), "227513097221")
+
+    def test_a_top_level_id_is_still_honoured(self):
+        # publishOffer and bulkMigrateListing do report it at the top level.
+        self.assertEqual(
+            inventory.offer_listing_id({"listingId": "227513097221"}),
+            "227513097221",
+        )
+
+    def test_an_unpublished_offer_has_no_listing(self):
+        for offer in ({}, {"offerId": "9001"}, {"listing": {}},
+                      {"listing": None}, {"listingId": ""}):
+            with self.subTest(offer=offer):
+                self.assertEqual(inventory.offer_listing_id(offer), "")
+
+
 class MigrateTests(unittest.TestCase):
     """
     The one irreversible call here, so the shape of the request matters more

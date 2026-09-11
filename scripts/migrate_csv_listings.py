@@ -219,8 +219,8 @@ def already_migrated(api_transport, cards):
         return None, []
     except EbayError:
         return None, []
-    ids = sorted({str(o.get("listingId") or "").strip() for o in offers
-                  if str(o.get("listingId") or "").strip()})
+    ids = sorted({inventory.offer_listing_id(o) for o in offers
+                  if inventory.offer_listing_id(o)})
     return bool(offers), ids
 
 
@@ -339,7 +339,7 @@ def verify(api_transport, listing, cards):
         print(f"    WARNING: could not verify the listing afterwards: {exc}")
         return True
 
-    ids = {str(o.get("listingId") or "").strip() for o in offers}
+    ids = {inventory.offer_listing_id(o) for o in offers}
     statuses = {str(o.get("status") or "").strip() for o in offers}
     if parent in ids:
         print(f"    verified: still published as #{parent} "
@@ -350,6 +350,82 @@ def verify(api_transport, listing, cards):
           f"Stopping here -- check the listing on eBay before migrating "
           f"anything else.")
     return False
+
+
+def verify_report(db, client, parent):
+    """
+    What eBay holds for one listing, card by card, against what we recorded.
+
+    Exists because the first successful migration was reported as a failure:
+    the verification read the listing id from the wrong level of the offer, so
+    a healthy published offer looked like an offer belonging to no listing.
+    Printing the rows rather than a verdict is the remedy -- a summary that
+    can be wrong in that way is worth less than the facts it was summarising.
+
+    Read-only.
+    """
+    cards = db.get_cards_for_listing(parent)
+    if not cards:
+        print(f"Nothing recorded for listing #{parent}.")
+        return 1
+
+    managed = db.get_managed_listing_by_parent(parent)
+    print(f"\nListing #{parent}")
+    print(f"  our record: "
+          + (f"managed, group key {managed['group_key']!r}, inventory group "
+             f"{managed.get('inventory_item_group_key') or '-'!r}"
+             if managed else "not managed through the API"))
+
+    group = None
+    group_key = str((managed or {}).get("inventory_item_group_key") or "").strip()
+    if group_key:
+        try:
+            group = inventory.get_inventory_item_group(client.seller, group_key)
+        except EbayError as exc:
+            print(f"  inventory group could not be read: {exc}")
+    if group is not None:
+        images = group.get("imageUrls") or []
+        print(f"  eBay's group: {len(group.get('variantSKUs') or [])} SKU(s), "
+              f"{len(images)} image(s), title "
+              f"{str(group.get('title') or '')[:60]!r}")
+
+    ok = 0
+    problems = 0
+    for card in cards:
+        sku = str(card.get("custom_label") or "").strip() or card["manifest_id"]
+        stored = str(card.get("offer_id") or "").strip() or "-"
+        try:
+            offers = inventory.get_offers(client.seller, sku)
+        except ApiError as exc:
+            note = ("no inventory item at eBay (404) -- not migrated"
+                    if exc.status_code == 404 else str(exc))
+            print(f"  {sku:24} stored offer {stored:14} eBay: {note}")
+            problems += 1
+            continue
+
+        if not offers:
+            print(f"  {sku:24} stored offer {stored:14} eBay: no offers")
+            problems += 1
+            continue
+
+        for offer in offers:
+            offer_id = str(offer.get("offerId") or "").strip()
+            listing_id = inventory.offer_listing_id(offer)
+            status = str(offer.get("status") or "?")
+            price = ((offer.get("pricingSummary") or {})
+                     .get("price") or {}).get("value")
+            agrees = "OK" if listing_id == parent else "DIFFERENT LISTING"
+            matches = "" if offer_id == stored.strip() else "  (we stored a different offer id)"
+            print(f"  {sku:24} stored offer {stored:14} eBay offer "
+                  f"{offer_id:14} listing #{listing_id or '-':14} "
+                  f"{status:10} ${price or '-':8} {agrees}{matches}")
+            if listing_id == parent:
+                ok += 1
+            else:
+                problems += 1
+
+    print(f"\n  {ok} offer(s) confirmed against #{parent}, {problems} to look at.")
+    return 0 if problems == 0 else 1
 
 
 def sku_fix_rows(listings):
@@ -444,7 +520,7 @@ def recover_one(db, client, listing, cards):
             continue
         for offer in offers:
             offer_id = str(offer.get("offerId") or "").strip()
-            listing_id = str(offer.get("listingId") or "").strip()
+            listing_id = inventory.offer_listing_id(offer)
             if listing_id and listing_id != parent:
                 mismatched.append(f"{sku} -> #{listing_id}")
                 continue
@@ -538,6 +614,12 @@ def main():
              "applies.",
     )
     parser.add_argument(
+        "--verify", metavar="ITEM_ID", default=None,
+        help="report what eBay holds for one listing's SKUs -- offer ids, "
+             "listing ids and statuses -- and what we have recorded. "
+             "Read-only.",
+    )
+    parser.add_argument(
         "--sku-fix", metavar="PATH", nargs="?", const="ebay_listing_sku_fix.csv",
         default=None,
         help="write a File Exchange Revise file giving each migratable "
@@ -549,6 +631,9 @@ def main():
 
     db = Database(db_path=DATABASE_URL)
     user_db = UserDatabase(db_path=USER_DATABASE_URL)
+
+    if args.verify:
+        return verify_report(db, build_client(user_db), args.verify.strip())
 
     # Built up front so the preflight can ask eBay whether a listing is
     # already migrated. Read-only either way: nothing is written to eBay

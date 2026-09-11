@@ -202,6 +202,28 @@ def get_offers(transport, sku: str) -> List[Dict[str, Any]]:
     return list(response.get("offers") or [])
 
 
+def offer_listing_id(offer: Dict[str, Any]) -> str:
+    """
+    The eBay listing id one offer belongs to, or "" if it is unpublished.
+
+    ``getOffers`` nests it: the id lives at ``offer.listing.listingId``, not at
+    the top level, even though ``publishOffer`` returns a top-level
+    ``listingId`` and ``bulkMigrateListing`` reports one per request. Reading
+    the top level of an offer therefore yields "" for a perfectly healthy
+    published offer -- which reads as "this offer belongs to no listing" and
+    is indistinguishable from a real fault.
+
+    It is a function here rather than an expression at each call site because
+    getting it wrong is silent and the sites are far apart: it cost a false
+    "PROBLEM: eBay's offers name listing(s) none" on a migration that had in
+    fact succeeded, and left a safety check comparing against "" for every
+    offer it was supposed to be validating. The top level is still consulted
+    as a fallback, since two other calls do put it there.
+    """
+    nested = (offer.get("listing") or {}).get("listingId")
+    return str(nested or offer.get("listingId") or "").strip()
+
+
 def publish_offer(transport, offer_id: str) -> str:
     """Publish a single (non-variation) offer; returns the eBay listing id."""
     response = transport.post(

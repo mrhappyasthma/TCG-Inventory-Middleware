@@ -59,11 +59,9 @@ class InventoryApiAdapter:
         it -- and guessing wrong publishes a second live listing.
         """
         for offer in inventory.get_offers(self.transport, sku):
-            listing = (offer.get("listing") or {}).get("listingId")
-            if not listing:
-                listing = offer.get("listingId")
+            listing = inventory.offer_listing_id(offer)
             if listing:
-                return str(listing)
+                return listing
         return ""
 
     def offer_ids_for(self, sku: str) -> List[str]:
