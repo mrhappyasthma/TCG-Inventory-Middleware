@@ -50,18 +50,21 @@ echo "Updated $(git rev-parse --short "$BEFORE") -> $(git rev-parse --short "$AF
 # --- decide whether the image has to be rebuilt ---------------------------
 # Only paths that end up inside the image, or that define it, require a
 # rebuild. A docs-only or test-only commit does not: the Dockerfile copies
-# app/ and installs tcg_engine/ and ebay_client/, and nothing else.
+# app/ and scripts/ and installs tcg_engine/ and ebay_client/, and nothing
+# else.
 #
 # Note that app/static counts -- the dashboard's HTML, JS and CSS are COPYed
 # into the image, so a UI change does need a rebuild even though it feels like
-# a static asset.
+# a static asset. scripts/ counts for the same reason: the one-off scripts are
+# run with `docker exec` inside this container, so the copy that matters is
+# the one in the image, not the one in the checkout.
 CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
 echo "$CHANGED" | sed 's/^/  /'
 
 NEEDS_BUILD=0
 for path in $CHANGED; do
     case "$path" in
-        app/*|tcg_engine/*|ebay_client/*|requirements.txt|Dockerfile|docker-compose.yml)
+        app/*|scripts/*|tcg_engine/*|ebay_client/*|requirements.txt|Dockerfile|docker-compose.yml)
             NEEDS_BUILD=1
             break
             ;;

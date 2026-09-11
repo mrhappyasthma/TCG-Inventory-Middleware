@@ -36,6 +36,15 @@ RUN pip install --no-cache-dir /src/tcg_engine "/src/ebay_client[notifications]"
 # Copy application files
 COPY app/ ./app/
 
+# The one-off operational scripts. In the image because they are run with
+# `docker exec` against the live databases and the live eBay connection --
+# they need this container's environment, not a developer's laptop, where
+# DATABASE_URL points at a different file entirely.
+#
+# Safe to sit inside /app, unlike tcg_engine and ebay_client above: the
+# directory is named "scripts" and shadows no installed package.
+COPY scripts/ ./scripts/
+
 # Environment defaults
 EXPOSE 8080
 VOLUME /data

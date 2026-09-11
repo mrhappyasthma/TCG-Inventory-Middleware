@@ -78,6 +78,42 @@ class EditableInstallsReachTheImageTests(unittest.TestCase):
                     f"{package} is never COPYied into the build context stage",
                 )
 
+    def test_the_one_off_scripts_reach_the_image(self):
+        """
+        They are run with `docker exec`, so the image's copy is the only one.
+
+        A script that exists in the checkout but not in the container fails
+        with "No such file or directory" at the moment somebody is trying to
+        run a migration against their live listings -- and the obvious next
+        move, running it on a laptop instead, would point DATABASE_URL at a
+        different database entirely and record the migration in the wrong
+        place.
+        """
+        scripts = [
+            name for name in os.listdir(os.path.join(PROJECT_ROOT, "scripts"))
+            if name.endswith(".py")
+        ]
+        self.assertTrue(scripts, "expected at least one script in scripts/")
+        self.assertRegex(
+            self.dockerfile, r"COPY\s+scripts/\s+\./scripts/",
+            "scripts/ is never COPYied into the image, so `docker exec "
+            "python scripts/...` cannot find it",
+        )
+
+    def test_a_scripts_change_triggers_a_rebuild(self):
+        """
+        deploy.sh decides on a path list, and a stale list is silent.
+
+        It reports "no rebuild needed" and exits 0, so the deploy looks like a
+        success while the container keeps running the old copy.
+        """
+        deploy = read("deploy.sh")
+        case_line = next(
+            (line for line in deploy.splitlines() if "requirements.txt|" in line),
+            "",
+        )
+        self.assertIn("scripts/*", case_line, case_line)
+
     def test_the_build_verifies_its_own_imports(self):
         """
         The build must fail rather than the container.
