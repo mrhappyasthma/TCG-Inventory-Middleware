@@ -1,10 +1,12 @@
 # Design: replacing the CSV hand-off with the eBay APIs
 
-**Status: in progress.** The `ebay_client` library, the staging tables, the
-plan engine and the drafts page are built; nothing contacts eBay yet. See §9
-for what is done and what is not. This file records the design and, more
-importantly, the constraints eBay imposes on it, so that the implementation
-does not rediscover them one failed push at a time.
+**Status: done.** The library, the staging tables, the plan engine, the drafts
+page, the push, the automatic repricer and the migration are all built and
+running against the real store. Every listing has been migrated onto the
+Inventory API and the File Exchange output path has been deleted. This file
+records the design and, more importantly, the constraints eBay imposes on it,
+so that the implementation does not rediscover them one failed push at a
+time -- several of the notes below were written *after* a failed call.
 
 ---
 
@@ -44,13 +46,19 @@ nothing a buyer can see.
 Today five different things produce a CSV for manual upload. All five become
 producers of the same draft plan:
 
-| Producer | Today | Becomes |
+| Producer | Was | Is now |
 |---|---|---|
-| SortSwift batch upload (Module A) | Add + Revise CSVs | a plan of `create_listing` / `update_qty` items |
-| Manual quantity edit | edits the DB, then a Revise CSV | a one-item plan |
-| TCGCSV price refresh | `build_reprice_csv` | a plan of `update_price` items |
-| Cover photo change | `ebay_listing_overrides` + Revise CSV | an `update_images` item |
-| Grouping / ungrouping | not currently possible | `add_to_group` / `remove_from_group` items |
+| SortSwift batch upload (Module A) | Add + Revise CSVs | ingest, then a staged draft |
+| Manual quantity edit | edits the DB, then a Revise CSV | picked up by the next draft |
+| TCGCSV price refresh | `build_reprice_csv` | the automatic repricer, applied nightly by API |
+| Cover photo change | `ebay_listing_overrides` + Revise CSV | applied immediately through the item group |
+| Grouping / ungrouping | not possible | the Listing dropdown on the drafts page |
+
+The repricer is the one producer that does **not** go through a draft, which
+was a deliberate exception: it only ever changes a price, within rules already
+approved, and holding a price change for review defeats the point of running
+it nightly. Its safeguards are a boundary margin, a hold window on falls, a
+proportional refusal cap, and a full audit log.
 
 The value of the single funnel is that suppression, validation, and the
 approval gate are each written once and apply to every producer. Today the

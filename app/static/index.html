@@ -116,7 +116,7 @@
 
                 <div class="w-px bg-slate-800"></div>
 
-                <div class="flex flex-col justify-center gap-0.5" title="Physical copies. On hand comes from your SortSwift dump; on eBay comes from your last Active Listings sync. Generating a Revise file does not change the eBay figure.">
+                <div class="flex flex-col justify-center gap-0.5" title="Physical copies. On hand comes from your SortSwift dump; on eBay comes from your last Active Listings sync or a confirmed push.">
                     <div class="text-[9px] uppercase font-bold tracking-wider text-slate-500 leading-none">Copies</div>
                     <div class="flex items-baseline gap-1">
                         <span id="statTotalOnHand" class="text-sm font-bold font-heading text-white leading-none tabular-nums">0</span>
@@ -268,8 +268,8 @@
                             <span class="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-cyan-950 text-accent-cyan border border-cyan-800/50">Module A</span>
                             <span class="text-xs text-slate-400">SortSwift &rarr; eBay</span>
                         </div>
-                        <h3 class="text-base font-bold font-heading text-white group-hover:text-accent-cyan transition-colors">1. Process SortSwift Batch</h3>
-                        <p class="text-xs text-slate-400 mt-1">Catalogs new card states, auto-assigns IDs, and routes to eBay Revise vs. Add CSVs.</p>
+                        <h3 class="text-base font-bold font-heading text-white group-hover:text-accent-cyan transition-colors">1. Ingest SortSwift Export</h3>
+                        <p class="text-xs text-slate-400 mt-1">Catalogues new cards, assigns IDs, corrects your quantities, and stages a draft of what eBay needs.</p>
 
                         <!-- Dropzone 2 -->
                         <div id="dropzoneBatch" class="dropzone mt-4 p-6 rounded-xl border-2 border-dashed border-slate-700 bg-dark-900/40 hover:bg-dark-900/80 hover:border-accent-cyan/70 text-center cursor-pointer transition-all">
@@ -306,7 +306,7 @@
                                     </span>
                                 </label>
                             </div>
-                            <p id="batchModeNote" class="text-[10px] text-slate-500 mt-2 leading-snug">Cards live on eBay but missing from a full dump are revised down to 0.</p>
+                            <p id="batchModeNote" class="text-[10px] text-slate-500 mt-2 leading-snug">Cards live on eBay but missing from a full dump are treated as sold out and set to 0.</p>
                         </div>
                     </div>
 
@@ -566,7 +566,7 @@
                                 <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('remarks')">Bin / Remark</th>
                                 <th class="py-3 px-4 cursor-pointer hover:text-slate-200" onclick="handleSort('ebay_parent_id')">eBay Item #</th>
                                 <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('quantity')" title="Copies you hold, from your SortSwift inventory dump. Click a value to adjust it by hand.">On Hand</th>
-                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')" title="Copies eBay reports as available, from your last Active Listings sync. Only a Module B sync changes this. An amber &rarr;N means the generated Revise file asks eBay for N, which has not been applied yet.">On eBay</th>
+                                <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')" title="Copies eBay reports as available, from your last Active Listings sync or a confirmed push. A gap against On hand is what the draft proposes to change.">On eBay</th>
                                 <th class="py-3 px-4 text-right">Action</th>
                             </tr>
                         </thead>
@@ -1072,11 +1072,10 @@
                 </div>
 
                 <!--
-                    How the change reaches eBay depends on which path created
-                    the listing, and the two are not interchangeable: File
-                    Exchange cannot revise a listing the Inventory API
-                    manages. Both halves of this box, and the submit button's
-                    label, are rewritten by openCoverModal().
+                    Whether the change can be applied at all depends on
+                    whether the eBay API can see the listing. Both halves of
+                    this box, and the submit button's label, are rewritten by
+                    openCoverModal().
                 -->
                 <div class="p-3 rounded-xl bg-amber-950/40 border border-amber-800/60 text-[11px] text-amber-200">
                     <p class="font-semibold text-amber-100 mb-1">This replaces the listing&rsquo;s whole picture set</p>
@@ -1414,7 +1413,7 @@
                 <!-- eBay Seller Requirements -->
                 <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-3">
                     <label class="block font-semibold text-slate-200">eBay Seller Requirements</label>
-                    <p class="text-[11px] text-slate-400">eBay rejects an Add file without an item location. We send <code class="text-accent-cyan font-mono">PostalCode</code> only &mdash; <code class="font-mono">Location</code> is its alternative, and sending both is a known cause of error 10009.</p>
+                    <p class="text-[11px] text-slate-400">Required before a plan can be approved: a listing with no item location is rejected. It also seeds the inventory location the API publishes against.</p>
                     <div>
                         <label class="block text-[11px] text-slate-300 mb-1">Seller Postal / ZIP Code <span class="text-rose-400">*required</span></label>
                         <input type="text" id="settingPostalCode" placeholder="e.g. 94301" class="w-40 px-3 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
@@ -1424,7 +1423,7 @@
                         <input type="text" id="settingDefaultGame" placeholder="e.g. Pok&eacute;mon TCG" class="w-full px-3 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
                         <p class="text-[10px] text-slate-500 mt-1">eBay requires <strong>Game</strong> on card listings and only accepts values from its own list. SortSwift exports a looser label (e.g. <code class="font-mono">Pokemon</code>) which eBay rejects, so this value <strong>overrides</strong> the export. Copy it exactly from one of your existing listings. Clear it to fall back to the export's value.</p>
                     </div>
-                    <p class="text-[11px] text-slate-400 pt-1">Business policy names, copied <strong>exactly</strong> from Seller Hub &rarr; Account &rarr; Business policies. Matching is case-sensitive. Leave blank to omit the column entirely.</p>
+                    <p class="text-[11px] text-slate-400 pt-1">Business policy <strong>names</strong>, for reference only &mdash; the API addresses policies by <strong>id</strong>, which is what the Direct API push section below resolves. These are kept because the ids are unreadable and a name is how you recognise which policy an id refers to.</p>
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
                         <div>
                             <label class="block text-[11px] text-slate-300 mb-1">Shipping policy</label>

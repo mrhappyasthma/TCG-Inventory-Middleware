@@ -10,19 +10,34 @@ This middleware connects **SortSwift** (TCGplayer Inventory Schema) and **eBay S
 
 ```mermaid
 graph TD
-    A[SortSwift Inventory Export] -->|Upload Batch| B(Module A: Batch Router)
-    B -->|New Cards| C[(SQLite Master Manifest)]
-    B -->|Check Store State| D[(SQLite Live Store Mirror)]
-    B -->|Items Live on eBay| E[ebay_inventory_updates.csv - Revise]
-    B -->|New to eBay| F[ebay_new_additions.csv - Add]
+    A[SortSwift Inventory Export] -->|Upload| B(Module A: Ingest)
+    B -->|Catalogue cards, correct quantities| C[(SQLite Master Manifest)]
+    B -->|Stage a draft of the difference| P(Draft Plan)
+    C --> P
+    D[(SQLite Live Store Mirror)] --> P
+    P -->|Review, edit, exclude| Q{Approve}
+    Q -->|Push| R[[eBay Inventory API]]
+    R -->|Confirmed quantities and prices| D
+
+    S[TCGCSV market prices] -->|Daily| C
+    C -->|Nightly, price only| T(Automatic Repricer)
+    T --> R
 
     G[eBay Orders CSV] -->|Upload Sales| H(Module C: Orders Converter)
     H -->|Custom Label Lookup| C
     H -->|Match skuId / Attributes| I[sortswift_orders_import.csv - Deductions]
 
-    J[eBay Active Listings CSV] -->|Upload Sync| K(Module B: Store State Sync)
+    J[eBay Active Listings] -->|Feed API or upload| K(Module B: Store State Sync)
     K -->|UPSERT ItemID & Live Qty| D
 ```
+
+**eBay is written to exclusively through its APIs.** The File Exchange CSV
+output this project began as is gone: every listing is managed through the
+Inventory API, which cannot see a File Exchange listing and cannot be revised
+by one, so a generated file would upload cleanly and change nothing. CSV
+remains an *input* — the SortSwift export, the Active Listings report and the
+orders report are all read from files or feeds. Only the eBay-bound writes
+became API-only.
 
 ---
 
@@ -33,13 +48,16 @@ follow that order:
 
 | Step | Module | What it does |
 |---|---|---|
-| 1 | **A** | Process a SortSwift batch into eBay Add / Revise files |
-| 2 | **B** | Sync the resulting eBay listings back into the store mirror |
+| 1 | **A** | Ingest a SortSwift export: catalogue cards and stage a draft |
+| 2 | **B** | Sync what eBay reports back into the store mirror |
 | 3 | **C** | Convert eBay orders into SortSwift stock deductions |
 
-The order reflects the dependency chain: a batch has to be catalogued and listed
-before eBay has anything to sync back, and the sync has to have linked the item
-numbers before an order can be traced to a card.
+The order reflects the dependency chain: cards have to be catalogued and
+listed before eBay has anything to sync back, and the sync has to have linked
+the item numbers before an order can be traced to a card.
+
+The **Drafts** tab sits between A and the push, and is the only route to eBay:
+nothing is written to a live listing that has not been approved there.
 
 ---
 
@@ -370,7 +388,7 @@ The core business logic is packaged as an independent library in [`tcg_engine/`]
 # Initialize SQLite database
 python -m tcg_engine.cli init-db --db data/inventory.db
 
-# Module A: Route SortSwift Batch to eBay Add vs. Revise CSVs
+# Module A: ingest a SortSwift export and stage a draft
 python -m tcg_engine.cli batch sortswift_batch.csv --out-dir ./output --db data/inventory.db
 
 # Module A: Re-apply a batch that has already been processed (adds quantities again)
@@ -483,34 +501,6 @@ Pricing Rules dialog. Two safety properties matter more than the schedule:
   a card TCGCSV has no price for keeps whatever it already had.
 * **Every value is kept in `price_history`.** A reprice that surprises you is
   only diagnosable if the number it came from still exists.
-
-### The reprice file
-
-Module A prices from the columns of the export it is handed, so without this
-there is no way to push a new price without re-uploading a dump. **Download
-`ebay_reprice_updates.csv`** builds an eBay Revise file from the stored prices
-and your own rules:
-
-```
-Action,ItemID,CustomLabel,Price
-Revise,227511361186,ID1050-C-1,7.00
-```
-
-* **No `Quantity` column.** A reprice must not touch stock, and an absent
-  column is how File Exchange is told to leave a field alone.
-* **Only listings whose price actually changed**, on the same principle as
-  Module A - a file of unchanged rows tells you nothing and asks eBay to
-  rewrite every listing for no reason.
-* The `CustomLabel` is the one **eBay** reported, never one rebuilt from a
-  card's identity.
-* **Listings the Inventory API manages are excluded.** Automatic repricing
-  owns those, and File Exchange cannot revise them anyway - the upload would
-  succeed and change nothing.
-
-When a reprice is pending, an amber **Reprice N** pill appears in the header.
-It is deliberately persistent rather than a toast: the nightly refresh
-finishes with nobody watching, so the signal has to survive until it is acted
-on.
 
 ### Automatic repricing
 
@@ -640,10 +630,12 @@ Configure how the middleware splits and titles listings via the **"Listing Rules
 * **Cover photo** (`cover_image_url`, optional): sets the listing's main image.
   Leave it blank to use the first card in the set. Variations keep their own
   images either way.
-* **Parent & Child Row Generation** in `ebay_new_additions.csv`:
-  * **Parent Row**: `Relationship` is left **empty**, `RelationshipDetails = Card=Name1;Name2;...`, category `183454` (CCG Individual Cards), title, description and cover image.
-  * **Child Rows**: `Relationship = Variation`, `RelationshipDetails = Card=Name1`, price, quantity, `ConditionID`, `CustomLabel` (`ID1001-Bin_A-12`) and image.
-  * **Separators matter**: within one attribute eBay separates values with a semicolon; a pipe (`|`) begins a *different* attribute. A `;` or `|` appearing inside a card name is replaced with `/` so one card cannot be split into several bogus options.
+* **How the listing is built** through the Inventory API:
+  * an **inventory item** per card, carrying what the card *is* — title, picture, item specifics and the condition descriptor — plus how many we hold;
+  * an **offer** per card, carrying price, marketplace and the business policies;
+  * an **inventory item group** naming the variation axis (`Card`) and the option for each SKU. Writing that group is a **full replace** and updates the live listing immediately, with no publish step — which is why a refresh has to send everything it wants kept.
+  * **Ordering matters**: options are sorted by card number, because that order *is* the order eBay shows the dropdown in. Left in catalogue order it comes out sorted by manifest id, which is meaningless to a buyer looking for `045/132`.
+  * **Separators still matter** in an option name: a `;` or `|` inside a card name is replaced with `/`, inherited from the File Exchange era and kept because the group's option list is still a delimited list.
 
 ---
 
@@ -651,7 +643,7 @@ Configure how the middleware splits and titles listings via the **"Listing Rules
 
 When you export your SortSwift inventory, SortSwift includes your internal notes in the `Remarks` column (e.g. `Bin A-12`, `Box 4`, `TEF-01`):
 
-* **Encoded into eBay Custom Label (SKU)**: when generating `ebay_new_additions.csv` and `ebay_inventory_updates.csv`, the engine formats the SKU as `ID1001-Bin_A-12` (non-alphanumeric characters become underscores, truncated to 20 characters).
+* **Encoded into the eBay SKU** for listings created in the File Exchange era: `ID1001-Bin_A-12` (non-alphanumeric characters become underscores, truncated to 20 characters). **Newly created listings do not carry it**: the encoding was applied when building the Add file, and the push uses the SKU eBay already knows or the bare manifest id. Whether the bin belongs in the SKU at all is the open question in `docs/ebay-api-design.md` §10 — and note that a variation's SKU cannot be renamed afterwards, so it cannot be added later either.
 * **Prints on the packing slip**: an incoming order shows `ID1001-Bin_A-12`, so you can pull the physical card from the exact bin without opening any other software.
 * **Auto-Resolves in Deductions**: the orders parser extracts the base `ID1001` and retrieves the exact SortSwift `skuId` to deduct stock accurately.
 * **Searchable in Dashboard**: search your catalog by bin location (e.g. `Bin A-12`) in the Live Inventory table, and sort by the Bin / Remark column. The table also shows a **Card #** column between Card Title and Expansion Set, sortable numerically (`4/198` before `133/198`, with prefixed numbering such as `TG12/TG30` after the plain numbers) and searchable.
@@ -730,116 +722,52 @@ Image headers only: no Pillow, and never a whole file, so a 6 MB photograph
 costs the same as a thumbnail.
 
 
-## 📌 Revising a variation listing
+## 📌 A variation's SKU cannot be renamed
 
-Confirmed against a live listing, because the failure mode is unobvious.
+Confirmed against a live listing, and worth knowing twice over.
 
-A Revise that carries `Relationship` / `RelationshipDetails` **must also
-include the parent container row** declaring the complete option list:
-
-```
-Action,ItemID,Relationship,RelationshipDetails,CustomLabel,Quantity
-Revise,227511361186,,Card=Ledyba (004/198);Ledian (005/198);...all of them...,,
-Revise,227511361186,Variation,Card=Ledyba (004/198),ID1050-C-1,1
-Revise,227511361186,Variation,Card=Ledian (005/198),ID1066-C-1,1
-```
-
-* The parent row leaves `Relationship` **empty**. Marking it `Variation`
-  leaves eBay unable to tell which row is the container.
-* The parent's `RelationshipDetails` lists every option, separated by `;`. A
-  pipe would start a second attribute.
-* `Quantity` is blank on the parent: eBay ignores item-level quantity on a
-  variation listing and sums the children (warning `21916619`).
-
-Sending only child rows fails with:
-
-```
-21916664  Variation Specifics provided does not match with the variation
-          specifics of the variations on the item.
-21916639  Variation specific value "X" used for pictures does not exist in
-          variation specific set.
-```
-
-The second error is the tell. eBay derives the variation specific set from
-what you sent, and with no parent row that set is just the values in the child
-rows — which no longer accounts for the per-variation picture mappings the
-listing already holds. It reads like a picture problem and is really a missing
-parent row.
-
-Prices sit in different columns depending on the row: a child row carries
-`Start price` and leaves `Current price` **empty**, while the parent row does
-the opposite. Reading `Current price` first therefore learns nothing for
-variations, which is why `find_column` takes a `skip_blank` flag. It is off by
-default because emptiness is meaningful elsewhere -- a blank `Custom label
-(SKU)` is exactly how the parent row is recognised.
-
-The option values must match eBay's exactly, so take them from the **Active
-Listings report's `Variation details` column** rather than regenerating them.
-A stored title template can be edited after a listing is created, at which
-point regenerating an option name produces a value eBay has never heard of.
-
-### A variation's CustomLabel cannot be renamed
-
-Confirmed: a Revise that changes a child row's `CustomLabel` returns
+A change to a variation's SKU (`CustomLabel` in the File Exchange era) returns
 **Success** and does not change it. Verified by re-downloading the Active
 Listings report afterwards and finding every label unchanged.
 
-That is worth knowing twice over. First, it means a card's bin/remark cannot be
-pushed to an existing variation listing, so the bin is display-only once the
-listing exists. Second, and more generally: **a File Exchange `Success` does
-not mean your change was applied.** Always confirm against a fresh report.
+First, it means a card's bin/remark cannot be pushed onto a variation that
+already exists, so the bin is display-only once the listing is up. Second, and
+more generally: **an eBay success response does not mean your change was
+applied.** That lesson outlived the mechanism it was learned on — it is the
+same trap the Inventory API's bulk calls set, where HTTP 200 carries per-SKU
+failures in the body. Always confirm against what eBay reports back.
 
-Note that Module A's ordinary Revise file is a different, simpler shape
-(`Action,ItemID,CustomLabel,Quantity,Price`) that identifies variations by SKU
-alone and mentions no specifics, so none of the above applies to it.
+## 🧮 Why a draft can be empty
 
----
+The planner only writes an item when it would **change** something. A full
+dump that matches what eBay is known to hold produces an empty draft, and that
+is the correct outcome rather than a failure — it means the store already says
+what your catalogue says.
 
-## 🧮 Why a Revise file can be empty
-
-Module A only writes a Revise row when it would **change** something. A full
-dump where nothing moved produces a file with just its header, and the card
-reads *"Nothing to upload — all N card(s) already match eBay"*.
-
-Previously it emitted one row per catalogued card that was live on eBay,
-regardless. A no-op re-upload of a 35-card dump therefore looked like 35
-pending changes, and there was no way to see at a glance what had actually
-changed.
-
-A row is suppressed **only** when eBay is positively known to hold both the
-same quantity and the same price. Everything else counts as a change:
-
-| Situation | Row emitted? | Why |
-|---|---|---|
-| eBay has this exact quantity and price | no | nothing to do |
-| Quantity differs | yes | the point of the file |
-| Price differs (e.g. you edited a pricing rule) | yes | price is half the comparison |
-| Never synced with Module B | **yes** | eBay's figures are unknown, so nothing can be ruled out |
-| Active Listings report had no price column | **yes** | same reason |
-| A previous change is still unapplied | **yes** | it must keep appearing until a sync confirms it, or it would reach no file at all |
-
-That last row matters: suppression is based on what eBay is *known* to hold,
-never on what we last asked for. Otherwise a change you generated but never
-uploaded would silently vanish from every subsequent file.
+Suppression is deliberately conservative. It only stays quiet when eBay's own
+figures are **known** and equal; anything unknown counts as a change, so a
+real update is never dropped on a guess.
 
 ### Every row skipped?
 
 `*ConditionID` is required and is never inferred, so a SortSwift export without
 that column has **every** row skipped. The dashboard then says *"No rows could
-be read — all N were skipped"* rather than reporting a file as ready, and the
-console names the reason per row. Re-export from SortSwift with the
-ConditionID column included.
+be read — all N were skipped"*, and the console names the reason per row.
+Re-export from SortSwift with the ConditionID column included.
+
+That case also disables sold-out reconciliation, on purpose: a skipped row is
+indistinguishable from a card the dump omitted, and the remedy for an omitted
+card is to stop selling it. A file whose rows all failed to parse would
+otherwise zero the entire catalogue.
 
 ### It needs one sync first
 
-The price comparison depends on `ebay_variations.last_known_price`, which
-**Module B** fills in from the `Current price` column of the Active Listings
-report. Until you have run a sync since upgrading, every price is unknown and
-nothing is suppressed — so the first dump after this change still emits
-everything. Run Module B once and subsequent no-op dumps go quiet.
-
-If your report has no price column at all, suppression simply never engages and
-behaviour is exactly as before. It never guesses.
+The comparison depends on `ebay_variations.last_known_qty` and
+`last_known_price`, which **Module B** fills in from the Active Listings
+report, and which a confirmed push also writes. Until you have synced once,
+eBay's figures are unknown, nothing is suppressed, and the first draft after a
+fresh start proposes everything. Run Module B once and subsequent no-op dumps
+go quiet.
 
 ---
 
@@ -1225,29 +1153,22 @@ Copy the value verbatim from one of your own existing listings. The safest way
 to find any required specific and its exact spelling is to open a live listing
 of the same kind and read them off it.
 
-### ⚠️ Possibly still incomplete
+### Where the item specifics go now
 
-Pending confirmation from a successful upload:
+They are sent as the inventory item's **aspects**: eBay's own shape is an
+unprefixed name mapping to a *list* of values, so `C:Card Number` becomes
+`{"Card Number": ["045/132"]}`. The `C:` prefix is a File Exchange column
+convention and is stripped.
 
-* The `Price` column is emitted alongside `StartPrice`; `Price` is probably not a
-  valid File Exchange field for fixed-price listings and may be ignored.
-* `PostalCode`, the Condition Descriptor and the policy columns are written to
-  parent, child and single rows alike, mirroring how `ConditionID` is emitted. If
-  eBay rejects any of them on child rows, restricting them to parents is a
-  one-line change.
+The condition descriptor travels separately, on the inventory item rather than
+among the aspects: `conditionDescriptors: [{"name": "40001", "values":
+["400010"]}]`. Both are **numeric ids** — the prose form eBay's own CSV
+template accepts is rejected here.
 
-**Empirically confirmed by a real upload attempt:** the file parses, and eBay
-validated as far as per-row field checks without complaining about the variation
-syntax, the blank parent `Relationship`, the `CD:40001` column, the category or
-the bare `Action` header. Those were the parts most at risk of being wrong.
-* **Output 1 (`ebay_inventory_updates.csv`)** — Revise:
-  ```
-  Action,ItemID,CustomLabel,Quantity,Price
-  ```
-* **Output 2 (`ebay_new_additions.csv`)** — Add:
-  ```
-  Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price,PostalCode,CD:40001,ShippingProfileName,ReturnProfileName,PaymentProfileName
-  ```
+**A card with no persisted specifics blocks approval** rather than producing a
+listing quietly missing fields eBay marks required. Around thirteen of them
+exist nowhere but the eBay-flavoured export, so the only remedy is
+re-uploading `export_eBay_<date>.csv`, and the blocker names that file.
 
 ### 2. eBay Active Listings Sync (Module B)
 * **Input**: the official eBay **Active Listings** report. Get it from
@@ -1386,22 +1307,18 @@ will publish it, with one row per card. On each row you can:
 The value eBay is currently known to hold appears struck through beside each
 proposal. An unknown reads as *new* rather than as a number, because nothing is
 suppressed against a value a sync has never told us — see
-[Why a Revise file can be empty](#-why-a-revise-file-can-be-empty) for the same
-rule on the CSV path.
+[Why a draft can be empty](#-why-a-draft-can-be-empty).
 
-**Set cover** on a listing block stages that listing's gallery image. Where it
-ends up depends on whether the listing exists yet:
+**Set cover** on a listing block stages that listing's gallery image. It is
+applied by the push, as the inventory item group's image — for a listing being
+created and for one being updated alike, since writing the group is a full
+replace either way. The per-card pictures are untouched: the cover is the
+listing's gallery image, not a replacement for each variation's own photo.
 
-| The plan would… | The cover travels in… |
-|---|---|
-| **create** the listing | the **Add file**, as the parent row's `PicURL` |
-| **update** an existing listing | the separate **Cover photos** Revise file |
-
-Both are listed under **Files** after approval, and the Add file's line says how
-many covers it carries. A cover cannot be revised onto a listing that does not
-exist, which is why the two paths differ — and the per-card pictures are
-untouched either way, since the cover is the listing's gallery image rather than
-a replacement for each variation's own photo.
+A cover the push chooses is **recorded against the listing it creates**. That
+matters more than it sounds: a later Refresh rewrites the group, finds no cover
+recorded, and would substitute the first card's photo. It did exactly that
+once.
 
 **Blockers gate the approve button.** eBay refuses an entire variation listing
 when any single one of its offers is invalid, and it only says so *after* you
@@ -1462,15 +1379,9 @@ The **Cover Photo** column shows the recorded cover image per listing and opens
 a dialog to change it. The URL is previewed in the browser first, which is a
 cheap check: if it will not render there, eBay is unlikely to fetch it either.
 
-Saving records the value **and downloads a Revise file**:
-
-```csv
-Action,ItemID,PicURL
-Revise,227511361186,https://cdn.example.com/new-cover.jpg
-```
-
-Upload that to Seller Hub → Reports → Upload to apply it. Saving alone changes
-nothing on eBay — the listing lives there, not here.
+Saving **applies it to the live listing immediately**, by re-sending the
+inventory item group. If the API cannot see the listing the choice is still
+recorded and the dialog says why, so nothing is silently lost.
 
 * ⚠️ **A revision replaces the listing's entire picture set.** eBay does not
   merge pictures; the uploaded set replaces what is present.
@@ -1478,16 +1389,14 @@ nothing on eBay — the listing lives there, not here.
   the same address is a no-op. Use a different image.
 * Do not mix eBay-hosted and self-hosted images on one listing; eBay rejects
   the combination.
+* ⚠️ **At least 500 pixels on the longest side.** eBay re-validates every
+  picture on a listing whenever anything about it changes, so one undersized
+  image blocks *all* future changes — including ones with nothing to do with
+  pictures. `scripts/check_images.py --url <url>` measures one before you paste
+  it, and `--all` finds any already in place.
 * This is stored **per listing**, separately from the global **Cover photo URL**
-  in Listing Rules — that one is the default applied to *new* listings Module A
-  generates, whereas this overrides one specific live listing. A re-sync does not
-  disturb it.
-
-> **Note on the `ItemID` column**: a File Exchange *upload* identifies an
-> existing listing with `ItemID`. `Item Number` is what the Active Listings
-> *report* calls the same value, and is not a valid upload column — the batch
-> Revise file previously used it, which would have left every row without an
-> identifier.
+  in Listing Rules — that one is the default applied to *new* listings, whereas
+  this overrides one specific live listing. A re-sync does not disturb it.
 
 ---
 
@@ -1542,13 +1451,13 @@ visible at a glance:
 | Column | Meaning | Written by |
 |---|---|---|
 | **Quantity** | Total stock **you** have catalogued for that card, read from the `Quantity` column of your SortSwift export and accumulated across every batch you have processed. | Module A |
-| **Live Stock** | The quantity **eBay** last reported for it. | Module B (Active Listings sync) |
+| **Live Stock** | The quantity **eBay** last confirmed for it. | Module B (Active Listings sync), or a confirmed push |
 
 When the two disagree the pair is highlighted amber, with a tooltip naming both
 figures. A mismatch usually means one of:
 
-* You have processed a batch but not yet uploaded the resulting
-  `ebay_inventory_updates.csv` to eBay, so eBay is behind.
+* You have ingested an export but not yet pushed the resulting draft, so eBay
+  is behind. That gap **is** the draft.
 * Cards have sold since your last Active Listings sync, so **eBay** is ahead
   (lower) and your catalogue is stale until you run Module B again.
 * A listing was edited directly on eBay.
@@ -1556,9 +1465,9 @@ figures. A mismatch usually means one of:
 Both figures are included in the Master Catalog CSV export, and both columns
 are sortable, so you can bring the largest discrepancies to the top.
 
-Note that the two counts are *expected* to differ right after a batch and to
-converge after an Active Listings sync. The column is a reconciliation aid, not
-an error indicator.
+Note that the two counts are *expected* to differ right after an ingest, and
+to converge once the draft is pushed or an Active Listings sync runs. The
+column is a reconciliation aid, not an error indicator.
 
 ### Cards vs copies
 
@@ -1597,24 +1506,22 @@ This is enforced, not merely conventional:
 | Figure | Only changed by |
 |---|---|
 | `On Hand` / `Copies On Hand` | **Module A** (your SortSwift dump) and the manual quantity dialog |
-| `On eBay` / `Copies on eBay` | **Module B** (an eBay Active Listings sync) |
+| `On eBay` / `Copies on eBay` | **Module B** (an Active Listings sync), or a **confirmed push** |
 
-Module A does **not** touch the eBay figures. Generating a Revise CSV is not
-evidence that eBay was updated — you still have to upload the file. Instead
-Module A records what it asked for in `ebay_variations.pending_qty`, and the
-table shows it as an amber **`→N`** beside the eBay figure:
+Module A does **not** touch the eBay figures. Staging a draft is not evidence
+that eBay was updated, and the gap between the two columns *is* the draft.
+Only two things move the eBay figure, and both are observations rather than
+intentions: a sync reporting what eBay holds, and a push that eBay confirmed.
 
-```
-Ledyba     On Hand=5   On eBay=3  →5 pending
-```
+Earlier versions had a third state — an amber `→N` showing what a generated
+Revise file had asked eBay for, recorded in `ebay_variations.pending_qty`. It
+existed because a file might sit in the Downloads folder for a week, so
+"asked" and "applied" were genuinely different things. The API push confirms
+in the same call, so that gap is gone and so is the column.
 
-Read as: *you hold 5, eBay is still selling 3, and the file you just generated
-asks eBay for 5.* Upload it, run a Module B sync, and the arrow disappears as
-`On eBay` becomes 5.
-
-Before this, Module A wrote the eBay figures itself the moment a CSV was
-generated. That made the dashboard claim eBay had been updated when it had not,
-and it hid the very drift these two columns exist to reveal.
+Before *that*, Module A wrote the eBay figures itself the moment a CSV was
+generated. That made the dashboard claim eBay had been updated when it had
+not, and it hid the very drift these two columns exist to reveal.
 
 Module B reconciles in the other direction: a card that is linked to a listing
 but **absent** from the report is no longer live on eBay, so its figure drops to

@@ -1166,7 +1166,7 @@ function syncBatchModeLabels() {
     const note = document.getElementById("batchModeNote");
     if (note) {
         note.innerText = isSet
-            ? "Cards live on eBay but missing from a full dump are revised down to 0."
+            ? "Cards live on eBay but missing from a full dump are treated as sold out and set to 0."
             : "Only use this for a file containing nothing you have already processed.";
     }
 }
@@ -3433,7 +3433,7 @@ function setPushBanner(title, detail) {
 // already pushed are skipped, so pressing it twice cannot duplicate a listing.
 async function pushPlan(planId, button, groupKey) {
     const what = groupKey ? `the "${groupKey}" listing from plan ${planId}` : `all of plan ${planId}`;
-    if (!confirm(`Push ${what} to eBay now? This creates and updates live listings immediately — there is no draft on eBay's side. Cards already pushed are skipped, and listings made through File Exchange are left for the CSV files.`)) {
+    if (!confirm(`Push ${what} to eBay now? This creates and updates live listings immediately — there is no draft on eBay's side. Cards already pushed are skipped.`)) {
         return;
     }
     if (button) { button.disabled = true; button.textContent = "Pushing…"; }
