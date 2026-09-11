@@ -121,6 +121,12 @@ try:
         download_active_inventory_report,
         report_outline,
     )
+    from ebay_client.account import (
+        create_inventory_location,
+        get_inventory_locations,
+        get_policies,
+        suggest_policy_ids,
+    )
     from app.ebay_push import InventoryApiAdapter
 
     EBAY_CLIENT_AVAILABLE = True
@@ -1782,6 +1788,127 @@ def ebay_disconnect(admin: Dict[str, Any] = Depends(require_admin_user)):
         user_db.save_ebay_token(None)
     print(f"[ebay] account disconnected by user {admin['id']}", flush=True)
     return {"success": True, "connected": False}
+
+
+@app.get("/api/ebay/account-setup")
+async def ebay_account_setup(admin: Dict[str, Any] = Depends(require_admin_user)):
+    """
+    The ids a push needs, read from the seller's own eBay account.
+
+    Business policy ids appear nowhere in Seller Hub -- the API is the only
+    way to learn them -- and the Inventory API addresses policies by id while
+    File Exchange addressed them by name. So the dashboard asks eBay, matches
+    the names already configured for the CSV path, and lets the answer be
+    confirmed rather than hunted for.
+
+    Also reports whether an inventory location exists. An account that has
+    only ever listed through File Exchange has none, and eBay will not publish
+    an offer without one, so an empty list here is the normal state and a
+    thing to fix rather than a fault.
+    """
+    client = get_ebay_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503, detail="eBay is not configured."
+        )
+    if not client.oauth.is_connected():
+        raise HTTPException(
+            status_code=409,
+            detail="Connect the eBay account first: this reads its policies.",
+        )
+
+    settings = db.get_listing_settings(user_id=admin["id"])
+    marketplace_id = str(settings.get("marketplace_id") or "EBAY_US")
+
+    def run():
+        policies = get_policies(client.seller, marketplace_id)
+        return policies, get_inventory_locations(client.seller)
+
+    try:
+        policies, locations = await run_in_threadpool(run)
+    except EbayError as exc:
+        raise HTTPException(status_code=502, detail=f"eBay refused: {exc}")
+
+    return {
+        "marketplace_id": marketplace_id,
+        "policies": policies,
+        "locations": locations,
+        # What the CSV path has been using, so the names can be shown beside
+        # the matches and checked by eye.
+        "configured_names": {
+            "fulfillment": settings.get("shipping_profile_name") or "",
+            "return": settings.get("return_profile_name") or "",
+            "payment": settings.get("payment_profile_name") or "",
+        },
+        "suggested": suggest_policy_ids(
+            policies,
+            shipping_name=settings.get("shipping_profile_name") or "",
+            return_name=settings.get("return_profile_name") or "",
+            payment_name=settings.get("payment_profile_name") or "",
+        ),
+        "current": {
+            "shipping_policy_id": settings.get("shipping_policy_id") or "",
+            "return_policy_id": settings.get("return_policy_id") or "",
+            "payment_policy_id": settings.get("payment_policy_id") or "",
+            "merchant_location_key": settings.get("merchant_location_key") or "",
+        },
+        "postal_code": settings.get("seller_postal_code") or "",
+    }
+
+
+class InventoryLocationRequest(BaseModel):
+    merchant_location_key: str = "home"
+    name: str = "Home"
+    postal_code: str = ""
+
+
+@app.post("/api/ebay/inventory-location")
+async def ebay_create_inventory_location(
+    req: InventoryLocationRequest,
+    admin: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Create the inventory location eBay requires before publishing an offer.
+
+    A warehouse location needs only a name and a postal code and country --
+    no street address -- which is the right shape for shipping from home
+    without publishing an address. The key is permanent once set, so it is
+    validated before the call rather than after.
+    """
+    client = get_ebay_client()
+    if client is None or not client.oauth.is_connected():
+        raise HTTPException(
+            status_code=409, detail="Connect the eBay account first."
+        )
+
+    settings = db.get_listing_settings(user_id=admin["id"])
+    postal = (req.postal_code or settings.get("seller_postal_code") or "").strip()
+    if not postal:
+        raise HTTPException(
+            status_code=400,
+            detail="A postal code is required. Set one in Listing Rules.",
+        )
+
+    def run():
+        return create_inventory_location(
+            client.seller, req.merchant_location_key,
+            name=req.name, postal_code=postal,
+        )
+
+    try:
+        key = await run_in_threadpool(run)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except EbayError as exc:
+        raise HTTPException(status_code=502, detail=f"eBay refused: {exc}")
+
+    # Recorded immediately: the key cannot be changed on eBay's side, so
+    # losing track of it would mean a location nothing can reference.
+    db.set_listing_settings(
+        {"merchant_location_key": key}, user_id=admin["id"]
+    )
+    print(f"[ebay] inventory location {key} created", flush=True)
+    return {"success": True, "merchant_location_key": key}
 
 
 # -------------------------------------------------------------------

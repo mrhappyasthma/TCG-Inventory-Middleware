@@ -15,6 +15,12 @@ manifest IDs, pricing rules or SortSwift, and translation between the two
 happens in the layer above so neither model leaks into the other.
 """
 
+from .account import (
+    create_inventory_location,
+    get_inventory_locations,
+    get_policies,
+    suggest_policy_ids,
+)
 from .client import EbayClient
 from .feed import (
     ACTIVE_INVENTORY_REPORT,
@@ -71,6 +77,10 @@ from .transport import Transport
 __all__ = [
     "EbayClient",
     "EbayConfig",
+    "get_policies",
+    "get_inventory_locations",
+    "create_inventory_location",
+    "suggest_policy_ids",
     "ACTIVE_INVENTORY_REPORT",
     "FeedError",
     "download_active_inventory_report",

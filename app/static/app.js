@@ -2009,6 +2009,7 @@ async function refreshEbayStatus() {
             connect.innerText = "Reconnect";
             disconnect.classList.remove("hidden");
             document.getElementById("ebaySyncGroup")?.classList.remove("hidden");
+            document.getElementById("ebayPushSetupGroup")?.classList.remove("hidden");
         } else {
             box.innerHTML = `
                 <p class="text-slate-300 font-semibold">Not connected</p>
@@ -2018,6 +2019,7 @@ async function refreshEbayStatus() {
             connect.innerText = "Connect eBay account";
             disconnect.classList.add("hidden");
             document.getElementById("ebaySyncGroup")?.classList.add("hidden");
+            document.getElementById("ebayPushSetupGroup")?.classList.add("hidden");
         }
     } catch (err) {
         box.innerHTML = `<p class="text-rose-400">${escapeHtml(err.message)}</p>`;
@@ -3055,6 +3057,128 @@ async function loadPlanFiles(planId) {
             </div>`;
     } catch (err) {
         box.innerHTML = `<p class="text-[11px] text-rose-400">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+// -------------------------------------------------------------------
+// Direct API push setup: policy ids and an inventory location
+// -------------------------------------------------------------------
+//
+// Business policy ids are not visible anywhere in Seller Hub, so the only way
+// to learn them is to ask eBay. The names already configured for the CSV path
+// are matched to the answer, which turns this from "find three ids" into
+// "confirm these three". A select is pre-selected on that match, never saved
+// on it: listing against the wrong shipping policy costs real money.
+
+let ebayPushSetup = null;
+
+async function loadEbayPushSetup() {
+    const box = document.getElementById("ebayPushSetupBox");
+    const button = document.getElementById("btnEbayLoadSetup");
+    if (!box) return;
+    box.classList.remove("hidden");
+    box.innerHTML = `<p class="text-slate-500">Asking eBay&hellip;</p>`;
+    if (button) button.disabled = true;
+    try {
+        const res = await fetch("/api/ebay/account-setup");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not read the account");
+        ebayPushSetup = data;
+        renderEbayPushSetup(data);
+    } catch (err) {
+        box.innerHTML = `<p class="text-rose-400">${escapeHtml(err.message)}</p>`;
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+function policySelect(id, entries, selected, configuredName) {
+    const options = [`<option value="">&mdash; not set &mdash;</option>`]
+        .concat((entries || []).map(entry =>
+            `<option value="${escapeHtml(entry.id)}"${entry.id === selected ? " selected" : ""}>${escapeHtml(entry.name || entry.id)} (${escapeHtml(entry.id)})</option>`));
+    const hint = configuredName
+        ? `<span class="text-slate-500">CSV files use &ldquo;${escapeHtml(configuredName)}&rdquo;</span>`
+        : "";
+    return `<select id="${id}" class="w-full mt-1 bg-dark-900 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200">${options.join("")}</select>${hint}`;
+}
+
+function renderEbayPushSetup(data) {
+    const box = document.getElementById("ebayPushSetupBox");
+    if (!box) return;
+    const current = data.current || {};
+    const suggested = data.suggested || {};
+    const names = data.configured_names || {};
+    const pick = (kind, key) => current[key] || suggested[kind] || "";
+
+    const locations = data.locations || [];
+    const locationBlock = locations.length
+        ? `<label class="block">Inventory location
+               <select id="ebayLocationSelect" class="w-full mt-1 bg-dark-900 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200">
+                   ${locations.map(loc => `<option value="${escapeHtml(loc.key)}"${loc.key === current.merchant_location_key ? " selected" : ""}>${escapeHtml(loc.name || loc.key)} &middot; ${escapeHtml(loc.postal_code)} (${escapeHtml(loc.key)})</option>`).join("")}
+               </select>
+           </label>`
+        : `<div class="rounded-lg border border-amber-800/60 bg-amber-950/30 p-2">
+               <p class="text-amber-300">No inventory location on this account.</p>
+               <p class="text-amber-200/80 mt-1">eBay will not publish an offer without one. A warehouse location needs only a postal code &mdash; no street address.</p>
+               <button type="button" onclick="createEbayInventoryLocation()" class="mt-2 text-[11px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200">
+                   Create one from ${escapeHtml(data.postal_code || "the postal code in Listing Rules")}
+               </button>
+           </div>`;
+
+    box.innerHTML = `
+        <p class="text-slate-400">Marketplace <span class="font-mono">${escapeHtml(data.marketplace_id || "")}</span></p>
+        <label class="block">Shipping policy
+            ${policySelect("ebayShippingPolicy", data.policies.fulfillment, pick("fulfillment", "shipping_policy_id"), names.fulfillment)}
+        </label>
+        <label class="block">Return policy
+            ${policySelect("ebayReturnPolicy", data.policies.return, pick("return", "return_policy_id"), names.return)}
+        </label>
+        <label class="block">Payment policy
+            ${policySelect("ebayPaymentPolicy", data.policies.payment, pick("payment", "payment_policy_id"), names.payment)}
+        </label>
+        ${locationBlock}
+        <button type="button" onclick="saveEbayPushSetup()" class="mt-2 text-[11px] font-bold px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 border border-brand-500 text-white transition-all">
+            Save for pushing
+        </button>`;
+}
+
+async function createEbayInventoryLocation() {
+    try {
+        const res = await fetch("/api/ebay/inventory-location", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ merchant_location_key: "home", name: "Home" }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not create the location");
+        logToTerminal("SUCCESS", `eBay inventory location "${data.merchant_location_key}" created`);
+        await loadEbayPushSetup();
+    } catch (err) {
+        logToTerminal("ERROR", `Location failed: ${err.message}`);
+    }
+}
+
+async function saveEbayPushSetup() {
+    const value = id => document.getElementById(id)?.value || "";
+    const settings = {
+        shipping_policy_id: value("ebayShippingPolicy"),
+        return_policy_id: value("ebayReturnPolicy"),
+        payment_policy_id: value("ebayPaymentPolicy"),
+    };
+    const location = document.getElementById("ebayLocationSelect");
+    if (location) settings.merchant_location_key = location.value;
+    try {
+        const res = await fetch("/api/listing-settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ settings }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not save");
+        logToTerminal("SUCCESS", "eBay push settings saved");
+        if (typeof loadListingSettings === "function") loadListingSettings();
+    } catch (err) {
+        logToTerminal("ERROR", `Save failed: ${err.message}`);
     }
 }
 
