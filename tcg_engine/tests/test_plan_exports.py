@@ -108,6 +108,59 @@ class PlanExportTests(unittest.TestCase):
         # revise yet -- which is exactly why it had to travel in the Add file.
         self.assertEqual(self.db.get_plan_cover_revisions(plan_id), [])
 
+    def test_a_card_already_pushed_is_left_out_of_both_files(self):
+        """
+        The files must not offer to do what the API has already done.
+
+        A pushed card is live. Left in the Add file, uploading that file
+        creates the listing a second time; left in the Revise file, it revises
+        something File Exchange cannot reach. Both are silent, and one of them
+        is expensive.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+
+        items = self.db.get_plan_items(plan_id)
+        self.db.update_plan_item(items[0]["id"], status="pushed")
+
+        built, rows = self.add_rows(plan_id)
+        self.assertEqual(built["pushed_count"], 1)
+        self.assertEqual(built["add_card_count"], 1)
+        children = [r for r in rows if r["Relationship"] == "Variation"]
+        self.assertEqual([r["CustomLabel"] for r in children], ["ID1002"])
+
+    def test_a_revise_row_is_not_offered_for_an_api_managed_listing(self):
+        # It would upload cleanly and do nothing, which looks like success.
+        self.add_card("ID1001", "Charizard", "004/102", price=1.99)
+        self.db.upsert_variation("ID1001", "227516488809", 2,
+                                 custom_label="ID1001", last_known_price=1.99)
+        self.db.upsert_managed_listing(
+            "Base Set|Near Mint", ebay_parent_id="227516488809"
+        )
+        # A price move puts the card in a plan as an update.
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE manifest SET price = 2.49 WHERE manifest_id = ?",
+                         ("ID1001",))
+            conn.commit()
+
+        built, _ = self.add_rows(self.approved_plan())
+        self.assertEqual(built["revise_count"], 0)
+        self.assertEqual(built["api_managed_count"], 1)
+
+    def test_a_revise_row_is_still_offered_for_a_csv_listing(self):
+        self.add_card("ID1001", "Charizard", "004/102", price=1.99)
+        self.db.upsert_variation("ID1001", "227511361186", 2,
+                                 custom_label="ID1001", last_known_price=1.99)
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE manifest SET price = 2.49 WHERE manifest_id = ?",
+                         ("ID1001",))
+            conn.commit()
+
+        built, _ = self.add_rows(self.approved_plan())
+        self.assertEqual(built["revise_count"], 1)
+        self.assertEqual(built["api_managed_count"], 0)
+
     def test_without_a_staged_cover_the_first_card_is_used(self):
         self.add_card("ID1001", "Charizard", "004/102")
         built, rows = self.add_rows(self.approved_plan())

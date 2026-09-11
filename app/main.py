@@ -2358,6 +2358,10 @@ def get_plan_file_summary(
         # revised onto anything, so it rides in the Add file instead. Reported
         # separately because otherwise it looks like the choice was dropped.
         "add_cover_count": built["add_cover_count"],
+        # Changes these files deliberately do not carry, so the page can say
+        # where they go instead: through Push, not through Seller Hub.
+        "pushed_count": built["pushed_count"],
+        "api_managed_count": built["api_managed_count"],
         # One row per listing, so the page can offer a single listing to be
         # pushed rather than only all of them. "managed" is the distinction
         # that decides whether the API can touch it at all: a listing made

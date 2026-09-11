@@ -47,6 +47,7 @@ from .plans import (
     ACTION_ZERO_OUT,
     PLAN_DRAFT,
     STATUS_EXCLUDED,
+    STATUS_PUSHED,
     PlanError,
     is_single,
 )
@@ -206,10 +207,18 @@ def build_plan_exports(
     common_add_fields.update(active_policies)
     default_game = (settings.get("default_game") or "").strip()
 
+    all_items = db.get_plan_items(plan_id)
+
+    # A card already pushed through the API is live. Leaving it in the Add
+    # file means uploading that file creates the listing a *second* time, and
+    # leaving it in the Revise file means revising something the file cannot
+    # reach. Both are silent, and one of them is expensive.
+    pushed_count = sum(1 for item in all_items if item["status"] == STATUS_PUSHED)
+
     items = [
         item
-        for item in db.get_plan_items(plan_id)
-        if item["status"] != STATUS_EXCLUDED
+        for item in all_items
+        if item["status"] not in (STATUS_EXCLUDED, STATUS_PUSHED)
     ]
 
     # Covers staged per listing on the drafts page. For a listing that already
@@ -225,6 +234,7 @@ def build_plan_exports(
     staged_variations: Dict[tuple, List[Dict[str, Any]]] = {}
     staged_singles: List[Dict[str, Any]] = []
     revise_rows: List[Dict[str, str]] = []
+    api_managed_rows = 0
     unlistable: List[Dict[str, str]] = []
     item_specific_outputs = {GAME_ITEM_SPECIFIC}
 
@@ -246,6 +256,14 @@ def build_plan_exports(
                     ),
                 })
                 continue
+            # File Exchange cannot revise a listing the Inventory API
+            # manages. A row for one of those would upload cleanly and do
+            # nothing at all, which is worse than being absent: it looks like
+            # the change was applied.
+            if db.get_managed_listing_by_parent(parent) is not None:
+                api_managed_rows += 1
+                continue
+
             quantity = int(item.get("proposed_qty") or 0)
             price = item.get("proposed_price")
             revise_rows.append({
@@ -316,6 +334,10 @@ def build_plan_exports(
         "add_card_count": sum(len(c) for c in staged_variations.values())
         + len(staged_singles),
         "revise_count": len(revise_rows),
+        # Changes this file deliberately does not carry, so the page can say
+        # where they do go instead of leaving them looking lost.
+        "pushed_count": pushed_count,
+        "api_managed_count": api_managed_rows,
         # Covers that travelled in the Add file rather than in the cover-photo
         # Revise file, so the page can say where a staged cover went instead of
         # leaving it looking dropped.

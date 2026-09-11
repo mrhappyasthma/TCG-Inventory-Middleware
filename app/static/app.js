@@ -3158,6 +3158,18 @@ async function loadPlanFiles(planId) {
                    </li>`).join("")}</ul>`
             : "";
 
+        // Changes these files cannot carry. A card already pushed is live, and
+        // File Exchange cannot revise a listing the Inventory API manages --
+        // so a row for either would upload cleanly and do nothing, or worse,
+        // create a second listing. Said plainly rather than silently omitted.
+        const elsewhere = [];
+        if (data.pushed_count) {
+            elsewhere.push(`${data.pushed_count} card(s) in this plan are already live through the eBay API, so they are not in these files.`);
+        }
+        if (data.api_managed_count) {
+            elsewhere.push(`${data.api_managed_count} change(s) belong to listings this app created through the API. Use Push, not Seller Hub — File Exchange cannot revise those listings.`);
+        }
+
         // Named individually because they are uploaded separately, and an Add
         // creates live listings while a Revise only changes existing ones.
         // Conflating them is how a quantity correction becomes 400 listings.
@@ -3171,6 +3183,7 @@ async function loadPlanFiles(planId) {
                        <ul class="ml-4 list-disc text-amber-200/80">${data.unlistable.slice(0, 5).map(u =>
                            `<li><span class="font-mono">${escapeHtml(u.manifest_id)}</span> ${escapeHtml(u.reason)}</li>`).join("")}</ul>`
                     : ""}
+                ${elsewhere.map(note => `<p class="text-sky-300/90">${escapeHtml(note)}</p>`).join("")}
                 ${listingRows}
                 ${data.add_card_count
                     ? `<p class="text-slate-500 pt-1">An Add file creates live listings. Upload a small slice first &mdash; a variation parent row plus its children &mdash; and check the result in Seller Hub before committing the rest.</p>`
