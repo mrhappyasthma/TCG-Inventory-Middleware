@@ -364,10 +364,20 @@ The drafts page therefore arrives at step 4, before any write risk exists.
 
 ## 10. Open questions
 
-* **How to write to the existing File Exchange listings** (§3a) — the biggest
-  one, since the Inventory API cannot touch them without migration. Leaning
-  toward the Feed API's `LMS_REVISE_INVENTORY_STATUS` for quantity and price,
-  with the Inventory API for new listings only.
+* ~~**How to write to the existing File Exchange listings**~~ (§3a) — settled
+  as **option 1, migration**, once the Inventory API path had proved itself on
+  real listings it created itself. What changed the answer was that the second
+  path stopped being free: dual-path safety has to be expressed in the CSV
+  builders, the drafts page, the cover dialog and now the repricer, and every
+  one of those is a place to get it wrong silently. `LMS_REVISE_INVENTORY_
+  STATUS` would have kept two write paths alive indefinitely on listings that
+  are a shrinking minority.
+
+  Migration runs from `scripts/migrate_csv_listings.py`, deliberately outside
+  the web app: it is irreversible, it runs once, and nothing in the dashboard
+  should be able to trigger it. One listing per call rather than eBay's
+  permitted five, recording the returned offer ids immediately and verifying
+  the listing is still published before touching the next.
 * ~~**The Feed report's exact column names**~~ — settled. It is XML with
   nested variations; see §3a and `AGENTS.md`. `/api/ebay/sync` returns the
   headers it saw and, when nothing matched, an element outline carrying no

@@ -260,5 +260,53 @@ class BulkOutcomeTests(unittest.TestCase):
         self.assertEqual(opener.calls, [])
 
 
+class MigrateTests(unittest.TestCase):
+    """
+    The one irreversible call here, so the shape of the request matters more
+    than usual: there is no second attempt to get it right in.
+    """
+
+    def test_listing_ids_are_wrapped_as_requests(self):
+        transport, opener = transport_with(ok({"responses": [
+            {"listingId": "227511361186", "statusCode": 200,
+             "inventoryItemGroupKey": "chilling-reign-nm",
+             "inventoryItems": [
+                 {"sku": "ID1050-C-1",
+                  "offers": [{"offerId": "9001", "marketplaceId": "EBAY_US"}]},
+             ]},
+        ]}))
+        rows = inventory.bulk_migrate_listing(transport, ["227511361186"])
+
+        self.assertEqual(opener.calls[0]["method"], "POST")
+        self.assertTrue(
+            opener.calls[0]["url"].endswith("/sell/inventory/v1/bulk_migrate_listing")
+        )
+        self.assertEqual(opener.calls[0]["body"],
+                         {"requests": [{"listingId": "227511361186"}]})
+        self.assertEqual(rows[0]["inventoryItems"][0]["offers"][0]["offerId"],
+                         "9001")
+
+    def test_the_limit_is_five_not_twenty_five(self):
+        transport, opener = transport_with()
+        with self.assertRaises(ValueError):
+            inventory.bulk_migrate_listing(transport, ["1", "2", "3", "4", "5", "6"])
+        self.assertEqual(opener.calls, [])
+
+    def test_a_per_listing_failure_inside_a_200_is_a_failure(self):
+        # Same trap as every other bulk call, and here it is a failure that
+        # cannot be retried blindly: the listing may have migrated anyway.
+        rows = inventory.bulk_statuses({"responses": [
+            {"listingId": "227511361186", "statusCode": 400,
+             "errors": [{"message": "Listing is not a fixed price listing."}]},
+        ]})
+        self.assertTrue(inventory.status_failed(rows[0]))
+        self.assertIn("fixed price", inventory.describe_failure(rows[0]))
+
+    def test_an_empty_request_makes_no_call(self):
+        transport, opener = transport_with()
+        self.assertEqual(inventory.bulk_migrate_listing(transport, []), [])
+        self.assertEqual(opener.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

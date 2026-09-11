@@ -658,6 +658,55 @@ When you export your SortSwift inventory, SortSwift includes your internal notes
 
 ---
 
+## 🚚 Migrating a File Exchange listing onto the API
+
+The store began on File Exchange, and **the Inventory API cannot see those
+listings at all** — `getOffers` returns nothing for their SKUs, so pushes,
+Refresh and automatic repricing cannot reach them. `bulkMigrateListing`
+converts one: it creates the inventory items, offers and inventory item group
+behind a listing that already exists, **keeping the same eBay item id, its
+watchers and its search standing**.
+
+It lives in a script, not the dashboard:
+
+```bash
+python scripts/migrate_csv_listings.py                   # preflight, sends nothing
+python scripts/migrate_csv_listings.py --migrate 227511361186
+python scripts/migrate_csv_listings.py --migrate all
+```
+
+On the NAS, run it where the app's environment already exists:
+
+```bash
+docker exec -it tcg-middleware python scripts/migrate_csv_listings.py
+```
+
+**It cannot be undone.** After a listing migrates, File Exchange and the
+Trading API can no longer revise it — every future change goes through this
+application's API path. That is the point, and it is also the whole risk:
+migrate one listing, check it on eBay, then do the next.
+
+What the script does that a bare API call would not:
+
+* **Preflights first.** Every variation must have a unique, non-blank SKU that
+  our own mirror knows. eBay requires the uniqueness; we require the match,
+  because a migration landing with SKUs we cannot map leaves offers we cannot
+  address.
+* **One listing per call**, though eBay permits five. Per-listing outcomes
+  arrive inside a 200, so a batch of five can be four successes and one
+  failure — and unpicking that after an irreversible operation is not worth a
+  saved round trip.
+* **Records the new offer ids immediately.** They exist nowhere else, and
+  until they are stored the repricer cannot see the listing it just gained.
+* **Records the existing gallery image as the cover.** A Refresh writes the
+  inventory item group as a full replace, so an unrecorded cover is one that
+  the first later repair silently replaces with the first card's photo. That
+  has already happened once.
+* **Verifies the listing is still published** under the same item id before
+  touching another. There is an unresolved report of migrating listings that
+  share an inventory item group key unpublishing all but the first; nothing
+  here shares one, but the check costs a single call.
+
 ## 📌 Revising a variation listing
 
 Confirmed against a live listing, because the failure mode is unobvious.
