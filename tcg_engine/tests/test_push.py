@@ -407,6 +407,64 @@ class ZeroOutTests(PushTestCase):
         self.assertEqual(request[1], ["ID1001"])
 
 
+class ScopedPushTests(PushTestCase):
+    def test_one_listing_can_be_pushed_without_the_others(self):
+        """
+        What makes a first push testable.
+
+        A create cannot be undone by pressing the button again, so the sane
+        way to begin is one small listing, checked in Seller Hub, before
+        several hundred cards go live in a single call. The rest of the plan
+        must be left exactly as it was -- still approved, still pushable.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        # A second listing, in a different set.
+        self.db.insert_manifest("ID2001", "Pikachu", "Jungle", "Near Mint",
+                                "Holofoil", card_number="060/064")
+        self.db.set_manifest_quantity("ID2001", 1)
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE manifest SET price = 1.99 WHERE manifest_id = ?",
+                         ("ID2001",))
+            conn.commit()
+        self.db.set_manifest_ebay_fields("ID2001", {
+            "item_specifics": {"C:Graded": "No"},
+        })
+
+        plan_id = self.approved_plan()
+        api = FakeEbay()
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE,
+                           group_keys=["Jungle|Near Mint"])
+
+        self.assertEqual(result["pushed"], 1)
+        self.assertEqual(result["listings_created"], 1)
+        # Only the requested listing was touched.
+        self.assertEqual(
+            [key for _, key in api.calls if key == "Base Set|Near Mint"], []
+        )
+        self.assertIsNone(self.db.get_managed_listing("Base Set|Near Mint"))
+        # The rest of the plan is untouched and still pushable, and the plan
+        # reads as partial rather than finished.
+        items = self.items_by_sku(plan_id)
+        self.assertEqual(items["ID1001"]["status"], "pending")
+        self.assertEqual(self.db.get_plan(plan_id)["status"], "partial")
+
+        # Pushing the remainder finishes it.
+        rest = push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE,
+                         group_keys=["Base Set|Near Mint"])
+        self.assertEqual(rest["pushed"], 2)
+        self.assertEqual(self.db.get_plan(plan_id)["status"], "pushed")
+
+    def test_an_unknown_listing_is_refused_rather_than_pushing_nothing(self):
+        # Silently pushing nothing would look like success and leave the user
+        # believing a listing went live.
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = self.approved_plan()
+        with self.assertRaises(PushError):
+            push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE,
+                      group_keys=["No Such Set|NM"])
+
+
 class GroupKeyTests(unittest.TestCase):
     def test_the_ebay_group_key_is_stable_and_path_safe(self):
         # Rebuilding a draft must map to the same eBay group, or a push would

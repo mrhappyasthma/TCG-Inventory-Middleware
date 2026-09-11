@@ -2262,6 +2262,23 @@ def get_plan_file_summary(
         # revised onto anything, so it rides in the Add file instead. Reported
         # separately because otherwise it looks like the choice was dropped.
         "add_cover_count": built["add_cover_count"],
+        # One row per listing, so the page can offer a single listing to be
+        # pushed rather than only all of them. "managed" is the distinction
+        # that decides whether the API can touch it at all: a listing made
+        # through File Exchange is invisible to the Inventory API and a push
+        # would duplicate it rather than update it.
+        "groups": [
+            {
+                "group_key": group["group_key"],
+                "set_name": group.get("set_name") or "",
+                "condition": group.get("condition") or "",
+                "item_count": group.get("item_count") or 0,
+                "excluded_count": group.get("excluded_count") or 0,
+                "ebay_parent_id": group.get("ebay_parent_id") or "",
+                "managed": db.get_managed_listing(group["group_key"]) is not None,
+            }
+            for group in db.get_plan_groups(plan_id)
+        ],
     }
 
 
@@ -2387,9 +2404,25 @@ def approve_plan_endpoint(
     return {"success": True, **result}
 
 
+class PlanPushRequest(BaseModel):
+    """
+    Which of a plan's listings to push.
+
+    ``group_key`` restricts the push to one listing, which is what makes a
+    first push testable: a create cannot be undone by pressing the button
+    again, so one small listing goes up and is checked in Seller Hub before
+    several hundred cards go live in a single call. Omitted means the whole
+    plan.
+    """
+
+    group_key: Optional[str] = None
+
+
 @app.post("/api/plans/{plan_id}/push")
 async def push_plan_endpoint(
-    plan_id: int, user: Dict[str, Any] = Depends(require_active_user)
+    plan_id: int,
+    req: Optional[PlanPushRequest] = None,
+    user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
     Apply an approved plan to eBay.
@@ -2431,9 +2464,16 @@ async def push_plan_endpoint(
 
     adapter = InventoryApiAdapter(client)
 
+    group_keys = None
+    if req is not None and req.group_key is not None:
+        group_keys = [req.group_key]
+
     def run():
         with db.session():
-            return push_plan(db, adapter, plan_id, user_id=user["id"])
+            return push_plan(
+                db, adapter, plan_id, user_id=user["id"],
+                group_keys=group_keys,
+            )
 
     try:
         result = await run_in_threadpool(run)

@@ -32,7 +32,7 @@ quantity eBay reports is only written when eBay has confirmed it.
 
 import json
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .batches import (
     build_variation_option_name,
@@ -346,6 +346,7 @@ def push_plan(
     plan_id: int,
     user_id: Optional[int] = None,
     log: Optional[Callable[[str, str], None]] = None,
+    group_keys: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """
     Apply an approved plan to eBay, one listing at a time.
@@ -355,6 +356,12 @@ def push_plan(
     continue. A plan can hold hundreds of cards across several listings, and
     abandoning all of them over one bad aspect value would make the drafts
     page useless.
+
+    ``group_keys`` restricts the push to those listings, leaving the rest of
+    the plan exactly as it was -- still approved, still pushable later. That
+    is what makes a first push testable: a create cannot be undone by pressing
+    the button again, so the sane way to begin is one small listing, checked in
+    Seller Hub, before several hundred cards go live in one call.
     """
     plan = db.get_plan(plan_id)
     if plan is None:
@@ -395,6 +402,15 @@ def push_plan(
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for item in items:
         groups.setdefault(item.get("group_key") or "", []).append(item)
+
+    if group_keys is not None:
+        wanted = {str(key) for key in group_keys}
+        unknown = wanted - set(groups)
+        if unknown:
+            raise PushError(
+                "this plan has no listing(s) called: " + ", ".join(sorted(unknown))
+            )
+        groups = {key: value for key, value in groups.items() if key in wanted}
 
     counts = {"pushed": 0, "failed": 0, "deferred": 0}
     listings_created = 0
@@ -438,10 +454,17 @@ def push_plan(
                     _mark(db, item, STATUS_FAILED, counts, str(exc))
             record("ERROR", f"{group_key or 'ungrouped'}: {exc}")
 
-    # The plan's status reflects what happened, so a partial push looks
-    # partial rather than complete.
-    if counts["failed"] or counts["deferred"]:
-        db.set_plan_status(plan_id, PLAN_PARTIAL)
+    # The plan's status is read back off its items rather than inferred from
+    # this run's counters, because a push restricted to one listing leaves the
+    # rest of the plan outstanding. Calling that "pushed" would hide the work
+    # still to do behind a word that means finished.
+    remaining = [
+        row for row in db.get_plan_items(plan_id)
+        if row["status"] not in (STATUS_EXCLUDED, STATUS_PUSHED)
+    ]
+    if remaining:
+        if any(row["status"] == STATUS_PUSHED for row in db.get_plan_items(plan_id)):
+            db.set_plan_status(plan_id, PLAN_PARTIAL)
     elif counts["pushed"]:
         db.set_plan_status(plan_id, PLAN_PUSHED)
 

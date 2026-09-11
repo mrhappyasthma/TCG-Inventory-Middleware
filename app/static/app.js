@@ -3038,6 +3038,26 @@ async function loadPlanFiles(planId) {
                 <span class="text-slate-500">&mdash; ${data.cover_count} listing(s)</span>`);
         }
 
+        // One row per listing with its own Push button. A create cannot be
+        // undone by pressing the button again, so the only sane way to start
+        // is one small listing, checked in Seller Hub, before several hundred
+        // cards go live in a single call.
+        const pushable = (data.groups || []).filter(g => g.item_count > g.excluded_count);
+        const listingRows = pushable.length
+            ? `<p class="text-slate-400 pt-1 border-t border-slate-800 mt-1.5">Push one listing at a time:</p>
+               <ul class="space-y-1">${pushable.map(g => `
+                   <li class="flex items-center gap-2">
+                       <span class="text-slate-300 truncate">${escapeHtml(g.set_name || g.group_key)}${g.condition ? ` &middot; ${escapeHtml(g.condition)}` : ""}</span>
+                       <span class="text-slate-600">${g.item_count - g.excluded_count} card(s)</span>
+                       ${g.ebay_parent_id && !g.managed
+                           ? `<span class="ml-auto text-amber-400/80">CSV only</span>`
+                           : `<button type="button" onclick="pushPlan(${planId}, this, this.dataset.groupKey)" data-group-key="${escapeHtml(g.group_key)}"
+                                class="ml-auto text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-emerald-900/60 hover:bg-emerald-800 border border-emerald-800 text-emerald-200 transition-all">
+                                Push${g.managed ? "" : " (new)"}
+                              </button>`}
+                   </li>`).join("")}</ul>`
+            : "";
+
         // Named individually because they are uploaded separately, and an Add
         // creates live listings while a Revise only changes existing ones.
         // Conflating them is how a quantity correction becomes 400 listings.
@@ -3051,6 +3071,7 @@ async function loadPlanFiles(planId) {
                        <ul class="ml-4 list-disc text-amber-200/80">${data.unlistable.slice(0, 5).map(u =>
                            `<li><span class="font-mono">${escapeHtml(u.manifest_id)}</span> ${escapeHtml(u.reason)}</li>`).join("")}</ul>`
                     : ""}
+                ${listingRows}
                 ${data.add_card_count
                     ? `<p class="text-slate-500 pt-1">An Add file creates live listings. Upload a small slice first &mdash; a variation parent row plus its children &mdash; and check the result in Seller Hub before committing the rest.</p>`
                     : ""}
@@ -3186,20 +3207,26 @@ async function saveEbayPushSetup() {
 // confirm states what it will do in numbers rather than asking "are you
 // sure?". A partial push is offered again because it is resumable: cards
 // already pushed are skipped, so pressing it twice cannot duplicate a listing.
-async function pushPlan(planId, button) {
-    if (!confirm(`Push plan ${planId} to eBay now? This creates and updates live listings. Cards already pushed are skipped, and listings made through File Exchange are left for the CSV files.`)) {
+async function pushPlan(planId, button, groupKey) {
+    const what = groupKey ? `the "${groupKey}" listing from plan ${planId}` : `all of plan ${planId}`;
+    if (!confirm(`Push ${what} to eBay now? This creates and updates live listings immediately — there is no draft on eBay's side. Cards already pushed are skipped, and listings made through File Exchange are left for the CSV files.`)) {
         return;
     }
     if (button) { button.disabled = true; button.textContent = "Pushing…"; }
     logToTerminal("INFO", `Pushing plan ${planId} to eBay…`);
     try {
-        const res = await fetch(`/api/plans/${planId}/push`, { method: "POST" });
+        const res = await fetch(`/api/plans/${planId}/push`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(groupKey ? { group_key: groupKey } : {}),
+        });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "The push failed");
         (data.logs || []).forEach(entry =>
             logToTerminal(entry.level, entry.message));
         logToTerminal(data.failed ? "WARN" : "SUCCESS",
             `Push complete: ${data.pushed} card(s) pushed, ${data.failed} failed, ${data.deferred} left for CSV`);
+        expandPlanFilesFor = planId;
         await fetchDraftPlan();
         if (typeof fetchEbayListings === "function") fetchEbayListings();
     } catch (err) {
