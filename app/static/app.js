@@ -16,10 +16,11 @@ let currentSortBy = "manifest_id";
 let currentSortDir = "ASC";
 // Held so the "Force process anyway" button can resubmit the same upload.
 let pendingBatchFile = null;
+// Module C still produces a file: the SortSwift deduction import is read by
+// SortSwift, not by eBay. The eBay-bound Add and Revise files are gone --
+// every listing is managed through the eBay API now.
 let storedGeneratedCSVs = {
-    orders: null,
-    revise: null,
-    add: null
+    orders: null
 };
 
 // Initialize Application
@@ -81,9 +82,6 @@ async function initAuth() {
             fetchStats();
             fetchSetFilter();
             fetchInventory();
-            // The scheduled refresh runs with nobody watching, so the pill has
-            // to be computed on arrival rather than only after a manual run.
-            refreshRepriceIndicator();
             // Cheap: reads local configuration and the stored token, and calls
             // nothing at eBay. Done on arrival so Module B's card can point at
             // the automated path without the eBay panel being opened first.
@@ -325,7 +323,6 @@ async function loadPricingRules() {
         renderPricingRulesEditor();
         updateTestPricePreview();
         loadConditionMultipliers();
-        refreshRepriceIndicator();
         loadAutoReprice();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400">Failed to load rules: ${escapeHtml(err.message)}</td></tr>`;
@@ -563,8 +560,9 @@ async function refreshMarketPrices() {
             ? `Already current (${data.snapshot || "unknown snapshot"})`
             : `Updated ${data.updated} card(s) from ${data.groups_fetched} set(s)`;
 
-        // Recompute what a reprice would now produce.
-        await refreshRepriceIndicator();
+        // The nightly repricer will act on these prices; show what it
+        // would now do.
+        await loadAutoReprice();
     } catch (err) {
         // A failed fetch leaves every stored price untouched, so this is
         // informational rather than something to recover from.
@@ -574,49 +572,6 @@ async function refreshMarketPrices() {
         button.disabled = false;
         label.innerText = "Refresh now";
         icon.classList.remove("animate-spin");
-    }
-}
-
-// Asks how many listings a reprice would change, without generating a
-// download. Drives both the in-dialog preview and the header pill.
-async function refreshRepriceIndicator() {
-    try {
-        const res = await fetch("/api/pricing/reprice");
-        if (!res.ok) return;
-        const data = await res.json();
-
-        const pill = document.getElementById("repriceReady");
-        const pillText = document.getElementById("repriceReadyText");
-        if (pill && pillText) {
-            if (data.reprice_count > 0) {
-                pillText.innerText = `Reprice ${data.reprice_count}`;
-                pill.classList.remove("hidden");
-                pill.classList.add("flex");
-            } else {
-                pill.classList.add("hidden");
-                pill.classList.remove("flex");
-            }
-        }
-
-        const box = document.getElementById("repricePreview");
-        const text = document.getElementById("repricePreviewText");
-        const link = document.getElementById("repriceDownload");
-        if (box && text && link) {
-            const parts = [];
-            if (data.reprice_count > 0) parts.push(`${data.reprice_count} to update`);
-            if (data.unchanged_count > 0) parts.push(`${data.unchanged_count} already correct`);
-            if (data.missing_price_count > 0) parts.push(`${data.missing_price_count} with no market price`);
-            if (data.api_managed_count > 0) parts.push(`${data.api_managed_count} repriced automatically`);
-            text.innerText = data.reprice_count > 0
-                ? `Prices differ \u2014 ${parts.join(", ")}.`
-                : `Nothing to reprice \u2014 ${parts.join(", ") || "no live listings"}.`;
-            box.classList.remove("hidden");
-            link.classList.toggle("hidden", data.reprice_count === 0);
-        }
-    } catch (err) {
-        // The indicator is advisory; failing to compute it must not surface
-        // as an error the operator has to act on.
-        console.error("reprice indicator:", err);
     }
 }
 
@@ -748,7 +703,6 @@ async function runAutoReprice() {
             logToTerminal("WARN", `[REPRICE] Nothing applied: ${data.reason}`);
         }
         await loadAutoReprice();
-        await refreshRepriceIndicator();
         await fetchEbayListings();
     } catch (err) {
         logToTerminal("ERROR", `[REPRICE] ${err.message}`);
@@ -1104,16 +1058,10 @@ function setupDropzones() {
         }
     });
 
-    document.getElementById("btnDownloadRevise").addEventListener("click", () => {
-        if (storedGeneratedCSVs.revise) {
-            triggerBrowserDownload(storedGeneratedCSVs.revise, "ebay_inventory_updates.csv");
-        }
-    });
-
     document.getElementById("btnDownloadOnlyBatch").addEventListener("click", () => {
         if (!pendingBatchFile) return;
         document.getElementById("batchDuplicateWarning").classList.add("hidden");
-        logToTerminal("INFO", `[MODULE A] Rebuilding files for ${pendingBatchFile.name} - inventory will not change.`);
+        logToTerminal("INFO", `[MODULE A] Previewing ${pendingBatchFile.name} — nothing will be written.`);
         handleBatchUpload(pendingBatchFile, "dry-run");
     });
 
@@ -1124,11 +1072,6 @@ function setupDropzones() {
         handleBatchUpload(pendingBatchFile, "force");
     });
 
-    document.getElementById("btnDownloadAdd").addEventListener("click", () => {
-        if (storedGeneratedCSVs.add) {
-            triggerBrowserDownload(storedGeneratedCSVs.add, "ebay_new_additions.csv");
-        }
-    });
 }
 
 function bindDropzone(zoneId, inputId, labelId, uploadHandler) {
@@ -1358,53 +1301,35 @@ async function handleBatchUpload(file, mode = "normal") {
         pendingBatchFile = null;
         document.getElementById("batchDuplicateWarning").classList.add("hidden");
 
-        storedGeneratedCSVs.revise = data.revise_csv;
-        storedGeneratedCSVs.add = data.add_csv;
-
         const resultBox = document.getElementById("resultBoxBatch");
         resultBox.classList.remove("hidden");
 
-        const btnRev = document.getElementById("btnDownloadRevise");
-        const btnAdd = document.getElementById("btnDownloadAdd");
-
-        btnRev.style.display = data.revise_count > 0 ? "flex" : "none";
-        btnAdd.style.display = data.add_count > 0 ? "flex" : "none";
-
         const parts = [];
-        if (data.add_count > 0) parts.push(`${data.add_count} to add`);
-        if (data.revise_count > 0) parts.push(`${data.revise_count} to revise`);
+        if (data.parsed_rows > 0) parts.push(`${data.parsed_rows} card(s) read`);
+        if (data.new_catalog_count > 0) parts.push(`${data.new_catalog_count} new`);
         if (data.skipped_count > 0) parts.push(`${data.skipped_count} skipped`);
         // Worth calling out separately: these are cards being pulled from
-        // sale, not routine revisions.
+        // sale, not routine changes.
         if (data.zeroed_count > 0) parts.push(`${data.zeroed_count} sold out → 0`);
-        if (data.unchanged_count > 0) parts.push(`${data.unchanged_count} unchanged`);
-        const suffix = data.dry_run ? " (inventory unchanged)" : "";
-        // "Nothing to upload" on its own reads like a failure. When the
-        // reason is that everything already matches eBay, say so.
-        const nothingToSend = data.revise_count === 0 && data.add_count === 0;
+        const suffix = data.dry_run ? " (nothing written)" : "";
         // Every row unusable is a failure, not an empty result. Saying
-        // "nothing to upload" there reads like everything was already in
-        // order, which is the opposite of the truth.
+        // "nothing to do" there reads like everything was already in order,
+        // which is the opposite of the truth.
         const nothingParsed = data.parsed_rows === 0 && data.skipped_count > 0;
+        // The draft is staged by the server as part of the upload, so this
+        // is what the ingest produced rather than a promise of a file.
+        const planned = (data.plan && data.plan.item_count) || 0;
         document.getElementById("batchReadyText").innerText = nothingParsed
-            ? `No rows could be read \u2014 all ${data.skipped_count} were skipped. See the console for why.`
-            : nothingToSend
-            ? (data.unchanged_count > 0
-                ? `Nothing to upload \u2014 all ${data.unchanged_count} card(s) already match eBay${suffix}`
-                : `Nothing to upload${suffix}`)
-            : `Files ready \u2014 ${parts.join(", ")}${suffix}`;
+            ? `No rows could be read — all ${data.skipped_count} were skipped. See the console for why.`
+            : planned
+            ? `Catalogue updated — ${parts.join(", ")}. Draft staged with ${planned} change(s): review it on the Drafts tab.`
+            : `Catalogue updated — ${parts.join(", ")}${suffix}. Nothing for eBay to change.`;
 
         logToTerminal(
             "SUCCESS",
-            `[MODULE A] Files are ready${parts.length ? " (" + parts.join(", ") + ")" : ""}${suffix}. Click to download.`
+            `[MODULE A] Ingest complete${parts.length ? " (" + parts.join(", ") + ")" : ""}${suffix}.`
+            + (planned ? ` Draft staged with ${planned} change(s).` : "")
         );
-
-        if (data.unchanged_count > 0 && data.revise_count === 0) {
-            logToTerminal(
-                "INFO",
-                `[MODULE A] No Revise file needed: all ${data.unchanged_count} linked card(s) already match eBay on quantity and price.`
-            );
-        }
 
         if (data.reconciled === false && data.skipped_count > 0
             && data.parsed_rows > 0) {
@@ -1417,21 +1342,19 @@ async function handleBatchUpload(file, mode = "normal") {
         if (data.zeroed_count > 0) {
             logToTerminal(
                 "WARN",
-                `[MODULE A] ${data.zeroed_count} card(s) live on eBay were absent from this dump and are revised to quantity 0. See the rows above for which.`
+                `[MODULE A] ${data.zeroed_count} card(s) live on eBay were absent from this dump, so the catalogue is now 0 for them. The draft will ask eBay to stop selling them — check that list before approving it.`
             );
         }
 
-        // A download-only rebuild wrote nothing, so there is nothing to refresh.
+        // A preview wrote nothing, so there is nothing to refresh.
         if (!data.dry_run) {
             fetchStats();
             fetchSetFilter();
             fetchInventory();
-            // The catalogue just moved, so any existing draft is describing a
-            // diff that no longer applies. Rebuilding here rather than making
-            // it a second button press is the whole point of the drafts page
-            // being the funnel -- and it is why a draft cannot be edited
-            // before the batch that feeds it has run.
-            rebuildDraftAfterBatch();
+            // The server staged the draft as part of the upload, so this
+            // only has to display it. It used to be rebuilt from here,
+            // which meant a CLI or API upload left no draft at all.
+            fetchDraftPlan();
         }
     } catch (err) {
         logToTerminal("ERROR", `[MODULE A] ${err.message}`);
@@ -2451,20 +2374,19 @@ function openCoverModal(itemId) {
         ? `eBay #${itemId} - ${listing.set_name || "?"}, ${listing.card_count} card(s)`
         : `eBay #${itemId}`;
 
-    // A listing this app created through the API is corrected in place. A File
-    // Exchange one needs its Revise file uploaded, and File Exchange cannot
-    // touch an API-managed listing -- so saying the wrong thing here sends
-    // someone to Seller Hub with a file that does nothing.
+    // eBay does not merge pictures: the set sent replaces what is there.
+    // Every listing is API-managed now, so saving applies immediately -- but
+    // a listing the API cannot see would silently not update, so say which.
     const managed = !!(listing && listing.managed);
     const how = document.getElementById("coverModalHowItApplies");
     const submit = document.getElementById("coverModalSubmit");
     if (how) {
         how.innerHTML = managed
-            ? "eBay does not merge pictures &mdash; the set sent replaces what is there. This listing was created through the eBay API, so saving applies the change immediately."
-            : "eBay does not merge pictures on a revision &mdash; the uploaded set replaces what is there. Saving records the change and downloads a Revise CSV; this listing only updates once you upload that file to eBay.";
+            ? "eBay does not merge pictures — the set sent replaces what is there. Saving applies the change to the live listing immediately."
+            : "This listing is not visible to the eBay API, so the choice can be saved but not applied. Sync from eBay first; if it stays unmanaged, the listing was created outside this application.";
     }
     if (submit) {
-        submit.textContent = managed ? "Save & apply to eBay" : "Save & Download Revise CSV";
+        submit.textContent = managed ? "Save & apply to eBay" : "Save anyway";
     }
     document.getElementById("coverUrlInput").value =
         listing ? (listing.cover_image_url || "") : "";
@@ -2522,18 +2444,14 @@ async function saveCoverPhoto(e) {
         const id = coverEditItemId;
         closeCoverModal();
 
-        // A listing we created through the API is already updated; a legacy
-        // one needs its Revise file uploaded, and File Exchange cannot touch
-        // an API-managed listing at all -- so the two must not be conflated.
+        // The endpoint applies it when it can and says why when it cannot.
         if (data.applied) {
             logToTerminal("SUCCESS",
-                `Cover photo applied to eBay #${id} directly (${data.refreshed} variation(s) re-sent).`);
+                `Cover photo applied to eBay #${id} (${data.refreshed} variation(s) re-sent).`);
         } else {
-            triggerBrowserDownload(data.csv_content, `ebay_cover_photo_${id}.csv`);
             logToTerminal("SUCCESS", `Cover photo recorded for eBay #${id}.`);
-            logToTerminal("INFO",
-                `Upload ebay_cover_photo_${id}.csv to Seller Hub to apply it. `
-                + "eBay replaces the listing's whole picture set on revision.");
+            logToTerminal("WARN", data.reason
+                || `It has not been applied to the live listing yet. Press Refresh on #${id}.`);
         }
 
         fetchEbayListings();
@@ -2629,7 +2547,7 @@ async function fetchEbayListings() {
                                 class="text-[10px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-all disabled:opacity-40">
                                 Refresh
                               </button>`
-                            : `<span class="text-[10px] text-slate-600" title="Created through File Exchange, so the Inventory API cannot see it. Changes go through the Revise CSV.">CSV only</span>`}
+                            : `<span class="text-[10px] text-amber-500/80" title="The Inventory API cannot see this listing, so nothing here can change it. Sync from eBay; if it persists, the listing was created outside this application.">unmanaged</span>`}
                     </td>
                 </tr>`;
         }).join("");
@@ -3074,41 +2992,6 @@ function setDraftsBadge(count) {
     badge.classList.remove("hidden");
 }
 
-async function rebuildDraftAfterBatch() {
-    // Reported rather than silent: a rebuild discards the open draft, and if
-    // edits had been made to it those are gone. Saying so is the difference
-    // between a helpful automation and a confusing one.
-    try {
-        const existing = await fetch("/api/plans");
-        const plans = existing.ok ? (await existing.json()).plans || [] : [];
-        const hadDraft = plans.some(p => p.status === "draft");
-
-        const res = await fetch("/api/plans/build", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ source: "batch" }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Could not build a draft");
-
-        logToTerminal(
-            "SUCCESS",
-            `[DRAFTS] ${hadDraft ? "Replaced the open draft. " : ""}`
-                + `Draft ${data.plan_id}: ${data.item_count} change(s) across `
-                + `${data.group_count} listing(s)`
-                + (data.invalid_count ? `, ${data.invalid_count} needing attention` : "")
-        );
-        setDraftsBadge(data.item_count);
-        // Only re-render if the user is looking at it; otherwise the badge is
-        // enough and a fetch would be wasted.
-        if (activeWorkspaceTab === "drafts") await fetchDraftPlan();
-    } catch (err) {
-        // Never fatal to the batch: the upload itself succeeded, and the draft
-        // can be rebuilt by hand.
-        logToTerminal("WARN", `[DRAFTS] Automatic rebuild failed: ${err.message}`);
-    }
-}
-
 async function buildDraftPlan() {
     const button = document.getElementById("btnBuildPlan");
     const container = document.getElementById("draftGroups");
@@ -3221,9 +3104,9 @@ function renderPlanHistory(plans) {
                         ${p.item_count} change(s)${p.excluded_count ? `, ${p.excluded_count} left out` : ""}
                         ${p.approved_at ? ` &middot; approved ${escapeHtml(String(p.approved_at).slice(0, 16))}` : ""}
                     </span>
-                    <button type="button" onclick="loadPlanFiles(${p.id})"
+                    <button type="button" onclick="loadPlanListings(${p.id})"
                         class="ml-auto text-[11px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all">
-                        Files
+                        Listings
                     </button>
                     ${p.status === "approved" || p.status === "partial"
                         ? `<button type="button" onclick="pushPlan(${p.id}, this)"
@@ -3244,92 +3127,51 @@ function renderPlanHistory(plans) {
     if (expandPlanFilesFor) {
         const planId = expandPlanFilesFor;
         expandPlanFilesFor = null;
-        loadPlanFiles(planId);
+        loadPlanListings(planId);
     }
 }
 
-async function loadPlanFiles(planId) {
+async function loadPlanListings(planId) {
     const box = document.getElementById(`planFiles${planId}`);
     if (!box) return;
     box.classList.remove("hidden");
-    box.innerHTML = `<p class="text-[11px] text-slate-500">Building the files&hellip;</p>`;
+    box.innerHTML = `<p class="text-[11px] text-slate-500">Reading the plan&hellip;</p>`;
     try {
-        const res = await fetch(`/api/plans/${planId}/files`);
+        const res = await fetch(`/api/plans/${planId}`);
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Could not read the plan's files");
+        if (!res.ok) throw new Error(data.detail || "Could not read the plan");
 
-        const links = [];
-        if (data.add_card_count) {
-            // A cover for a listing that does not exist yet has nothing to be
-            // revised onto, so it travels in this file. Said here because
-            // otherwise the choice looks like it was dropped.
-            const coversInAdd = data.add_cover_count
-                ? `, including ${data.add_cover_count} cover photo(s)`
-                : "";
-            links.push(`<a href="/api/plans/${planId}/add.csv" download
-                class="text-accent-emerald underline decoration-dotted font-semibold">Add file</a>
-                <span class="text-slate-500">&mdash; creates ${data.listing_count} listing(s) from ${data.add_card_count} card(s)${coversInAdd}</span>`);
-        }
-        if (data.revise_count) {
-            links.push(`<a href="/api/plans/${planId}/revise.csv" download
-                class="text-accent-cyan underline decoration-dotted font-semibold">Revise file</a>
-                <span class="text-slate-500">&mdash; updates ${data.revise_count} existing row(s)</span>`);
-        }
-        if (data.cover_count) {
-            links.push(`<a href="/api/plans/${planId}/cover-revise.csv" download
-                class="text-accent-cyan underline decoration-dotted font-semibold">Cover photos</a>
-                <span class="text-slate-500">&mdash; ${data.cover_count} listing(s)</span>`);
-        }
+        const items = data.items || [];
+        const pushedCount = items.filter(i => i.status === "pushed").length;
 
         // One row per listing with its own Push button. A create cannot be
         // undone by pressing the button again, so the only sane way to start
         // is one small listing, checked in Seller Hub, before several hundred
         // cards go live in a single call.
-        const pushable = (data.groups || []).filter(g => g.item_count > g.excluded_count);
-        const listingRows = pushable.length
-            ? `<p class="text-slate-400 pt-1 border-t border-slate-800 mt-1.5">Push one listing at a time:</p>
-               <ul class="space-y-1">${pushable.map(g => `
+        const pushable = (data.groups || []).filter(
+            g => g.item_count > g.excluded_count
+        );
+        const rows = pushable.length
+            ? `<ul class="space-y-1">${pushable.map(g => `
                    <li class="flex items-center gap-2">
                        <span class="text-slate-300 truncate">${escapeHtml(g.set_name || g.group_key)}${g.condition ? ` &middot; ${escapeHtml(g.condition)}` : ""}</span>
                        <span class="text-slate-600">${g.item_count - g.excluded_count} card(s)</span>
-                       ${g.ebay_parent_id && !g.managed
-                           ? `<span class="ml-auto text-amber-400/80">CSV only</span>`
-                           : `<button type="button" onclick="pushPlan(${planId}, this, this.dataset.groupKey)" data-group-key="${escapeHtml(g.group_key)}"
-                                class="ml-auto text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-emerald-900/60 hover:bg-emerald-800 border border-emerald-800 text-emerald-200 transition-all">
-                                Push${g.managed ? "" : " (new)"}
-                              </button>`}
+                       <button type="button" onclick="pushPlan(${planId}, this, this.dataset.groupKey)" data-group-key="${escapeHtml(g.group_key)}"
+                           class="ml-auto text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-emerald-900/60 hover:bg-emerald-800 border border-emerald-800 text-emerald-200 transition-all">
+                           Push${g.ebay_parent_id ? "" : " (new)"}
+                       </button>
                    </li>`).join("")}</ul>`
-            : "";
+            : `<p class="text-slate-500">Nothing left to push in this plan.</p>`;
 
-        // Changes these files cannot carry. A card already pushed is live, and
-        // File Exchange cannot revise a listing the Inventory API manages --
-        // so a row for either would upload cleanly and do nothing, or worse,
-        // create a second listing. Said plainly rather than silently omitted.
-        const elsewhere = [];
-        if (data.pushed_count) {
-            elsewhere.push(`${data.pushed_count} card(s) in this plan are already live through the eBay API, so they are not in these files.`);
-        }
-        if (data.api_managed_count) {
-            elsewhere.push(`${data.api_managed_count} change(s) belong to listings this app created through the API. Use Push, not Seller Hub — File Exchange cannot revise those listings.`);
-        }
-
-        // Named individually because they are uploaded separately, and an Add
-        // creates live listings while a Revise only changes existing ones.
-        // Conflating them is how a quantity correction becomes 400 listings.
         box.innerHTML = `
             <div class="rounded-lg border border-slate-700 bg-dark-900/60 p-2.5 text-[11px] space-y-1.5">
-                ${links.length
-                    ? links.map(l => `<p>${l}</p>`).join("")
-                    : `<p class="text-slate-500">This plan produced no uploadable rows.</p>`}
-                ${data.unlistable && data.unlistable.length
-                    ? `<p class="text-amber-300">${data.unlistable.length} card(s) could not be included:</p>
-                       <ul class="ml-4 list-disc text-amber-200/80">${data.unlistable.slice(0, 5).map(u =>
-                           `<li><span class="font-mono">${escapeHtml(u.manifest_id)}</span> ${escapeHtml(u.reason)}</li>`).join("")}</ul>`
+                <p class="text-slate-400">Push one listing at a time:</p>
+                ${rows}
+                ${pushedCount
+                    ? `<p class="text-sky-300/90 pt-1">${pushedCount} card(s) in this plan are already live on eBay.</p>`
                     : ""}
-                ${elsewhere.map(note => `<p class="text-sky-300/90">${escapeHtml(note)}</p>`).join("")}
-                ${listingRows}
-                ${data.add_card_count
-                    ? `<p class="text-slate-500 pt-1">An Add file creates live listings. Upload a small slice first &mdash; a variation parent row plus its children &mdash; and check the result in Seller Hub before committing the rest.</p>`
+                ${pushable.some(g => !g.ebay_parent_id)
+                    ? `<p class="text-slate-500 pt-1">A listing marked <span class="text-emerald-300">new</span> does not exist on eBay yet, and creating it cannot be undone by pressing the button again. Start with a small one and check it in Seller Hub.</p>`
                     : ""}
             </div>`;
     } catch (err) {

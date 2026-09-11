@@ -580,14 +580,19 @@ async def process_batch_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
-    Module A: Ingest SortSwift scan batch, auto-catalog cards, route to Add vs Revise CSVs.
+    Module A: ingest a SortSwift export, catalogue the cards, stage a draft.
 
-    Quantities are additive, so re-processing the same export would inflate live
-    eBay stock. Uploads are fingerprinted and a repeat of an already-processed
-    file is refused unless the caller explicitly passes force=true.
+    It no longer produces anything to download. The catalogue is updated
+    from the file and a draft plan is staged from the catalogue, which the
+    drafts page reviews and the API push applies -- the only route to eBay
+    there is.
 
-    Pass dry_run=true to rebuild the CSVs from current settings without writing
-    anything to the catalogue or store mirror.
+    Quantities can be additive, so re-processing the same export would
+    inflate stock. Uploads are fingerprinted and a repeat of an
+    already-processed file is refused unless the caller passes force=true.
+
+    Pass dry_run=true to see what a file would change without writing
+    anything to the catalogue, the store mirror or a draft.
 
     Prices and listing settings come from the signed-in user's own rules, so
     two sellers processing the same export each get their own output.
@@ -616,7 +621,7 @@ async def process_batch_endpoint(
     # closing several per card.
     def run():
         with db.session():
-            return process_batch_csv(
+            result = process_batch_csv(
                 csv_text,
                 db,
                 source_name=file.filename or "upload.csv",
@@ -625,6 +630,34 @@ async def process_batch_endpoint(
                 user_id=user["id"],
                 quantity_mode=quantity_mode,
             )
+            # Stage the draft in the same breath as the ingest. Module A used
+            # to finish by handing over two files; now it finishes by leaving
+            # a reviewable draft of what eBay needs, which is the only route
+            # to eBay there is. Doing it here rather than inside
+            # process_batch_csv keeps the engine's ingest free of any opinion
+            # about plans, and avoids an import cycle.
+            #
+            # Skipped for a dry run, which must write nothing, and for a
+            # refused duplicate, which changed nothing to re-plan against.
+            if not dry_run and not result.get("duplicate"):
+                try:
+                    result["plan"] = build_plan(
+                        db, user["id"], source="batch",
+                        source_ref=file.filename or None,
+                    )
+                except PlanError as exc:
+                    # An ingest that succeeded must not report failure because
+                    # the draft could not be built; the Rebuild button is
+                    # still there.
+                    result["plan"] = None
+                    result["logs"].append({
+                        "level": "WARN",
+                        "message": (
+                            f"The catalogue was updated, but the draft could "
+                            f"not be staged: {exc}. Press Rebuild draft."
+                        ),
+                    })
+            return result
 
     return await run_in_threadpool(run)
 

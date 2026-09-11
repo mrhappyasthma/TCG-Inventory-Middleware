@@ -154,11 +154,54 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         data = res.json()
         self.assertFalse(data["duplicate"])
-        self.assertEqual(data["add_count"], 1)
+        self.assertEqual(data["staged_card_count"], 1)
 
         inv_res = self.client.get("/api/inventory")
         self.assertEqual(inv_res.status_code, 200)
         self.assertEqual(inv_res.json()["total"], 1)
+
+    def test_08b_an_upload_stages_the_draft(self):
+        """
+        Ingest finishes by leaving a reviewable draft, not a file.
+
+        Module A used to hand over an Add and a Revise CSV. Those are gone, so
+        an upload that did not stage a draft would leave the operator with a
+        changed catalogue and no visible next step.
+        """
+        # Re-applies the same card with force rather than introducing a new
+        # one: these tests share a database in name order, and a second
+        # catalogue entry would change the counts the later ones assert.
+        res = self.client.post(
+            "/api/process/batch",
+            files={"file": ("staged.csv", BATCH_CSV, "text/csv")},
+            data={"force": "true"},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertIsNotNone(body.get("plan"), "no draft was staged")
+        self.assertIn("plan_id", body["plan"])
+
+        # And it is the open draft the page will show.
+        draft = self.client.get("/api/plans").json()
+        self.assertTrue(draft["plans"], "the staged draft is not listed")
+
+        # Nothing to download: the two file keys must be gone for good.
+        self.assertNotIn("add_csv", body)
+        self.assertNotIn("revise_csv", body)
+
+    def test_08c_a_dry_run_stages_nothing(self):
+        before = self.client.get("/api/plans").json()["plans"]
+        res = self.client.post(
+            "/api/process/batch",
+            files={"file": ("staged.csv", BATCH_CSV, "text/csv")},
+            data={"dry_run": "true", "force": "true"},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIsNone(res.json().get("plan"))
+        self.assertEqual(
+            self.client.get("/api/plans").json()["plans"], before,
+            "a preview must not stage a draft",
+        )
 
     def test_09_duplicate_batch_is_refused_then_forced(self):
         files = {"file": ("sortswift_batch.csv", BATCH_CSV, "text/csv")}
@@ -166,8 +209,7 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         data = res.json()
         self.assertTrue(data["duplicate"], "identical batch should be flagged")
-        self.assertEqual(data["add_count"], 0)
-        self.assertEqual(data["revise_count"], 0)
+        self.assertEqual(data["staged_card_count"], 0)
 
         # Catalog untouched by the refused upload.
         self.assertEqual(self.client.get("/api/inventory").json()["total"], 1)

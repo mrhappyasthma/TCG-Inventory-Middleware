@@ -14,35 +14,10 @@ from .db import (
 )
 
 
-# eBay File Exchange / Seller Hub Headers
-# A File Exchange *upload* identifies an existing listing by "ItemID". "Item
-# Number" is what the Active Listings *report* calls it, which is a different
-# document; using the report's spelling in an upload leaves the row with no
-# identifier.
-REVISE_HEADERS = ["Action", "ItemID", "CustomLabel", "Quantity", "Price"]
-
-# eBay requires a Condition Descriptor for trading cards. For ungraded cards
-# the descriptor is "Card Condition", ID 40001, so the column is "CD:40001".
+# The export column eBay's card categories require for an ungraded card's
+# condition descriptor. Named here because a missing one is something the
+# operator has to fix in SortSwift, and the warning has to say what to add.
 CONDITION_DESCRIPTOR_COLUMN = "CD:40001"
-
-ADD_HEADERS = [
-    "Action",
-    "Category",
-    "Title",
-    "Relationship",
-    "RelationshipDetails",
-    "Description",
-    "ConditionID",
-    "StartPrice",
-    "Quantity",
-    "CustomLabel",
-    "PicURL",
-    "Format",
-    "Duration",
-    "Price",
-    "PostalCode",
-    CONDITION_DESCRIPTOR_COLUMN,
-]
 
 # eBay item specifics travel in columns prefixed "C:" (the seller's own
 # templates mark required ones with a leading asterisk, e.g. "*C:Game"). The
@@ -86,42 +61,6 @@ def _detect_item_specific_columns(fieldnames) -> Dict[str, str]:
             detected[name] = "C:" + match.group(1).strip()
     return detected
 
-
-def _uniform_item_specifics(cards: List[Dict[str, Any]]) -> Dict[str, str]:
-    """
-    Keep only the specifics that every card in a variation group agrees on.
-
-    A variation listing carries ONE set of listing-level item specifics, so a
-    field that differs between cards (Card Name, Card Number) cannot be stated
-    at listing level -- the variation axis expresses it instead. Fields common
-    to the whole group (Game, Set, Language) can be.
-    """
-    if not cards:
-        return {}
-
-    shared: Dict[str, str] = {}
-    all_keys = set()
-    for c in cards:
-        all_keys.update(c.get("item_specifics", {}))
-
-    for key in all_keys:
-        values = {str(c.get("item_specifics", {}).get(key, "")).strip() for c in cards}
-        if len(values) == 1:
-            value = values.pop()
-            if value:
-                shared[key] = value
-    return shared
-
-
-# Business policy columns, emitted only when configured. eBay matches these by
-# name, case-sensitively, against the seller's Manage Business Policies page.
-# When policies are used the individual Payment/Shipping/Returns fields must be
-# absent -- which they are.
-POLICY_SETTING_COLUMNS = (
-    ("shipping_profile_name", "ShippingProfileName"),
-    ("return_profile_name", "ReturnProfileName"),
-    ("payment_profile_name", "PaymentProfileName"),
-)
 
 # eBay's variation syntax: within one attribute, values are separated by
 # semicolons; a pipe separates different attributes. Card names containing
@@ -431,178 +370,17 @@ def _parse_price(val: Optional[str]) -> float:
         return 0.0
 
 
-def build_add_rows(
-    staged_variations: Dict[tuple, List[Dict[str, Any]]],
-    staged_singles: List[Dict[str, Any]],
-    *,
-    category_id: str,
-    title_template: str,
-    cover_image_url: str,
-    common_add_fields: Dict[str, str],
-    cover_images: Optional[Dict[Any, str]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Assemble the Add file's rows: variation parents, their children, singles.
-
-    Extracted so that both callers share it -- a SortSwift batch, and an
-    approved draft plan. A second copy would be free to drift in exactly
-    the rules that are hardest to get right and least visible when wrong:
-    the parent row leaving Relationship empty, the option list matching the
-    child order, and a per-variation PicURL naming its option.
-
-    ``cover_images`` maps a ``(set, condition)`` group to the cover photo
-    chosen for that one listing on the drafts page, and wins over the
-    account-wide ``cover_image_url``. A single carries its own choice on the
-    entry as ``cover_image``. Without this, a cover staged for a listing that
-    does not exist yet had nowhere to go: it cannot be revised onto a listing
-    that has not been created, so it has to travel in the Add file that
-    creates it.
-    """
-    covers = cover_images or {}
-    # BUILD FINAL EBAY ADD CSV (PARENT CONTAINERS + CHILD VARIATIONS + SINGLES)
-    # -----------------------------------------------------------------
-    final_add_rows: List[Dict[str, Any]] = []
-
-    # 1. Multi-Item Variation Listings (one per set + condition)
-    for (set_title, group_condition), cards in staged_variations.items():
-        if not cards:
-            continue
-
-        # Order the dropdown by card number. The parent's option list and the
-        # child rows must agree, so sort once and use it for both.
-        cards = sorted(cards, key=variation_sort_key)
-
-        # Generate Parent Container Row
-        parent_title = generate_variation_title(
-            set_title, condition=group_condition, template=title_template
-        )
-        # This listing's own cover wins, then the account-wide one; otherwise
-        # fall back to the first card's picture.
-        cover_image = (
-            covers.get((set_title, group_condition))
-            or cover_image_url
-            or next((c["cdn_image"] for c in cards if c["cdn_image"]), "")
-        )
-
-        # Declare the option list on the parent. eBay separates values within
-        # one attribute by semicolons; a pipe would be read as the start of a
-        # second attribute and rejected.
-        option_names = [c["option_name"] for c in cards]
-        parent_rel_details = (
-            f"{VARIATION_ATTRIBUTE_NAME}="
-            + VARIATION_VALUE_SEPARATOR.join(option_names)
-        )
-
-        # Append Parent Container Row. The parent leaves Relationship EMPTY;
-        # only the child rows are marked "Variation". Marking the parent too
-        # leaves eBay unable to tell which row is the container.
-        final_add_rows.append({
-            "Action": "Add",
-            "Category": category_id,
-            "Title": parent_title,
-            "Relationship": "",
-            "RelationshipDetails": parent_rel_details,
-            "Description": (
-                f"Pick Your Card from {set_title}! "
-                f"Condition: {group_condition}. Complete your collection."
-            ),
-            "ConditionID": cards[0]["condition_id"],
-            "StartPrice": "",
-            "Quantity": "",
-            "CustomLabel": "",
-            "PicURL": cover_image,
-            "Format": "FixedPrice",
-            "Duration": "GTC",
-            "Price": "",
-            CONDITION_DESCRIPTOR_COLUMN: cards[0]["condition_descriptor"],
-            **common_add_fields,
-            **_uniform_item_specifics(cards),
-        })
-
-        # Append Child Variation Rows
-        for c in cards:
-            final_add_rows.append({
-                "Action": "Add",
-                "Category": category_id,
-                "Title": "",
-                "Relationship": "Variation",
-                "RelationshipDetails": (
-                    f"{VARIATION_ATTRIBUTE_NAME}={c['option_name']}"
-                ),
-                "Description": "",
-                "ConditionID": c["condition_id"],
-                "StartPrice": f"{c['price']:.2f}",
-                "Quantity": c["quantity"],
-                "CustomLabel": c["custom_label"],
-                # A per-variation image must name the option it belongs to:
-                # "<option value>=<url>". A bare URL here is ignored by eBay,
-                # which is why only the parent's picture used to appear.
-                "PicURL": (
-                    f"{c['option_name']}{VARIATION_PICTURE_SEPARATOR}{c['cdn_image']}"
-                    if c["cdn_image"]
-                    else ""
-                ),
-                "Format": "FixedPrice",
-                "Duration": "GTC",
-                "Price": f"{c['price']:.2f}",
-                CONDITION_DESCRIPTOR_COLUMN: c["condition_descriptor"],
-                **common_add_fields,
-            })
-
-    # 2. Standalone Single Listings (Cards >= threshold)
-    for s in staged_singles:
-        single_title = f"{s['product_name']} - {s['set_name']} - {s['condition_name']}"
-        if len(single_title) > 80:
-            single_title = f"{s['product_name']} - {s['set_name']}"
-        if len(single_title) > 80:
-            single_title = single_title[:80]
-
-        # Single listings: include front, back, and stock images (pipe-delimited)
-        single_pic_parts = [url for url in [
-            s.get("cover_image") or cover_image_url or s["cdn_image"],
-            s.get("cdn_back_image", ""),
-            s.get("stock_image", ""),
-        ] if url]
-        single_pic_url = "|".join(single_pic_parts)
-
-        final_add_rows.append({
-            "Action": "Add",
-            "Category": category_id,
-            "Title": single_title,
-            "Relationship": "",
-            "RelationshipDetails": "",
-            "Description": f"{s['product_name']} from {s['set_name']}. Condition: {s['condition_name']}, Printing: {s['printing']}.",
-            "ConditionID": s["condition_id"],
-            "StartPrice": f"{s['price']:.2f}",
-            "Quantity": s["quantity"],
-            "CustomLabel": s["custom_label"],
-            "PicURL": single_pic_url,
-            "Format": "FixedPrice",
-            "Duration": "GTC",
-            "Price": f"{s['price']:.2f}",
-            CONDITION_DESCRIPTOR_COLUMN: s["condition_descriptor"],
-            **common_add_fields,
-            **s.get("item_specifics", {}),
-        })
-
-    return final_add_rows
-
-
 def _empty_batch_result(
     logs: List[Dict[str, str]],
-    add_headers: Optional[List[str]] = None,
     **overrides,
 ) -> Dict[str, Any]:
     """Build a no-op batch result carrying the supplied log messages."""
     result = {
-        "revise_csv": ",".join(REVISE_HEADERS) + "\n",
-        "add_csv": ",".join(add_headers or ADD_HEADERS) + "\n",
-        "revise_count": 0,
         "zeroed_count": 0,
-        "unchanged_count": 0,
         "parsed_rows": 0,
         "reconciled": False,
-        "add_count": 0,
+        "staged_card_count": 0,
+        "staged_listing_count": 0,
         "new_catalog_count": 0,
         "skipped_count": 0,
         "duplicate": False,
@@ -668,7 +446,6 @@ def process_batch_csv(
     """
     csv_text = strip_bom(csv_text)
     logs: List[Dict[str, str]] = []
-    revise_rows: List[Dict[str, Any]] = []
 
     # Raw items to be added (categorized into singles vs variation sets)
     staged_singles: List[Dict[str, Any]] = []
@@ -705,22 +482,10 @@ def process_batch_csv(
     # same card in two bins) sum together before replacing the stored value.
     file_totals: Dict[str, int] = {}
 
-    # In replace mode there must be exactly one Revise row per card, keyed by
-    # manifest id rather than appended per row: two rows for one card would
-    # otherwise emit two Revise rows whose CustomLabels differ by bin, and only
-    # one of those labels exists on the listing.
-    revise_by_manifest: Dict[str, Dict[str, Any]] = {}
-    # Add mode keeps one row per CSV row, paired with its manifest id so the
-    # unchanged check never has to guess which card a row belongs to.
-    revise_pairs: List[tuple] = []
-
-    # What eBay is believed to hold for each card we touched, so an unchanged
-    # Revise row can be recognised and dropped after the final total is known.
-    believed_state: Dict[str, Dict[str, Any]] = {}
-    # The quantity we intend to ask eBay for, written only for rows that
-    # survive; recording one for a suppressed row would claim an outstanding
-    # request that no file actually contains.
-    intended_qty: Dict[str, int] = {}
+    # Cards this file touched that are already live on eBay. They need no
+    # work here: the catalogue has been corrected and the planner diffs it
+    # against what eBay is known to hold.
+    live_count = 0
 
     # Load configuration settings
     single_threshold = float(
@@ -735,36 +500,14 @@ def process_batch_csv(
     descriptor_style = db.get_listing_setting(
         "condition_descriptor_style", "label_id", user_id=user_id
     )
-    postal_code = str(
-        db.get_listing_setting("seller_postal_code", "", user_id=user_id)
-    ).strip()
     default_game = str(
         db.get_listing_setting("default_game", "", user_id=user_id)
     ).strip()
     option_template = db.get_listing_setting(
         "variation_option_template", DEFAULT_VARIATION_OPTION_TEMPLATE, user_id=user_id
     )
-    cover_image_url = str(
-        db.get_listing_setting("cover_image_url", "", user_id=user_id)
-    ).strip()
-
-    # Only emit policy columns that are actually configured; a blank policy
-    # name is worse than an absent column.
-    active_policies = {}
-    for setting_key, column in POLICY_SETTING_COLUMNS:
-        value = str(
-            db.get_listing_setting(setting_key, "", user_id=user_id)
-        ).strip()
-        if value:
-            active_policies[column] = value
-
-    # Cells appended to every generated Add row.
-    common_add_fields = {"PostalCode": postal_code}
-    common_add_fields.update(active_policies)
-
     # Populated once the uploaded file's headers are known.
     item_specific_columns: Dict[str, str] = {}
-    add_headers = ADD_HEADERS + list(active_policies) + [GAME_ITEM_SPECIFIC]
     group_by_set = str(
         db.get_listing_setting("group_by_set", "true", user_id=user_id)
     ).strip().lower() not in (
@@ -777,7 +520,6 @@ def process_batch_csv(
     if not lines:
         return _empty_batch_result(
             [{"level": "WARN", "message": "Uploaded SortSwift batch file is empty."}],
-            add_headers=add_headers,
         )
 
     reader = csv.DictReader(io.StringIO(csv_text))
@@ -787,7 +529,6 @@ def process_batch_csv(
                 "level": "ERROR",
                 "message": "Unable to parse CSV headers in SortSwift batch file.",
             }],
-            add_headers=add_headers,
         )
 
     # Fail fast, and with the actual diagnosis, when the wrong SortSwift export
@@ -812,7 +553,6 @@ def process_batch_csv(
                     "and no eBay file was built, so nothing has changed."
                 ),
             }],
-            add_headers=add_headers,
         )
 
     # Item specifics are discovered from the uploaded file's own headers, so
@@ -834,8 +574,6 @@ def process_batch_csv(
         | {out for out, _ in derived_specifics}
         | {GAME_ITEM_SPECIFIC}
     )
-    add_headers = ADD_HEADERS + list(active_policies) + item_specific_outputs
-
     if item_specific_outputs:
         forwarded = ", ".join(item_specific_outputs)
         logs.append({
@@ -858,7 +596,6 @@ def process_batch_csv(
                     f"Re-upload with 'force' enabled if that is really intended."
                 ),
             }],
-            add_headers=add_headers,
             duplicate=True,
         )
 
@@ -871,30 +608,12 @@ def process_batch_csv(
         "level": "INFO",
         "message": f"Processing SortSwift scan batch with {len(lines) - 1} cards ({grouping_note})..."
     })
-    if not postal_code:
-        logs.append({
-            "level": "ERROR",
-            "message": (
-                "No seller postal code is configured, so eBay will reject this "
-                "Add file with error 10009 (No <Item.Location> exists). Set your "
-                "postal code under Listing Rules before uploading."
-            ),
-        })
-    if not active_policies:
-        logs.append({
-            "level": "WARN",
-            "message": (
-                "No eBay business policy names are configured. eBay usually "
-                "requires shipping and return details on an Add, so set your "
-                "policy names under Listing Rules if the upload is rejected."
-            ),
-        })
     if dry_run:
         logs.append({
             "level": "INFO",
             "message": (
-                "Download-only run: regenerating the CSV files with current "
-                "settings. Nothing will be written to your inventory."
+                "Preview run: reporting what this file would change "
+                "with current settings. Nothing will be written."
             ),
         })
     if previous and force and not dry_run:
@@ -1154,9 +873,12 @@ def process_batch_csv(
         variation = db.get_variation(manifest_id)
 
         if variation and variation.get("ebay_parent_id"):
-            # REVISE Scenario: Item is already live on eBay
+            # Already live on eBay, so this row is an update rather than a new
+            # listing. What that update *is* no longer gets worked out here:
+            # the catalogue has just been corrected above, and the planner
+            # diffs it against what eBay is known to hold. This branch only
+            # says so, which is the part a person reading the log wants.
             ebay_item_id = str(variation["ebay_parent_id"]).strip()
-            prev_qty = variation.get("last_known_qty", 0)
 
             # eBay knows this variation by whichever label it was listed under,
             # which Module B records. Inventing a fresh label from this row's
@@ -1164,44 +886,20 @@ def process_batch_csv(
             known_label = (variation.get("custom_label") or "").strip()
             revise_label = known_label or ebay_custom_label
 
-            if replace_quantities:
-                new_consolidated_qty = file_totals[manifest_id]
-                qty_note = f"= {new_consolidated_qty}"
-            else:
-                # Accumulate on whatever we most recently asked eBay for, or on
-                # eBay's own figure if nothing is outstanding. Reading only
-                # last_known_qty would make two scan batches uploaded before a
-                # sync both start from the same base, losing the first one.
-                outstanding = variation.get("pending_qty")
-                base_qty = prev_qty if outstanding is None else int(outstanding)
-                new_consolidated_qty = base_qty + file_totals[manifest_id]
-                qty_note = f"+{quantity} => Total {new_consolidated_qty}"
-
-            # Deferred until the row is known to survive; see below.
-            intended_qty[manifest_id] = new_consolidated_qty
-            believed_state[manifest_id] = {
-                "last_known_qty": variation.get("last_known_qty"),
-                "last_known_price": variation.get("last_known_price"),
-                "pending_qty": variation.get("pending_qty"),
-            }
-
-            revise_entry = {
-                "Action": "Revise",
-                "ItemID": ebay_item_id,
-                "CustomLabel": revise_label,
-                "Quantity": new_consolidated_qty,
-                "Price": f"{effective_price:.2f}",
-            }
-            if replace_quantities:
-                # Later rows for the same card update the running total in
-                # place, keeping one row per card.
-                revise_by_manifest[manifest_id] = revise_entry
-            else:
-                revise_pairs.append((manifest_id, revise_entry))
-
-            _log_once(logs, log_tallies, "REVISE",
-                      f"Row {row_idx}: [REVISE] #{ebay_item_id} [{revise_label}] "
-                      f"{product_name} ({qty_note})")
+            # Accumulation in add mode rests on increment_manifest_quantity
+            # above, which adds to the catalogue's own figure. That is the
+            # right base and always was: it is correct whether or not eBay has
+            # been told anything yet. The previous base -- eBay's last
+            # reported quantity, or a `pending_qty` recording what a generated
+            # file had asked for -- needed that second column precisely
+            # because two scan batches uploaded before a sync would otherwise
+            # both start from the same stale number and lose the first.
+            live_count += 1
+            _log_once(logs, log_tallies, "LIVE",
+                      f"Row {row_idx}: [LIVE] #{ebay_item_id} [{revise_label}] "
+                      f"{product_name} (catalogue now "
+                      f"{db.get_manifest_by_id(manifest_id)['quantity']}, "
+                      f"eBay reports {variation.get('last_known_qty')})")
         else:
             # ADD Scenario: Stage for Single vs Variation listing
             card_entry = {
@@ -1268,78 +966,19 @@ def process_batch_csv(
                           f"{condition_name} (Price: ${effective_price:.2f})")
 
     # -----------------------------------------------------------------
-    final_add_rows = build_add_rows(
-        staged_variations,
-        staged_singles,
-        category_id=category_id,
-        title_template=title_template,
-        cover_image_url=cover_image_url,
-        common_add_fields=common_add_fields,
-    )
-
-    # -----------------------------------------------------------------
     # REPLACE MODE: RECONCILE AGAINST THE FULL DUMP
     # -----------------------------------------------------------------
-    def revise_row_changes_anything(manifest_id: str, row: Dict[str, Any]) -> bool:
-        """
-        Would this Revise row actually change the listing?
-
-        Only ever answers False when eBay is *known* to hold exactly these
-        values already. Anything unknown -- no sync yet, or a report with no
-        price column -- counts as a change, so a real update is never dropped
-        on a guess. That makes the check safe but conservative: it stays quiet
-        until a Module B sync has taught us both figures.
-        """
-        state = believed_state.get(manifest_id)
-        if state is None:
-            return True
-
-        known_qty = state["last_known_qty"]
-        known_price = state["last_known_price"]
-        pending = state["pending_qty"]
-
-        if known_qty is None or known_price is None:
-            return True
-
-        # An outstanding request eBay has not confirmed must keep appearing in
-        # the file, or the change would never reach eBay at all. A pending
-        # value equal to eBay's own figure is not outstanding -- it is what a
-        # previous no-op run recorded.
-        if pending is not None and int(pending) != int(known_qty):
-            return True
-
-        return not (
-            int(known_qty) == int(row["Quantity"])
-            and round(float(known_price), 2) == round(float(row["Price"]), 2)
-        )
-
-    from_file_rows = (
-        list(revise_by_manifest.items()) if replace_quantities else revise_pairs
-    )
-
-    unchanged_count = 0
-    surviving: List[Dict[str, Any]] = []
-    for manifest_key, row in from_file_rows:
-        if not revise_row_changes_anything(manifest_key, row):
-            unchanged_count += 1
-            continue
-        surviving.append(row)
-        if not dry_run:
-            # Record the request only now that it is really in the file. Only a
-            # Module B sync may move last_known_qty.
-            db.set_pending_quantity(manifest_key, intended_qty[manifest_key])
-
-    revise_rows = surviving
-
-    if unchanged_count:
-        logs.append({
-            "level": "INFO",
-            "message": (
-                f"{unchanged_count} card(s) already match eBay on both quantity "
-                f"and price, so no Revise row was written for them."
-            ),
-        })
-
+    # What used to happen here was the other half of this module: comparing
+    # every card against what eBay was believed to hold and writing a Revise
+    # row for the ones that differed. That is now the planner's job --
+    # ``build_plan`` computes the same diff from stored state, the drafts page
+    # shows it, and the API push applies it. Two independent answers to "what
+    # does eBay need" is one too many, and this one could only ever be acted
+    # on by a human uploading a file.
+    #
+    # What remains is the part that belongs to ingest rather than to eBay:
+    # noticing that a card live on eBay is absent from a full dump, and
+    # therefore sold out.
     zeroed_count = 0
 
     # Zeroing is only safe if we actually understood the file. Every skip
@@ -1390,22 +1029,13 @@ def process_batch_csv(
 
             item_id = str(live["ebay_parent_id"]).strip()
             label = (live.get("custom_label") or "").strip() or live_id
-
-            revise_rows.append({
-                "Action": "Revise",
-                "ItemID": item_id,
-                "CustomLabel": label,
-                "Quantity": 0,
-                # Price is required by the Revise header. Leaving it blank
-                # tells eBay not to change the listed price, which is what we
-                # want: this row is only about stock.
-                "Price": "",
-            })
             zeroed_count += 1
 
             if not dry_run:
-                # Same rule: we are asking eBay for zero, not observing it.
-                db.set_pending_quantity(live_id, 0)
+                # The catalogue is ours to correct from the dump. eBay's own
+                # figure is not touched: only a Module B sync may move
+                # last_known_qty, and the draft this stock change produces is
+                # what will ask eBay for zero.
                 db.set_manifest_quantity(live_id, 0)
 
             logs.append({
@@ -1414,8 +1044,8 @@ def process_batch_csv(
                     f"[SOLD OUT] #{item_id} [{label}] "
                     f"{live.get('product_name') or live_id} "
                     f"({live.get('set_name') or '?'} | {live.get('condition') or '?'}) "
-                    f"is not in this dump, so the file asks eBay to set it to "
-                    f"0 (eBay currently reports {live.get('last_known_qty')})."
+                    f"is not in this dump, so the catalogue is set to 0 "
+                    f"(eBay currently reports {live.get('last_known_qty')})."
                 ),
             })
 
@@ -1423,25 +1053,12 @@ def process_batch_csv(
         logs.append({
             "level": "WARN",
             "message": (
-                f"{zeroed_count} card(s) live on eBay were absent from this dump "
-                f"and are revised down to 0. Check that list before uploading: "
-                f"these listings stop selling."
+                f"{zeroed_count} card(s) live on eBay were absent from this "
+                f"dump and are now 0 in the catalogue. The draft will ask eBay "
+                f"to stop selling them, so check that list before approving "
+                f"it: those listings stop selling."
             ),
         })
-
-    # Generate REVISE CSV
-    revise_io = io.StringIO()
-    rev_writer = csv.DictWriter(revise_io, fieldnames=REVISE_HEADERS, lineterminator="\n")
-    rev_writer.writeheader()
-    rev_writer.writerows(revise_rows)
-    revise_csv = revise_io.getvalue()
-
-    # Generate ADD CSV
-    add_io = io.StringIO()
-    add_writer = csv.DictWriter(add_io, fieldnames=add_headers, lineterminator="\n")
-    add_writer.writeheader()
-    add_writer.writerows(final_add_rows)
-    add_csv = add_io.getvalue()
 
     total_added_cards = len(staged_singles) + sum(len(c) for c in staged_variations.values())
 
@@ -1452,7 +1069,15 @@ def process_batch_csv(
 
     logs.append({
         "level": "INFO",
-        "message": f"Batch routing finished: {len(revise_rows)} items to REVISE ({zeroed_count} of them zeroed as sold out, {unchanged_count} unchanged and skipped), {len(staged_variations)} Set/Condition Variation Listings ({sum(len(c) for c in staged_variations.values())} child cards), {len(staged_singles)} Single Listings ({new_catalog_count} new catalog entries created).",
+        "message": (
+            f"Ingest finished: {len(file_totals)} card(s) read, "
+            f"{new_catalog_count} new to the catalogue, "
+            f"{zeroed_count} zeroed as sold out. They route to "
+            f"{len(staged_variations)} Set/Condition variation listing(s) "
+            f"({sum(len(c) for c in staged_variations.values())} child cards) "
+            f"and {len(staged_singles)} single listing(s). Rebuild the draft "
+            f"to see what eBay needs."
+        ),
     })
 
     if unpriced_grades:
@@ -1473,8 +1098,8 @@ def process_batch_csv(
             "level": "ERROR",
             "message": (
                 f"Not one row of this file could be processed ({skipped_count} "
-                f"skipped), so nothing was catalogued and no eBay file was "
-                f"built from it. See the warnings above for the reason."
+                f"skipped), so nothing was catalogued and the draft will be "
+                f"empty. See the warnings above for the reason."
             ),
         })
 
@@ -1488,15 +1113,15 @@ def process_batch_csv(
         )
 
     return {
-        "revise_csv": revise_csv,
-        "add_csv": add_csv,
-        "revise_count": len(revise_rows),
         "zeroed_count": zeroed_count,
-        "unchanged_count": unchanged_count,
         "parsed_rows": parsed_rows,
         "reconciled": reconcile,
         "quantity_mode": mode,
-        "add_count": total_added_cards,
+        # How the cards route, which is what the draft will group them into.
+        # Informational: the planner derives the grouping itself from stored
+        # state, so these are a preview of it and never its input.
+        "staged_card_count": total_added_cards,
+        "staged_listing_count": len(staged_variations) + len(staged_singles),
         "new_catalog_count": new_catalog_count,
         "skipped_count": skipped_count,
         "duplicate": False,
@@ -1508,14 +1133,17 @@ def process_batch_csv(
 def process_batch_file(
     input_path: str,
     db: Database,
-    revise_output_path: Optional[str] = None,
-    add_output_path: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
     user_id: int = SHARED_SCOPE,
     quantity_mode: str = QUANTITY_MODE_SET,
 ) -> Dict[str, Any]:
-    """Process a SortSwift batch CSV file from disk."""
+    """
+    Ingest a SortSwift export from disk.
+
+    Writes no files: it updates the catalogue and reports what it found.
+    The eBay-bound work is the drafts page and the API push.
+    """
     content = read_csv_text(input_path)
     # One connection for the whole run; see Database.session.
     with db.session():
@@ -1528,10 +1156,4 @@ def process_batch_file(
             user_id=user_id,
             quantity_mode=quantity_mode,
         )
-    if revise_output_path and result["revise_count"] > 0:
-        with open(revise_output_path, "w", encoding="utf-8", newline="") as f:
-            f.write(result["revise_csv"])
-    if add_output_path and result["add_count"] > 0:
-        with open(add_output_path, "w", encoding="utf-8", newline="") as f:
-            f.write(result["add_csv"])
     return result

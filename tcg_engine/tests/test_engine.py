@@ -8,7 +8,11 @@ from tcg_engine.db import (Database, apply_pricing_rules,
                           apply_condition_multiplier,
                           normalize_condition_key)
 from tcg_engine.orders import process_orders_csv
-from tcg_engine.batches import process_batch_csv
+from tcg_engine.batches import (
+    build_variation_option_name,
+    process_batch_csv,
+    variation_sort_key,
+)
 from tcg_engine.sync import sync_active_listings_csv
 from tcg_engine.relink import relink_from_active_listings, parse_option_name
 from tcg_engine.pricing_feed import refresh_market_prices, PriceFeedError
@@ -89,34 +93,6 @@ class TestTCGEngine(unittest.TestCase):
         self.assertTrue(any("ORD-9901" in line and "Pikachu" in line and "3" in line for line in csv_lines))
         self.assertTrue(any("ORD-9902" in line and "Mewtwo" in line and "1" in line for line in csv_lines))
 
-    def test_module_b_batches_routing(self):
-        # Populate DB with 1 card that is already live on eBay
-        self.db.insert_manifest("ID1001", "Gengar", "Fossil", "Near Mint", "Holofoil")
-        self.db.upsert_variation("ID1001", "123456789099", 2)
-
-        # Batch contains 1 existing live card (Revise) and 1 brand new card (Add)
-        sample_batch = """Product Name,Set Name,Condition,Printing,Quantity,ConditionID
-Gengar,Fossil,Near Mint,Holofoil,3,4000
-Alakazam,Base Set,Lightly Played,Normal,1,4000
-"""
-        res = process_batch_csv(sample_batch, self.db)
-        self.assertEqual(res["revise_count"], 1)
-        self.assertEqual(res["add_count"], 1)
-        self.assertEqual(res["new_catalog_count"], 1)
-
-        # Verify Revise CSV has updated quantity (2 previous + 3 new = 5)
-        revise_lines = res["revise_csv"].strip().splitlines()
-        # A File Exchange upload identifies an existing listing by "ItemID";
-        # "Item Number" is the Active Listings report's name for it and is not
-        # a valid upload column.
-        self.assertEqual(revise_lines[0], "Action,ItemID,CustomLabel,Quantity,Price")
-        self.assertTrue(any("Revise" in line and "123456789099" in line and "ID1001" in line and "5" in line for line in revise_lines))
-
-        # Verify Add CSV has new card with generated ID1002
-        add_lines = res["add_csv"].strip().splitlines()
-        self.assertIn("Action,Category,Title,Relationship,RelationshipDetails,Description,ConditionID,StartPrice,Quantity,CustomLabel,PicURL,Format,Duration,Price", add_lines[0])
-        self.assertTrue(any("ID1002" in line and "Alakazam" in line for line in add_lines))
-
     def test_variation_title_generation(self):
         from tcg_engine.batches import generate_variation_title
 
@@ -149,25 +125,6 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertLessEqual(len(t4), 80)
         self.assertIn("Base Set", t4)
 
-    def test_single_threshold_and_variation_grouping(self):
-        # Card 1: Market $0.17 -> Calculated price $1.99 (< $5.00) -> grouped into Set Variation
-        # Card 2: Market $4.50 -> Calculated price $7.50 (>= $5.00) -> listed as Single
-        batch_csv = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
-"6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","Bin-1",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","","","4000"
-"6a9f37cd1ffb1c868bf60ba1","Pokemon","","SV05: Temporal Forces","TEF","001/162","Iron Leaves ex","Ultra Rare","4.50","0.01","4.50","19.98","","NM","EN","Normal",1,"","Bin-2",542679,7805759,"760647","","https://cdn.example.com/ironleaves.jpg","","0.00","4.50","","","","","","","","4000"
-"""
-        res = process_batch_csv(batch_csv, self.db)
-        self.assertEqual(res["add_count"], 2)
-
-        add_lines = res["add_csv"].strip().splitlines()
-        # Should have:
-        # 1. Parent container row (Relationship=Variation, Title=SV05: Temporal Forces: Pick Your Card...)
-        # 2. Child variation row (Deerling, CustomLabel=ID1001-Bin-1, Price=1.99)
-        # 3. Single listing row (Iron Leaves ex, Relationship="", Title=Iron Leaves ex - SV05: Temporal Forces - Near Mint, Price=7.50)
-        self.assertTrue(any("SV05: Temporal Forces: Pick Your Card - NM - Complete Your Set" in line for line in add_lines))
-        self.assertTrue(any("Deerling" in line and "ID1001-Bin-1" in line and "1.99" in line for line in add_lines))
-        self.assertTrue(any("Iron Leaves ex" in line and "ID1002-Bin-2" in line and "7.50" in line and "Variation" not in line for line in add_lines))
-
     def test_sortswift_real_sample(self):
         # Test with the exact user SortSwift inventory format
         real_sample = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
@@ -175,7 +132,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 "6a9f37cd1ffb1c868bf60ba3","Pokemon","","SV05: Temporal Forces","TEF","018/162","Grubbin","Common","0.13","0.01","0.15","2.99","","NM","EN","Normal",2,"","No Remark",542763,7806223,"760648","","https://cdn.example.com/grubbin.jpg","","0.00","0.14","","","","","","","","4000"
 """
         res = process_batch_csv(real_sample, self.db)
-        self.assertEqual(res["add_count"], 2)
+        self.assertEqual(res["staged_card_count"], 2)
         self.assertEqual(res["new_catalog_count"], 2)
 
         # Check that SKU Id, TCGplayer Id, CDN image, and calculated price were cataloged
@@ -208,11 +165,16 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 "6a9f37cd1ffb1c868bf60ba0","Pokemon","","SV05: Temporal Forces","TEF","016/162","Deerling - 016/162","Common","0.17","0.01","0.17","19.98","","NM","EN","Normal",1,"","Bin A-12",542678,7805758,"760646","","https://cdn.example.com/deerling.jpg","","0.00","0.15","","","","","","","","4000"
 """
         res1 = process_batch_csv(batch_1, self.db)
-        self.assertEqual(res1["add_count"], 1)
+        self.assertEqual(res1["staged_card_count"], 1)
 
-        # Check that CustomLabel in eBay Add CSV encodes the bin remark: ID1001-Bin_A-12
-        add_lines = res1["add_csv"].strip().splitlines()
-        self.assertTrue(any("ID1001-Bin_A-12" in line for line in add_lines))
+        # The remark is stored against the card, which is what the
+        # order side decodes a bin from later in this test.
+        #
+        # Note the SKU itself no longer carries it for a *new* listing:
+        # the encoding was applied when building the Add file, and the
+        # push uses the stored custom_label or the bare manifest id.
+        # Whether the bin belongs in the SKU at all is the open question
+        # in docs/ebay-api-design.md section 10.
 
         # Check that remark is saved in DB
         card = self.db.get_manifest_by_id("ID1001")
@@ -229,10 +191,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 "6a9f37cd1ffb1c868bf60ba1","Pokemon","","Base Set","BS","058/102","Pikachu","Common","2.50","0.01","2.50","19.98","","NM","EN","Normal",1,"","Box 4",12345,67890,"12345","","https://cdn.example.com/pikachu.jpg","","0.00","2.50","","","","","","","","4000"
 """
         res2 = process_batch_csv(batch_2, self.db)
-        # Deerling was live on eBay -> routed to Revise with consolidated quantity (3 existing + 2 = 5)
-        self.assertEqual(res2["revise_count"], 1)
-        # Pikachu is new -> routed to Add with ID1002-Box_4
-        self.assertEqual(res2["add_count"], 1)
+        # Deerling is live on eBay already, so only Pikachu is newly staged.
+        self.assertEqual(res2["staged_card_count"], 1)
         self.assertEqual(res2["new_catalog_count"], 1)
 
         # Test eBay order with custom label ID1001-Bin_A-12
@@ -314,13 +274,12 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
     def test_duplicate_batch_is_refused_unless_forced(self):
         first = process_batch_csv(self.TWO_CARD_BATCH, self.db, source_name="scan.csv")
         self.assertFalse(first["duplicate"])
-        self.assertEqual(first["add_count"], 2)
+        self.assertEqual(first["staged_card_count"], 2)
 
         # Same bytes again: refused, and nothing is applied.
         second = process_batch_csv(self.TWO_CARD_BATCH, self.db, source_name="scan.csv")
         self.assertTrue(second["duplicate"])
-        self.assertEqual(second["add_count"], 0)
-        self.assertEqual(second["revise_count"], 0)
+        self.assertEqual(second["staged_card_count"], 0)
         self.assertEqual(second["new_catalog_count"], 0)
         self.assertTrue(
             any("already processed" in log["message"] for log in second["logs"])
@@ -334,33 +293,12 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             self.TWO_CARD_BATCH, self.db, source_name="scan.csv", force=True
         )
         self.assertFalse(forced["duplicate"])
-        self.assertEqual(forced["add_count"], 2)
-
+        self.assertEqual(forced["staged_card_count"], 2)
     def test_a_different_batch_is_not_treated_as_duplicate(self):
         process_batch_csv(self.TWO_CARD_BATCH, self.db, source_name="scan.csv")
         other = self.TWO_CARD_BATCH.replace("Deerling", "Sunkern")
         res = process_batch_csv(other, self.db, source_name="scan2.csv")
         self.assertFalse(res["duplicate"])
-
-    def test_group_by_set_disabled_lists_every_card_as_single(self):
-        self.db.set_listing_settings({"group_by_set": "false"})
-        res = process_batch_csv(self.TWO_CARD_BATCH, self.db)
-
-        self.assertEqual(res["add_count"], 2)
-        add_lines = res["add_csv"].strip().splitlines()
-        # No parent container row, so no row carries the Variation relationship.
-        self.assertFalse(
-            any("Variation" in line for line in add_lines[1:]),
-            "set grouping is off; no variation rows expected",
-        )
-        # The cheap card is now a single despite being below the threshold.
-        self.assertTrue(any("Deerling" in line and "1.99" in line for line in add_lines))
-
-    def test_group_by_set_enabled_still_groups(self):
-        self.db.set_listing_settings({"group_by_set": "true"})
-        res = process_batch_csv(self.TWO_CARD_BATCH, self.db)
-        add_lines = res["add_csv"].strip().splitlines()
-        self.assertTrue(any("Variation" in line for line in add_lines[1:]))
 
     def test_search_and_count_use_the_same_columns(self):
         process_batch_csv(self.TWO_CARD_BATCH, self.db)
@@ -440,7 +378,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         row by row.
         """
         res = process_batch_csv(self.BATCH_WITHOUT_CONDITION_ID, self.db)
-        self.assertEqual(res["add_count"], 0)
+        self.assertEqual(res["staged_card_count"], 0)
         self.assertEqual(self.db.get_stats()["total_cards"], 0)
         message = " ".join(log["message"] for log in res["logs"])
         self.assertIn("ConditionID", message)
@@ -459,7 +397,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         )
         res = process_batch_csv(batch, self.db)
         self.assertEqual(res["skipped_count"], 1)
-        self.assertEqual(res["add_count"], 1)
+        self.assertEqual(res["staged_card_count"], 1)
         self.assertTrue(
             any("ConditionID" in log["message"] for log in res["logs"]),
             "the skip reason should name the missing value",
@@ -467,68 +405,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 
     def test_row_without_condition_is_skipped(self):
         res = process_batch_csv(self.BATCH_WITHOUT_CONDITION, self.db)
-        self.assertEqual(res["add_count"], 0)
+        self.assertEqual(res["staged_card_count"], 0)
         self.assertEqual(res["skipped_count"], 1)
-
-    def test_variations_are_grouped_by_set_and_condition(self):
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-        self.assertEqual(res["add_count"], 2)
-
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        parents = [r for r in rows if not r["Relationship"]]
-        children = [r for r in rows if r["Relationship"] == "Variation"]
-
-        # One listing per (set, condition), so NM and LP do not share a parent.
-        self.assertEqual(len(parents), 2)
-        self.assertEqual(len(children), 2)
-
-        # Both listings are ungraded (ConditionID 4000); the grade that differs
-        # is carried by the Condition Descriptor.
-        self.assertEqual({p["ConditionID"] for p in parents}, {"4000"})
-        by_desc = {p["CD:40001"]: p for p in parents}
-        self.assertEqual(
-            set(by_desc),
-            {"Near mint or better - (ID: 400010)", "Excellent - (ID: 400015)"},
-        )
-        self.assertIn("NM", by_desc["Near mint or better - (ID: 400010)"]["Title"])
-        self.assertIn("LP", by_desc["Excellent - (ID: 400015)"]["Title"])
-
-    def test_parent_row_leaves_relationship_blank(self):
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        for r in rows:
-            if r["Title"]:
-                # Parent rows carry the title; eBay requires their Relationship
-                # to be empty so it can identify the container row.
-                self.assertEqual(r["Relationship"], "")
-                self.assertTrue(r["RelationshipDetails"].startswith("Card="))
-            else:
-                self.assertEqual(r["Relationship"], "Variation")
-
-    def test_variation_values_are_semicolon_separated(self):
-        batch = self.MIXED_CONDITION_BATCH.replace('"LP"', '"NM"')
-        res = process_batch_csv(batch, self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        parent = next(r for r in rows if r["Title"])
-
-        # Both cards now share one listing. Values must be semicolon separated:
-        # a pipe would be read by eBay as the start of a second attribute.
-        self.assertEqual(parent["RelationshipDetails"], "Card=Deerling;Mareep")
-        self.assertNotIn("|", parent["RelationshipDetails"])
-
-    def test_separator_characters_in_card_names_are_sanitized(self):
-        res = process_batch_csv(self.BATCH_WITH_PUNCTUATED_NAME, self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        details = [r["RelationshipDetails"] for r in rows]
-        # Neither separator may survive inside a value, or one card would be
-        # split into several bogus options.
-        for d in details:
-            self.assertNotIn(";", d.split("=", 1)[1])
-            self.assertNotIn("|", d)
-
-    # ------------------------------------------------------------------
-    # Catalogued quantity vs eBay's reported quantity
-    # ------------------------------------------------------------------
 
     def test_catalog_quantity_accumulates_in_add_mode(self):
         """In add mode a second batch adds to the first, for scan deltas."""
@@ -654,41 +532,6 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
                 for log in res["logs"])
         )
 
-    def test_descriptor_appears_on_every_generated_row(self):
-        from tcg_engine.batches import CONDITION_DESCRIPTOR_COLUMN
-
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        self.assertTrue(rows)
-        for r in rows:
-            self.assertTrue(
-                r[CONDITION_DESCRIPTOR_COLUMN],
-                "every Add row needs a Condition Descriptor",
-            )
-        # NM and LP groups carry their own descriptor.
-        descriptors = {r[CONDITION_DESCRIPTOR_COLUMN] for r in rows}
-        self.assertEqual(
-            descriptors,
-            {"Near mint or better - (ID: 400010)", "Excellent - (ID: 400015)"},
-        )
-
-    def test_explicit_descriptor_column_is_passed_through(self):
-        from tcg_engine.batches import CONDITION_DESCRIPTOR_COLUMN
-
-        # An export that already supplies the descriptor wins over our mapping.
-        hdr = (
-            '"Set","Name","Market Price","Condition","Printing","Quantity",'
-            '"Remarks","SKU Id","*ConditionID","CD:40001"'
-        )
-        row = (
-            '"Chilling Reign","Deerling","0.17","NM","Normal",1,"Bin-1",111,'
-            '"4000","Poor - (ID: 400017)"'
-        )
-        res = process_batch_csv(hdr + chr(10) + row + chr(10), self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        for r in rows:
-            self.assertEqual(r[CONDITION_DESCRIPTOR_COLUMN], "Poor - (ID: 400017)")
-
     def test_graded_condition_id_is_skipped(self):
         batch = self.MIXED_CONDITION_BATCH.replace('"4000"', '"2750"')
         res = process_batch_csv(batch, self.db)
@@ -700,115 +543,12 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
     # Item location and business policies (eBay error 10009)
     # ------------------------------------------------------------------
 
-    def test_postal_code_is_emitted_and_location_is_not(self):
-        self.db.set_listing_settings({"seller_postal_code": "94301"})
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-
-        header = res["add_csv"].splitlines()[0].split(",")
-        self.assertIn("PostalCode", header)
-        # Location and PostalCode are alternatives; sending both is a documented
-        # cause of the 10009 error this column exists to fix.
-        self.assertNotIn("Location", header)
-
-        for r in csv.DictReader(io.StringIO(res["add_csv"])):
-            self.assertEqual(r["PostalCode"], "94301")
-
-    def test_missing_postal_code_raises_an_error_log(self):
-        self.db.set_listing_settings({"seller_postal_code": ""})
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-
-        errors = [lg for lg in res["logs"] if lg["level"] == "ERROR"]
-        self.assertTrue(errors, "an unset postal code must be surfaced loudly")
-        self.assertTrue(
-            any("10009" in lg["message"] for lg in errors),
-            "the log should name the eBay error code it will cause",
-        )
-
-    def test_business_policy_columns_appear_only_when_configured(self):
-        # Explicitly blank the other two: they ship with defaults, and the
-        # behaviour under test is that a BLANK policy omits its column.
-        self.db.set_listing_settings({
-            "seller_postal_code": "94301",
-            "shipping_profile_name": "Standard Free Shipping",
-            "return_profile_name": "",
-            "payment_profile_name": "",
-        })
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-
-        header = res["add_csv"].splitlines()[0].split(",")
-        self.assertIn("ShippingProfileName", header)
-        # An unconfigured policy is omitted entirely rather than sent blank.
-        self.assertNotIn("ReturnProfileName", header)
-        self.assertNotIn("PaymentProfileName", header)
-
-        for r in csv.DictReader(io.StringIO(res["add_csv"])):
-            self.assertEqual(r["ShippingProfileName"], "Standard Free Shipping")
-
-    def test_all_business_policies_are_emitted_verbatim(self):
-        policies = {
-            "shipping_profile_name": "Standard Free Shipping",
-            "return_profile_name": "30 Day Returns",
-            "payment_profile_name": "Managed Payments",
-        }
-        self.db.set_listing_settings(dict(policies, seller_postal_code="94301"))
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        self.assertTrue(rows)
-        for r in rows:
-            # Policy names are matched case-sensitively by eBay, so they must
-            # survive untouched.
-            self.assertEqual(r["ShippingProfileName"], "Standard Free Shipping")
-            self.assertEqual(r["ReturnProfileName"], "30 Day Returns")
-            self.assertEqual(r["PaymentProfileName"], "Managed Payments")
-
-    def test_empty_batch_still_reports_the_effective_headers(self):
-        self.db.set_listing_settings({
-            "seller_postal_code": "94301",
-            "shipping_profile_name": "Standard Free Shipping",
-        })
-        res = process_batch_csv("", self.db)
-        header = res["add_csv"].splitlines()[0].split(",")
-        self.assertIn("PostalCode", header)
-        self.assertIn("ShippingProfileName", header)
-
-    # ------------------------------------------------------------------
-    # Shipped seller defaults (postal code + business policies)
-    # ------------------------------------------------------------------
-
     def test_seller_settings_are_prepopulated_by_default(self):
         settings = self.db.get_listing_settings()
         self.assertEqual(settings["seller_postal_code"], "94305")
         self.assertEqual(settings["shipping_profile_name"], "Free Shipping Cards")
         self.assertEqual(settings["return_profile_name"], "No Returns")
         self.assertEqual(settings["payment_profile_name"], "Immediate Payment")
-
-    def test_defaults_reach_the_generated_csv_with_no_configuration(self):
-        # Straight out of the box, with nothing configured, the Add file must
-        # already carry everything eBay rejected it for.
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-
-        header = res["add_csv"].splitlines()[0].split(",")
-        for column in (
-            "PostalCode",
-            "ShippingProfileName",
-            "ReturnProfileName",
-            "PaymentProfileName",
-        ):
-            self.assertIn(column, header)
-        self.assertNotIn("Location", header)
-
-        for r in csv.DictReader(io.StringIO(res["add_csv"])):
-            self.assertEqual(r["PostalCode"], "94305")
-            self.assertEqual(r["ShippingProfileName"], "Free Shipping Cards")
-            self.assertEqual(r["ReturnProfileName"], "No Returns")
-            self.assertEqual(r["PaymentProfileName"], "Immediate Payment")
-
-        # And no error about a missing location.
-        self.assertFalse(
-            [lg for lg in res["logs"] if lg["level"] == "ERROR"],
-            "a fully defaulted run should not warn about missing seller fields",
-        )
 
     def test_blank_seller_values_are_backfilled_on_reopen(self):
         # Simulates a database created before these defaults existed.
@@ -876,122 +616,10 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 "Test TCG","Chilling Reign","English","Heracross","004/198","Chilling Reign","Heracross","0.17","NM","Normal",1,"C-1",112,"4000"
 """
 
-    def test_item_specific_columns_are_forwarded(self):
-        res = process_batch_csv(self.EBAY_EXPORT_BATCH, self.db)
-        header = res["add_csv"].splitlines()[0].split(",")
-
-        # The leading asterisk is a template annotation, not part of the name.
-        for column in ("C:Game", "C:Set", "C:Language"):
-            self.assertIn(column, header)
-        self.assertNotIn("*C:Game", header)
-
-    def test_parent_keeps_only_specifics_shared_by_the_whole_group(self):
-        # Clear the overriding setting so the export-supplied value is used.
-        self.db.set_listing_settings({"default_game": ""})
-        res = process_batch_csv(self.EBAY_EXPORT_BATCH, self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        parent = next(r for r in rows if r["Title"])
-
-        # Uniform across the group -> valid at listing level.
-        self.assertEqual(parent["C:Game"], "Test TCG")
-        self.assertEqual(parent["C:Set"], "Chilling Reign")
-        self.assertEqual(parent["C:Language"], "English")
-
-        # Differs per card -> cannot be a single listing-level value, and the
-        # variation axis already expresses it.
-        self.assertEqual(parent["C:Card Name"], "")
-        self.assertEqual(parent["C:Card Number"], "")
-
-    def test_game_falls_back_to_the_configured_default(self):
-        self.db.set_listing_settings({"default_game": "Fallback Game"})
-        # A batch with no game information anywhere.
-        res = process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        for r in rows:
-            if r["Title"]:
-                self.assertEqual(r["C:Game"], "Fallback Game")
-
-    def test_bare_game_column_is_normalised(self):
-        # Clear the overriding setting so the export-supplied value is used.
-        self.db.set_listing_settings({"default_game": ""})
-        hdr = (
-            '"Game","Set","Name","Market Price","Condition","Printing",'
-            '"Quantity","Remarks","SKU Id","*ConditionID"'
-        )
-        row = '"Some Game","Chilling Reign","Deerling","0.17","NM","Normal",1,"C-1",111,"4000"'
-        res = process_batch_csv(chr(10).join([hdr, row]) + chr(10), self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        parent = next(r for r in rows if r["Title"])
-        self.assertEqual(parent["C:Game"], "Some Game")
-
-    def test_single_listing_keeps_all_of_its_own_specifics(self):
-        # Clear the overriding setting so the export-supplied value is used.
-        self.db.set_listing_settings({"default_game": ""})
-        batch = self.EBAY_EXPORT_BATCH.replace('"0.17"', '"40.00"')
-        res = process_batch_csv(batch, self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        # Above the threshold every card is a single, so nothing is uniform-only.
-        self.assertFalse([r for r in rows if r["Relationship"] == "Variation"])
-        for r in rows:
-            self.assertEqual(r["C:Game"], "Test TCG")
-            self.assertTrue(r["C:Card Name"], "a single keeps its own card name")
-
     PLAIN_EXPORT_BATCH = """"Game","Set","Set Code","Card Number","Name","Rarity","Market Price","Condition","Language","Printing","Quantity","Remarks","SKU Id","*ConditionID"
 "Pokemon","SWSH06: Chilling Reign","CRE","121/198","Crushing Gloves","Uncommon","0.17","NM","English","Normal",1,"C-1",111,"4000"
 "Pokemon","SWSH06: Chilling Reign","CRE","004/198","Heracross","Common","0.17","NM","English","Normal",2,"C-1",112,"4000"
 """
-
-    def test_specifics_are_derived_from_plain_sortswift_columns(self):
-        """A plain export with no C: columns still gets eBay specifics."""
-        res = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db)
-        header = res["add_csv"].splitlines()[0].split(",")
-        for column in ("C:Game", "C:Set", "C:Card Name", "C:Card Number",
-                       "C:Language", "C:Rarity", "C:Finish"):
-            self.assertIn(column, header, f"{column} should be derived")
-
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        parent = next(r for r in rows if r["Title"])
-        # Uniform across the group.
-        self.assertEqual(parent["C:Set"], "SWSH06: Chilling Reign")
-        self.assertEqual(parent["C:Language"], "English")
-        self.assertEqual(parent["C:Finish"], "Normal")
-        # Varies per card, so not stated at listing level.
-        self.assertEqual(parent["C:Rarity"], "")
-        self.assertEqual(parent["C:Card Number"], "")
-
-    def test_configured_game_overrides_the_export_value(self):
-        """eBay only accepts its own Game values, so the setting wins."""
-        self.db.set_listing_settings({"default_game": "Pokemon TCG (exact)"})
-        res = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db)
-        for r in csv.DictReader(io.StringIO(res["add_csv"])):
-            if r["Title"]:
-                # Not "Pokemon", which is what the export says.
-                self.assertEqual(r["C:Game"], "Pokemon TCG (exact)")
-
-    def test_blank_game_setting_falls_back_to_the_export(self):
-        self.db.set_listing_settings({"default_game": ""})
-        res = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db)
-        for r in csv.DictReader(io.StringIO(res["add_csv"])):
-            if r["Title"]:
-                self.assertEqual(r["C:Game"], "Pokemon")
-
-    def test_explicit_c_column_beats_a_derived_one(self):
-        hdr = (
-            '"*C:Set","Set","Name","Market Price","Condition","Printing",'
-            '"Quantity","Remarks","SKU Id","*ConditionID"'
-        )
-        row = (
-            '"eBay Set Name","Internal Set Name","Deerling","0.17","NM","Normal",'
-            '1,"C-1",111,"4000"'
-        )
-        res = process_batch_csv(chr(10).join([hdr, row]) + chr(10), self.db)
-        rows = list(csv.DictReader(io.StringIO(res["add_csv"])))
-        parent = next(r for r in rows if r["Title"])
-        self.assertEqual(parent["C:Set"], "eBay Set Name")
-
-    # ------------------------------------------------------------------
-    # Download-only (dry run) regeneration
-    # ------------------------------------------------------------------
 
     def _full_state(self):
         return (
@@ -1000,7 +628,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             self.db.get_inventory(limit=1000),
         )
 
-    def test_dry_run_writes_nothing_but_still_produces_files(self):
+    def test_dry_run_writes_nothing_but_still_reports(self):
         process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
         before = self._full_state()
 
@@ -1010,84 +638,76 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertTrue(res["dry_run"])
         # Not reported as a duplicate: a read-only rebuild is always safe.
         self.assertFalse(res["duplicate"])
-        self.assertEqual(res["add_count"], 2, "the files must still be generated")
+        self.assertEqual(res["staged_card_count"], 2,
+                         "it must still report what it would stage")
         self.assertEqual(self._full_state(), before, "dry run mutated state")
-
     def test_dry_run_does_not_fingerprint_the_batch(self):
         res = process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
         )
         # Nothing was catalogued, so nothing could be emitted...
-        self.assertEqual(res["add_count"], 0)
+        self.assertEqual(res["staged_card_count"], 0)
         # ...and the batch must remain un-fingerprinted so a real run still works.
         real = process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
         self.assertFalse(real["duplicate"])
-        self.assertEqual(real["add_count"], 2)
-
-    def test_dry_run_uses_current_settings_not_the_previous_output(self):
-        process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
-        self.db.set_listing_settings({
-            "seller_postal_code": "10001",
-            "default_game": "Changed Game",
-        })
-        res = process_batch_csv(
-            self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
-        )
-        parent = next(
-            r for r in csv.DictReader(io.StringIO(res["add_csv"])) if r["Title"]
-        )
-        # The whole point of rebuilding is to pick up changed settings.
-        self.assertEqual(parent["PostalCode"], "10001")
-        self.assertEqual(parent["C:Game"], "Changed Game")
+        self.assertEqual(real["staged_card_count"], 2)
 
     def test_dry_run_skips_cards_not_yet_catalogued(self):
         res = process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", dry_run=True
         )
-        self.assertEqual(res["add_count"], 0)
+        self.assertEqual(res["staged_card_count"], 0)
         self.assertEqual(res["skipped_count"], 2)
         self.assertTrue(
             any("not in the catalogue yet" in lg["message"] for lg in res["logs"]),
             "the skip reason should explain why an ID cannot be minted",
         )
 
-    def test_add_mode_accumulates_on_ebays_figure_then_on_pending(self):
+    def test_add_mode_accumulates_across_batches_before_any_sync(self):
         """
-        Add mode starts from what eBay reports, and from then on from what we
-        last asked eBay for -- otherwise two scan batches uploaded before a
-        sync would both start from the same base and the first would be lost.
+        Two scan deltas uploaded before a sync must both land.
+
+        Add mode accumulates on the catalogue's own figure, which is correct
+        whether or not eBay has been told anything. It used to accumulate on
+        eBay's last reported quantity, which needed a second column --
+        ``pending_qty``, recording what a generated Revise file had asked for
+        -- purely so the second batch would not start from the same stale
+        number and lose the first. Nothing generates such a file now, and the
+        catalogue was always the better base.
         """
         process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db,
                           source_name="b.csv", quantity_mode="add")
-        # eBay reports 3 for this card, which also clears anything pending.
+        # eBay reports 3 for this card.
         self.db.upsert_variation("ID1001", "998877665544", 3)
-        self.assertIsNone(self.db.get_variation("ID1001")["pending_qty"])
+        catalogued = self.db.get_manifest_by_id("ID1001")["quantity"]
 
-        first = process_batch_csv(
+        process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b1.csv",
             quantity_mode="add", force=True,
         )
-        revise = list(csv.DictReader(io.StringIO(first["revise_csv"])))
-        self.assertEqual(revise[0]["Quantity"], "4", "eBay's 3 plus this file's 1")
+        self.assertEqual(
+            self.db.get_manifest_by_id("ID1001")["quantity"], catalogued + 1
+        )
 
-        # eBay has not been told yet, so its own figure must not have moved.
-        variation = self.db.get_variation("ID1001")
-        self.assertEqual(variation["last_known_qty"], 3)
-        self.assertEqual(variation["pending_qty"], 4)
-
-        second = process_batch_csv(
+        process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b2.csv",
             quantity_mode="add", force=True,
         )
-        revise = list(csv.DictReader(io.StringIO(second["revise_csv"])))
-        self.assertEqual(revise[0]["Quantity"], "5",
-                         "builds on the outstanding 4, not on eBay's stale 3")
-        self.assertEqual(self.db.get_variation("ID1001")["last_known_qty"], 3)
+        self.assertEqual(
+            self.db.get_manifest_by_id("ID1001")["quantity"], catalogued + 2,
+            "the second batch builds on the first, not on eBay's figure",
+        )
+
+        # And eBay's own figure is untouched throughout: only a sync or a
+        # confirmed push may move it.
+        self.assertEqual(
+            self.db.get_variation("ID1001")["last_known_qty"], 3)
 
     def test_dry_run_matches_a_real_run_in_set_mode(self):
         """
         With replace semantics there is no accumulation to double, so a
-        download-only run and a real run must produce the same file.
+        preview and a real run must reach the same conclusions -- the only
+        difference being that one of them wrote them down.
         """
         process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
         self.db.upsert_variation("ID1001", "998877665544", 3)
@@ -1099,11 +719,13 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         applied = process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", force=True,
         )
-        self.assertEqual(preview["revise_csv"], applied["revise_csv"])
-        # The dump said 1, so the mirror is corrected down from eBay's 3.
-        revise = list(csv.DictReader(io.StringIO(applied["revise_csv"])))
-        by_label = {r["CustomLabel"]: r for r in revise}
-        self.assertIn("ID1001", str(by_label))
+        comparable = ("staged_card_count", "staged_listing_count",
+                      "zeroed_count", "new_catalog_count", "skipped_count",
+                      "parsed_rows", "reconciled")
+        self.assertEqual(
+            {k: preview[k] for k in comparable},
+            {k: applied[k] for k in comparable},
+        )
 
     # ------------------------------------------------------------------
     # Variation option names, ordering, and per-variation images
@@ -1127,68 +749,59 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         ]
 
     def test_option_names_include_the_card_number(self):
-        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
-        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
-        self.assertIn("Crushing Gloves (133/198)", options)
-
+        # The card number makes otherwise-identical reprints distinguishable
+        # and gives the dropdown a natural order.
+        self.assertEqual(
+            build_variation_option_name("Crushing Gloves", "133/198"),
+            "Crushing Gloves (133/198)",
+        )
     def test_options_are_sorted_numerically_by_card_number(self):
-        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
-        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
-        # 4 before 16 before 133 -- a string sort would give 133, 16, 4.
-        self.assertEqual(
-            options,
-            ["Heracross (4/198)", "Deerling (16/198)", "Crushing Gloves (133/198)"],
-        )
-        # Child rows must follow the same order as the parent's option list.
-        child_options = [
-            c["RelationshipDetails"].split("=", 1)[1] for c in self._children(res)
+        # 4 before 16 before 133 -- a string sort would give 133, 16, 4, and
+        # this order *is* the order eBay shows the variation dropdown in.
+        cards = [
+            {"product_name": "Crushing Gloves", "card_number": "133/198"},
+            {"product_name": "Heracross", "card_number": "4/198"},
+            {"product_name": "Deerling", "card_number": "16/198"},
         ]
-        self.assertEqual(child_options, options)
+        ordered = [
+            build_variation_option_name(c["product_name"], c["card_number"])
+            for c in sorted(cards, key=variation_sort_key)
+        ]
+        self.assertEqual(ordered, [
+            "Heracross (4/198)",
+            "Deerling (16/198)",
+            "Crushing Gloves (133/198)",
+        ])
 
+    def test_numbers_with_a_prefix_sort_within_their_prefix(self):
+        # Real card numbers are not plain integers: "TG12/TG30", "SV107".
+        cards = [
+            {"product_name": "b", "card_number": "TG12/TG30"},
+            {"product_name": "a", "card_number": "TG2/TG30"},
+            {"product_name": "c", "card_number": "5/198"},
+        ]
+        self.assertEqual(
+            [c["product_name"] for c in sorted(cards, key=variation_sort_key)],
+            ["c", "a", "b"],
+        )
     def test_cards_without_a_number_sort_last_and_drop_the_brackets(self):
-        batch = self.NUMBERED_BATCH.replace('"16/198","Deerling"', '"","Deerling"')
-        res = process_batch_csv(batch, self.db)
-        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
-        self.assertEqual(options[-1], "Deerling", "no empty brackets, sorted last")
-
-    def test_each_variation_image_is_prefixed_with_its_option_name(self):
-        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
-        pics = {
-            c["RelationshipDetails"].split("=", 1)[1]: c["PicURL"]
-            for c in self._children(res)
-        }
-        # eBay ignores a bare URL on a child row; it must name the option.
+        self.assertEqual(build_variation_option_name("Deerling", ""), "Deerling")
+        cards = [
+            {"product_name": "Deerling", "card_number": ""},
+            {"product_name": "Heracross", "card_number": "4/198"},
+        ]
         self.assertEqual(
-            pics["Crushing Gloves (133/198)"],
-            "Crushing Gloves (133/198)=https://cdn/gloves.jpg",
+            [c["product_name"] for c in sorted(cards, key=variation_sort_key)],
+            ["Heracross", "Deerling"],
+            "an unnumbered card sorts last rather than scattering",
         )
-        self.assertEqual(
-            pics["Heracross (4/198)"], "Heracross (4/198)=https://cdn/heracross.jpg"
-        )
-        # A card with no image gets an empty cell, not a dangling separator.
-        self.assertEqual(pics["Deerling (16/198)"], "")
-
-    def test_cover_photo_setting_overrides_the_parent_image(self):
-        self.db.set_listing_settings({"cover_image_url": "https://cdn/cover.jpg"})
-        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
-        self.assertEqual(self._parent(res)["PicURL"], "https://cdn/cover.jpg")
-        # Variations keep their own images regardless.
-        pics = [c["PicURL"] for c in self._children(res) if c["PicURL"]]
-        self.assertTrue(any("gloves.jpg" in p for p in pics))
-
-    def test_parent_falls_back_to_the_first_cards_image(self):
-        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
-        # First in sorted order is Heracross (4/198).
-        self.assertEqual(self._parent(res)["PicURL"], "https://cdn/heracross.jpg")
-
     def test_option_template_is_configurable(self):
-        self.db.set_listing_settings(
-            {"variation_option_template": "{card_number} {name}"}
+        self.assertEqual(
+            build_variation_option_name(
+                "Heracross", "4/198", template="{card_number} {name}"
+            ),
+            "4/198 Heracross",
         )
-        res = process_batch_csv(self.NUMBERED_BATCH, self.db)
-        options = self._parent(res)["RelationshipDetails"].split("=", 1)[1].split(";")
-        self.assertEqual(options[0], "4/198 Heracross")
-
     def test_equals_sign_is_stripped_from_option_names(self):
         from tcg_engine.batches import build_variation_option_name
 
@@ -1235,7 +848,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 
         again = process_batch_csv(self.NUMBERED_BATCH, self.db, source_name="b.csv")
         self.assertFalse(again["duplicate"])
-        self.assertEqual(again["add_count"], 3)
+        self.assertEqual(again["staged_card_count"], 3)
         # IDs restart, since the catalogue is empty.
         self.assertEqual(self.db.get_next_manifest_id(), "ID1004")
 
@@ -1487,7 +1100,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         plain = process_batch_csv(self.NUMBERED_BATCH, db_b)
         db_b2 = Database(self.db_path + ".b2")
         with_bom = process_batch_csv(self.BOM + self.NUMBERED_BATCH, db_b2)
-        self.assertEqual(plain["add_count"], with_bom["add_count"])
+        self.assertEqual(plain["staged_card_count"], with_bom["staged_card_count"])
         self.assertEqual(with_bom["skipped_count"], 0)
 
         # Module C
@@ -1768,24 +1381,6 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         sync_active_listings_csv(report, self.db)
         self.assertEqual(self.db.get_listing_cover_image(item), "https://cdn/cover.jpg")
 
-    def test_revise_output_uses_itemid_not_item_number(self):
-        """The batch Revise file is an upload, so it must use ItemID."""
-        self.db.insert_manifest("ID1001", "Gengar", "Fossil", "NM", "Holofoil")
-        self.db.upsert_variation("ID1001", "123456789099", 2)
-
-        batch = (
-            "Product Name,Set Name,Condition,Printing,Quantity,ConditionID" + chr(10)
-            + "Gengar,Fossil,NM,Holofoil,3,4000" + chr(10)
-        )
-        res = process_batch_csv(batch, self.db)
-        header = res["revise_csv"].splitlines()[0].split(",")
-        self.assertIn("ItemID", header)
-        self.assertNotIn("Item Number", header)
-
-    # ------------------------------------------------------------------
-    # Database snapshot export / inspect / restore
-    # ------------------------------------------------------------------
-
     def test_snapshot_export_is_self_contained(self):
         process_batch_csv(self.TWO_SET_BATCH, self.db)
         dest = os.path.join(self.temp_dir.name, "snap.db")
@@ -1984,9 +1579,13 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             csv_text, self.db, source_name="a.csv", force=True, dry_run=True,
             user_id=7,
         )
-        self.assertIn("2.49", shared["add_csv"])
-        self.assertIn("9.99", mine["add_csv"])
-        self.assertNotIn("9.99", shared["add_csv"])
+        # The rules are the uploader's own, so the price each run computes
+        # differs. A dry run stores nothing, so read it from the logs,
+        # which name the price they priced each card at.
+        self.assertIn("2.49", chr(10).join(
+            lg["message"] for lg in shared["logs"]))
+        self.assertIn("9.99", chr(10).join(
+            lg["message"] for lg in mine["logs"]))
 
     def test_scoping_migration_preserves_an_unscoped_database(self):
         """
@@ -2084,14 +1683,24 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
           '"English","Normal",2,"Bin A-2","4000"' + chr(10)
     )
 
-    def _seed_live_dump(self):
-        """Catalogue the dump and put both cards live on eBay with labels."""
+    def _seed_live_dump(self, live_qty=2):
+        """
+        Catalogue the dump and put both cards live on eBay with labels.
+
+        ``live_qty`` is what eBay is believed to hold, and it defaults to
+        stock rather than zero because a live listing at zero is not a
+        listing anybody is selling from. It used to default to 0, which
+        only worked for the sold-out tests because the module recorded a
+        non-zero *pending* request alongside it; with that gone, a
+        believed quantity of zero correctly means "nothing to pull".
+        """
         process_batch_csv(self.FULL_DUMP, self.db, source_name="seed.csv")
         ids = {r["product_name"]: r["manifest_id"]
                for r in self.db.export_all_manifest()}
         for name, mid in ids.items():
             self.db.upsert_variation(
-                mid, "227511361186", 0, custom_label=f"{mid}-Bin_A-1"
+                mid, "227511361186", live_qty,
+                custom_label=f"{mid}-Bin_A-1"
             )
         return ids
 
@@ -2105,16 +1714,11 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 
         seen = []
         for n in range(3):
-            res = process_batch_csv(
+            process_batch_csv(
                 self.FULL_DUMP, self.db, source_name=f"d{n}.csv", force=True
             )
-            revise = list(csv.DictReader(io.StringIO(res["revise_csv"])))
-            by_id = {r["ItemID"] + r["CustomLabel"]: r["Quantity"]
-                     for r in revise}
-            seen.append(sorted(by_id.values()))
-
-            # One row per card, not one per CSV row.
-            self.assertEqual(len(revise), 2, "one Revise row per card")
+            seen.append({r["product_name"]: r["quantity"]
+                         for r in self.db.export_all_manifest()})
 
         self.assertEqual(seen[0], seen[1])
         self.assertEqual(seen[1], seen[2], "uploads must be idempotent")
@@ -2124,14 +1728,14 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(catalogued["Ledyba"], 3, "2 + 1 across two bins")
         self.assertEqual(catalogued["Heracross"], 2)
 
-        # Module A records what it asked for, and must leave eBay's own figure
-        # alone until an Active Listings sync moves it.
+        # Module A corrects the catalogue and must leave eBay's own figure
+        # alone: only an Active Listings sync, or a confirmed push, may
+        # move that. The difference between the two is what the draft is.
         variation = self.db.get_variation(ids["Ledyba"])
-        self.assertEqual(variation["pending_qty"], 3)
-        self.assertEqual(variation["last_known_qty"], 0,
-                         "generating a CSV must not claim eBay was updated")
+        self.assertEqual(variation["last_known_qty"], 2,
+                         "ingesting a dump must not claim eBay was updated")
 
-    def test_full_dump_revises_absent_cards_to_zero(self):
+    def test_full_dump_zeroes_absent_cards_in_the_catalogue(self):
         """A card missing from a full dump has sold out and must be pulled."""
         ids = self._seed_live_dump()
         process_batch_csv(self.FULL_DUMP, self.db, source_name="d1.csv",
@@ -2143,32 +1747,29 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         res = process_batch_csv(smaller, self.db, source_name="d2.csv")
 
         self.assertEqual(res["zeroed_count"], 1)
-        revise = list(csv.DictReader(io.StringIO(res["revise_csv"])))
-        zeroed = [r for r in revise if r["Quantity"] == "0"]
-        self.assertEqual(len(zeroed), 1)
-
-        # The label must be the one eBay knows, not one rebuilt from this file.
-        self.assertEqual(zeroed[0]["CustomLabel"],
-                         f"{ids['Heracross']}-Bin_A-1")
-        # Blank price means "do not change the price"; this row is about stock.
-        self.assertEqual(zeroed[0]["Price"], "")
-
-        variation = self.db.get_variation(ids["Heracross"])
-        self.assertEqual(variation["pending_qty"], 0, "we asked eBay for zero")
         catalogued = {r["product_name"]: r["quantity"]
                       for r in self.db.export_all_manifest()}
         self.assertEqual(catalogued["Heracross"], 0)
+        # eBay's own figure is never written here: only a Module B sync may
+        # move it, and the draft this produces is what asks eBay for zero.
+        self.assertEqual(
+            self.db.get_variation(ids["Heracross"])["last_known_qty"], 2)
         self.assertTrue(any(
             "SOLD OUT" in lg["message"] for lg in res["logs"]
         ), "the operator must be told which cards were pulled")
+    def test_an_absent_card_keeps_being_reported_until_ebay_confirms_zero(self):
+        """
+        Suppression now waits for confirmation rather than for an intention.
 
-    def test_absent_card_already_at_zero_is_not_re_zeroed(self):
+        The old rule stopped re-reporting a sold-out card as soon as a Revise
+        row had been *written* for it, tracked in ``pending_qty`` -- because a
+        file may or may not ever be uploaded, and re-emitting the row every
+        time was noise. Nothing writes a file now: the push applies the change
+        and records eBay's confirmed quantity in the same breath. So the card
+        stays reported until eBay's own figure reaches zero, which is the
+        stricter and more honest condition.
         """
-        Avoid a pointless Revise row on every later upload, while still
-        re-asking until eBay confirms. The first smaller dump has something to
-        zero because the full dump left a non-zero request outstanding.
-        """
-        self._seed_live_dump()
+        ids = self._seed_live_dump()
         process_batch_csv(self.FULL_DUMP, self.db, source_name="d0.csv",
                           force=True)
 
@@ -2178,9 +1779,15 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
 
         again = process_batch_csv(smaller, self.db, source_name="d2.csv",
                                   force=True)
-        self.assertEqual(again["zeroed_count"], 0,
-                         "zero is already the outstanding request")
+        self.assertEqual(again["zeroed_count"], 1,
+                         "eBay still reports stock, so it is still sold out")
 
+        # Once a sync (or a push) has taught us eBay holds zero, it stops.
+        self.db.upsert_variation(ids["Heracross"], "227511361186", 0,
+                                 custom_label=ids["Heracross"] + "-Bin_A-1")
+        settled = process_batch_csv(smaller, self.db, source_name="d3.csv",
+                                    force=True)
+        self.assertEqual(settled["zeroed_count"], 0)
     def test_add_mode_does_not_zero_absent_cards(self):
         """
         A scan delta says nothing about cards it omits, so add mode must
@@ -2192,8 +1799,8 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
                                 quantity_mode="add")
         self.assertEqual(res["zeroed_count"], 0)
         self.assertEqual(
-            self.db.get_variation(ids["Heracross"])["last_known_qty"], 0,
-            "seeded at 0 and left alone",
+            self.db.get_variation(ids["Heracross"])["last_known_qty"], 2,
+            "left exactly as the fixture seeded it",
         )
         self.assertNotIn("SOLD OUT",
                          chr(10).join(lg["message"] for lg in res["logs"]))
@@ -2286,7 +1893,7 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
     def test_session_reuses_one_connection_without_changing_results(self):
         """
         The session is a performance change only: it must not alter what a
-        batch produces, and it must leave the data committed.
+        batch concludes, and it must leave the data committed.
         """
         import sqlite3 as _sqlite3
         real = _sqlite3.connect
@@ -2307,14 +1914,14 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         finally:
             _sqlite3.connect = real
 
-        self.assertEqual(without["add_csv"], withsess["add_csv"])
-        self.assertEqual(without["revise_csv"], withsess["revise_csv"])
+        for key in ("staged_card_count", "staged_listing_count",
+                    "new_catalog_count", "skipped_count", "parsed_rows"):
+            self.assertEqual(without[key], withsess[key], key)
         self.assertEqual(count["n"], 1, "one connection for the whole run")
 
         # Reopening proves the work was committed, not lost on close.
         reopened = Database(fresh.db_path)
         self.assertEqual(reopened.get_stats()["total_on_hand"], 5)
-
     def test_session_is_reentrant(self):
         """Nesting must not close the outer connection early."""
         with self.db.session():
@@ -2373,38 +1980,6 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         # On Hand did change, which is Module A's business.
         self.assertGreater(self.db.get_stats()["total_on_hand"], 0)
 
-    def test_a_sync_clears_the_outstanding_request(self):
-        """
-        Once eBay reports back, what we asked for is history -- otherwise the
-        UI would keep showing a pending change that has already landed.
-        """
-        ids = self._seed_live_dump()
-        mid = ids["Ledyba"]
-        process_batch_csv(self.FULL_DUMP, self.db, source_name="d.csv",
-                          force=True)
-        self.assertEqual(self.db.get_variation(mid)["pending_qty"], 3)
-
-        report = (
-            "Item number,Custom label,Available quantity,Title" + chr(10)
-            + f"227511361186,{mid},3,Chilling Reign: Pick Your Card" + chr(10)
-        )
-        sync_active_listings_csv(report, self.db)
-
-        variation = self.db.get_variation(mid)
-        self.assertEqual(variation["last_known_qty"], 3, "now eBay has told us")
-        self.assertIsNone(variation["pending_qty"], "nothing outstanding")
-        self.assertEqual(self.db.get_stats()["total_stock"], 3)
-
-    def test_pending_is_exposed_to_the_inventory_view(self):
-        """The UI needs it to explain why On Hand and On eBay disagree."""
-        self._seed_live_dump()
-        process_batch_csv(self.FULL_DUMP, self.db, source_name="d.csv",
-                          force=True)
-        rows = {r["product_name"]: r
-                for r in self.db.get_inventory(limit=50)}
-        self.assertEqual(rows["Ledyba"]["quantity"], 3)
-        self.assertEqual(rows["Ledyba"]["last_known_qty"], 0)
-        self.assertEqual(rows["Ledyba"]["pending_qty"], 3)
     def test_sync_zeroes_cards_missing_from_the_report(self):
         """
         A linked card absent from an Active Listings report is not live on
@@ -2475,105 +2050,6 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
                                  self.db)
         return ids
 
-    def test_unchanged_dump_produces_no_revise_rows(self):
-        """
-        A full dump with nothing changed must not ask eBay to rewrite every
-        listing. Emitting one row per catalogued card regardless made a no-op
-        upload look like dozens of pending changes.
-        """
-        self._synced_dump_fixture()
-        res = process_batch_csv(self.FULL_DUMP, self.db,
-                                source_name="again.csv", force=True)
-        self.assertEqual(res["revise_count"], 0)
-        self.assertEqual(res["unchanged_count"], 2)
-        self.assertEqual(list(csv.DictReader(io.StringIO(res["revise_csv"]))), [],
-                         "the file should carry only its header")
-        self.assertTrue(any("already match eBay" in lg["message"]
-                            for lg in res["logs"]))
-
-    def test_a_quantity_change_emits_and_keeps_emitting_until_confirmed(self):
-        """
-        Only the changed card appears, and it must keep appearing until a sync
-        confirms it -- otherwise the change would reach no file at all.
-        """
-        ids = self._synced_dump_fixture()
-        changed = self.FULL_DUMP.replace(
-            '"English","Normal",2,"Bin A-2"', '"English","Normal",5,"Bin A-2"'
-        )
-        self.assertNotEqual(changed, self.FULL_DUMP, "fixture must actually change")
-
-        first = process_batch_csv(changed, self.db, source_name="c1.csv")
-        self.assertEqual(first["revise_count"], 1)
-        self.assertEqual(first["unchanged_count"], 1)
-
-        again = process_batch_csv(changed, self.db, source_name="c2.csv",
-                                  force=True)
-        self.assertEqual(again["revise_count"], 1,
-                         "an unapplied change must not be suppressed")
-
-        # Once eBay confirms it, it goes quiet.
-        mid = ids["Heracross"]
-        self.db.upsert_variation(mid, "227511361186", 5,
-                                 custom_label=mid + "-C-1",
-                                 last_known_price=2.49)
-        settled = process_batch_csv(changed, self.db, source_name="c3.csv",
-                                    force=True)
-        self.assertEqual(settled["revise_count"], 0)
-
-    def test_a_price_rule_change_emits_even_though_quantities_match(self):
-        """Price is half the comparison; ignoring it would strand rule edits."""
-        self._synced_dump_fixture()
-        self.db.set_pricing_rules([
-            {"min_price": 0.0, "max_price": None, "rule_type": "fixed",
-             "rule_value": 3.49, "sort_order": 1}])
-        res = process_batch_csv(self.FULL_DUMP, self.db, source_name="p.csv",
-                                force=True)
-        self.assertEqual(res["unchanged_count"], 0)
-        self.assertEqual(res["revise_count"], 2)
-        for row in csv.DictReader(io.StringIO(res["revise_csv"])):
-            self.assertEqual(row["Price"], "3.49")
-
-    def test_nothing_is_suppressed_before_a_sync(self):
-        """Suppression may only act on what eBay is known to hold."""
-        process_batch_csv(self.FULL_DUMP, self.db, source_name="s.csv")
-        ids = {r["product_name"]: r["manifest_id"]
-               for r in self.db.export_all_manifest()}
-        for mid in ids.values():
-            self.db.upsert_variation(mid, "227511361186", 0,
-                                     custom_label=mid + "-C-1")
-        res = process_batch_csv(self.FULL_DUMP, self.db, source_name="s2.csv",
-                                force=True)
-        self.assertEqual(res["unchanged_count"], 0,
-                         "no price known, so nothing may be ruled out")
-
-    def test_nothing_is_suppressed_when_the_report_has_no_price(self):
-        """
-        Some Active Listings layouts carry no price column. Unknown must mean
-        "emit", never "assume unchanged".
-        """
-        ids = self._synced_dump_fixture(price_column=False)
-        self.assertIsNone(
-            self.db.get_variation(ids["Ledyba"])["last_known_price"])
-        res = process_batch_csv(self.FULL_DUMP, self.db, source_name="np.csv",
-                                force=True)
-        self.assertEqual(res["unchanged_count"], 0)
-        self.assertGreater(res["revise_count"], 0)
-
-    def test_a_suppressed_row_records_no_pending_request(self):
-        """
-        Recording intent for a row no file contains would claim an outstanding
-        change forever, and would block every later suppression.
-        """
-        ids = self._synced_dump_fixture()
-        process_batch_csv(self.FULL_DUMP, self.db, source_name="q1.csv",
-                          force=True)
-        self.assertIsNone(self.db.get_variation(ids["Ledyba"])["pending_qty"],
-                          "nothing was asked for, so nothing is pending")
-
-        again = process_batch_csv(self.FULL_DUMP, self.db, source_name="q2.csv",
-                                  force=True)
-        self.assertEqual(again["revise_count"], 0, "still suppressible")
-
     def test_parse_price_tolerates_report_formatting(self):
         """Report prices arrive with symbols, separators and currency codes."""
         from tcg_engine.csvtools import parse_price
@@ -2604,9 +2080,9 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         Every skip happens before a row reaches file_totals, so a skipped row
         is indistinguishable from a card the dump omitted -- and the remedy for
         an omitted card is to stop selling it. A file whose rows all fail to
-        parse would therefore have revised the entire store to zero. This is
-        the exact shape of a real report: a SortSwift export with no
-        *ConditionID column.
+        parse would therefore zero the entire catalogue, and the draft built
+        from it would ask eBay to delist the whole store. This is the exact
+        shape of a real report: a SortSwift export with no *ConditionID column.
         """
         ids = self._seed_live_dump()
         for mid in ids.values():
@@ -2622,19 +2098,16 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertFalse(res["reconciled"])
         self.assertEqual(res["zeroed_count"], 0, "nothing may be delisted")
 
-        rows = list(csv.DictReader(io.StringIO(res["revise_csv"])))
-        self.assertEqual([r for r in rows if r["Quantity"] == "0"], [],
-                         "no zero-quantity row may reach the file")
-
-        # The live store is untouched.
-        for mid in ids.values():
-            self.assertEqual(
-                self.db.get_variation(mid)["last_known_qty"], 3)
+        # Neither the catalogue nor the store mirror moved.
+        for name, mid in ids.items():
+            self.assertEqual(self.db.get_variation(mid)["last_known_qty"], 3)
+        self.assertTrue(all(
+            row["quantity"] > 0 for row in self.db.export_all_manifest()
+        ), "no catalogued quantity may be zeroed from a file that failed")
 
         messages = chr(10).join(lg["message"] for lg in res["logs"])
         self.assertIn("not a reliable picture", messages)
         self.assertIn("Not one row", messages)
-
     def test_a_partially_skipped_dump_also_withholds_reconciliation(self):
         """
         Even one unreadable row means the file is not a complete picture, and
@@ -2679,10 +2152,11 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         self.assertEqual(res["skipped_count"], 0)
         self.assertTrue(res["reconciled"])
         self.assertEqual(res["zeroed_count"], 1)
-        self.assertEqual(
-            self.db.get_variation(ids["Heracross"])["pending_qty"], 0)
-    # -- eBay puts the same value in different columns per row type ---------
+        catalogued = {r["product_name"]: r["quantity"]
+                      for r in self.db.export_all_manifest()}
+        self.assertEqual(catalogued["Heracross"], 0)
 
+    # -- eBay puts the same value in different columns per row type ---------
     def test_find_column_can_skip_present_but_empty_columns(self):
         """
         On a variation listing the child rows carry "Start price" and leave
@@ -2816,16 +2290,16 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
         ]
         dump = chr(10).join([header] + rows) + chr(10)
 
-        res = process_batch_csv(dump, self.db, source_name="grades.csv")
-        prices = {}
-        for row in csv.DictReader(io.StringIO(res["add_csv"])):
-            label = row.get("Title") or ""
-            if row.get("Price"):
-                prices[label] = row["Price"]
+        process_batch_csv(dump, self.db, source_name="grades.csv")
+        priced = {
+            r["product_name"]: round(
+                self.db.get_manifest_by_id(r["manifest_id"])["price"], 2)
+            for r in self.db.export_all_manifest()
+        }
 
         # $10 mint -> markup_fixed +3.00 = 13.00; MP is x0.70 -> 7.00 -> 10.00.
-        self.assertIn("13.00", res["add_csv"])
-        self.assertIn("10.00", res["add_csv"])
+        self.assertEqual(priced["Mint Card"], 13.00)
+        self.assertEqual(priced["Played Card"], 10.00)
 
         # An unrecognised grade is reported rather than quietly priced as mint.
         odd = chr(10).join([header,
@@ -2850,9 +2324,14 @@ Alakazam,Base Set,Lightly Played,Normal,1,4000
             '"Pokemon","Chilling Reign","004/198","Override","10.00","4.44",'
             '"MP","English","Normal",1,"C-1","4000"']) + chr(10)
 
-        res = process_batch_csv(dump, self.db, source_name="override.csv")
-        self.assertIn("4.44", res["add_csv"],
-                      "the override must survive the grade discount")
+        process_batch_csv(dump, self.db, source_name="override.csv")
+        priced = {
+            r["product_name"]: round(
+                self.db.get_manifest_by_id(r["manifest_id"])["price"], 2)
+            for r in self.db.export_all_manifest()
+        }
+        self.assertEqual(priced["Override"], 4.44,
+                         "the override must survive the grade discount")
 
     # -- market price feed -------------------------------------------------
 

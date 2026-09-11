@@ -144,20 +144,6 @@
                     </svg>
                     Pricing Rules
                 </button>
-
-                <!-- Reprice indicator. Persistent on purpose: the nightly
-                     refresh finishes with nobody watching, so a transient
-                     toast would be missed. Hidden until there is something
-                     to do. -->
-                <a id="repriceReady" href="/api/pricing/reprice.csv" download
-                   class="hidden items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-950/70 hover:bg-amber-900/70 border border-amber-800 text-amber-200 transition-all"
-                   title="Prices changed. Download the eBay Revise file.">
-                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                    <span id="repriceReadyText">Reprice ready</span>
-                </a>
-
                 <!-- Account menu. The username was a dead badge; it is now the
                      control that owns everything scoped to the person signed
                      in, which is where people look for it. -->
@@ -338,11 +324,11 @@
                                 </div>
                             </div>
                         </div>
-                        <button id="btnDownloadOnlyBatch" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-600 flex items-center justify-center gap-1.5 transition-all" title="Rebuild the CSV files using your current settings. Your inventory is not touched.">
+                        <button id="btnDownloadOnlyBatch" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-600 flex items-center justify-center gap-1.5 transition-all" title="Report what this file would change, without writing anything.">
                             <svg class="w-4 h-4 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                             </svg>
-                            <span>Download only &mdash; no inventory change</span>
+                            <span>Preview only &mdash; nothing is written</span>
                         </button>
                         <button id="btnForceProcessBatch" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-amber-800 hover:bg-amber-700 text-amber-50 border border-amber-700 flex items-center justify-center gap-1.5 transition-all" title="Apply this file again. In full-dump mode quantities are replaced, so this is safe to repeat; in newly-scanned mode they are added a second time.">
                             <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -357,19 +343,13 @@
                             <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
                             </svg>
-                            <span id="batchReadyText">Files ready</span>
+                            <span id="batchReadyText">Catalogue updated</span>
                         </div>
-                        <button id="btnDownloadRevise" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition-all">
-                            <svg class="w-4 h-4 text-accent-amber" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        <button onclick="switchWorkspaceTab('drafts')" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-brand-600 hover:bg-brand-500 text-white border border-brand-500 flex items-center justify-center gap-1.5 transition-all shadow-md shadow-brand-500/20">
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
                             </svg>
-                            <span>Download ebay_inventory_updates.csv (Revise)</span>
-                        </button>
-                        <button id="btnDownloadAdd" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition-all">
-                            <svg class="w-4 h-4 text-accent-emerald" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                            </svg>
-                            <span>Download ebay_new_additions.csv (Add)</span>
+                            <span>Review the staged draft</span>
                         </button>
                     </div>
                 </div>
@@ -1314,15 +1294,6 @@
                     </button>
                 </div>
 
-                <div id="repricePreview" class="hidden mt-3 p-3 rounded-xl bg-dark-900/70 border border-slate-700/80">
-                    <p id="repricePreviewText" class="text-[11px] text-slate-300"></p>
-                    <a id="repriceDownload" href="/api/pricing/reprice.csv" download class="hidden mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20 transition-all">
-                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                        </svg>
-                        <span>Download ebay_reprice_updates.csv</span>
-                    </a>
-                </div>
             </div>
 
             <!-- Automatic repricing, for the listings the eBay API can reach -->
@@ -1333,7 +1304,7 @@
                             <span>Automatic Repricing</span>
                             <span id="autoRepriceBadge" class="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">&mdash;</span>
                         </h4>
-                        <p class="text-[11px] text-slate-400 mt-1">Runs once a day, straight after the market refresh, on the listings this app created through the eBay <strong>API</strong>. Price only &mdash; never quantity, never a new listing. The old File Exchange listings stay on the CSV above.</p>
+                        <p class="text-[11px] text-slate-400 mt-1">Runs once a day, straight after the market refresh, on the listings this app created through the eBay <strong>API</strong>. Price only &mdash; never quantity, never a new listing.</p>
                         <p class="text-[11px] text-slate-400 mt-1">A <strong>rise</strong> applies the same day. A <strong>fall</strong> is held at the current price until the lower figure has stayed true for the whole hold window &mdash; those are the yellow flags below.</p>
                     </div>
                     <label class="shrink-0 flex items-center gap-2 cursor-pointer">

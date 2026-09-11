@@ -30,14 +30,10 @@ def handle_orders(args):
 
 def handle_batch(args):
     db = _get_db(args.db)
-    out_dir = args.out_dir or "."
-    os.makedirs(out_dir, exist_ok=True)
-    revise_path = os.path.join(out_dir, "ebay_inventory_updates.csv")
-    add_path = os.path.join(out_dir, "ebay_new_additions.csv")
 
-    print(f"Processing SortSwift Batch from: {args.input_file}")
+    print(f"Ingesting SortSwift export from: {args.input_file}")
     result = process_batch_file(
-        args.input_file, db, revise_path, add_path,
+        args.input_file, db,
         force=args.force, dry_run=args.dry_run,
         quantity_mode=args.quantity_mode,
     )
@@ -51,10 +47,15 @@ def handle_batch(args):
         )
         return
 
-    if result["revise_count"] > 0:
-        print(f"Generated Revise CSV: {revise_path} ({result['revise_count']} items)")
-    if result["add_count"] > 0:
-        print(f"Generated Add CSV: {add_path} ({result['add_count']} items)")
+    # No files are produced. eBay is written to through its API, from an
+    # approved draft, so this command updates the catalogue and the
+    # dashboard is where the resulting draft is reviewed and pushed.
+    print(
+        f"\nCatalogued {result['parsed_rows']} card(s), "
+        f"{result['new_catalog_count']} new, "
+        f"{result['zeroed_count']} zeroed as sold out."
+    )
+    print("Review and push the draft in the dashboard.")
 
 
 def handle_sync(args):
@@ -191,14 +192,14 @@ def main():
     # batch (Module A)
     p_batch = subparsers.add_parser(
         "batch",
-        parents=[db_parent], help="Module A: Route SortSwift Scan Batch to Add vs. Revise eBay CSVs"
+        parents=[db_parent],
+        help="Module A: ingest a SortSwift export and stage a draft"
     )
     p_batch.add_argument("input_file", help="Path to SortSwift batch CSV")
-    p_batch.add_argument("--out-dir", default=".", help="Directory to save generated CSVs")
     p_batch.add_argument(
         "--dry-run",
         action="store_true",
-        help="Regenerate the CSVs without writing anything to the catalogue or store mirror",
+        help="Report what the file would change without writing anything",
     )
     p_batch.add_argument(
         "--force",
