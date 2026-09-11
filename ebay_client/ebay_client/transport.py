@@ -242,8 +242,16 @@ class Transport:
         errors = payload.get("errors") if isinstance(payload, dict) else None
         summary = f"{method} {url} returned {response.status}"
 
+        # Carried through even when the payload parsed, because a body that
+        # parsed as JSON without an "errors" key is exactly the case where
+        # the status code alone told us nothing.
+        try:
+            body = (response.body or b"").decode("utf-8", "replace")
+        except Exception:  # pragma: no cover - defensive
+            body = ""
+
         if response.status in (401, 403):
             return AuthError(summary)
         if response.status == 429:
             return RateLimited(summary, self._backoff(response, 1))
-        return ApiError(summary, response.status, errors)
+        return ApiError(summary, response.status, errors, body=body)

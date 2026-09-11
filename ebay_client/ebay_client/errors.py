@@ -56,17 +56,28 @@ class ApiError(EbayError):
     flattened into a string: ``errorId`` is the only stable, machine-readable
     part of an eBay failure, and the caller needs it to decide whether a
     failure is retryable, belongs to one card, or invalidates a whole group.
+
+    ``body`` is the response as it arrived, kept for the case this class was
+    originally blind to: a refusal whose payload is *not* in eBay's documented
+    ``{"errors": [...]}`` shape. That produced "returned 400" and nothing
+    else, which is indistinguishable from a bug in our own request and cost a
+    live migration attempt with no way to tell why it had failed. Truncated,
+    because an eBay error body is occasionally an HTML gateway page.
     """
+
+    BODY_EXCERPT_LIMIT = 800
 
     def __init__(
         self,
         message: str,
         status_code: int,
         errors: Optional[List[Dict[str, Any]]] = None,
+        body: str = "",
     ):
         super().__init__(message)
         self.status_code = status_code
         self.errors = errors or []
+        self.body = body or ""
 
     @property
     def error_ids(self) -> List[int]:
@@ -81,13 +92,18 @@ class ApiError(EbayError):
 
     def __str__(self) -> str:
         base = super().__str__()
-        if not self.errors:
-            return base
-        details = "; ".join(
-            str(e.get("longMessage") or e.get("message") or e)
-            for e in self.errors
-        )
-        return f"{base}: {details}"
+        if self.errors:
+            details = "; ".join(
+                str(e.get("longMessage") or e.get("message") or e)
+                for e in self.errors
+            )
+            return f"{base}: {details}"
+        # No parsed errors. Rather than report the status code alone -- which
+        # says only that eBay refused, not why -- show what it actually sent.
+        excerpt = " ".join(self.body.split())[:self.BODY_EXCERPT_LIMIT]
+        if excerpt:
+            return f"{base}, body: {excerpt}"
+        return f"{base} with an empty body"
 
 
 class SignatureError(EbayError):

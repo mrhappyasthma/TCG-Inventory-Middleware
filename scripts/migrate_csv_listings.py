@@ -301,6 +301,28 @@ def verify(api_transport, listing, cards):
     return False
 
 
+def report_call_failure(exc):
+    """
+    Print everything eBay said, not just that it said no.
+
+    The first real migration attempt failed with "returned 400" and nothing
+    else, which is indistinguishable from a malformed request of our own. Each
+    of these three is a different diagnosis: an ``errorId`` names a documented
+    eBay condition, a body without an ``errors`` list usually means the
+    request never reached the Inventory API, and an empty body with a 400
+    means the payload shape itself was rejected.
+    """
+    print(f"    FAILED: {exc}")
+    for error in getattr(exc, "errors", None) or []:
+        print(f"      errorId {error.get('errorId')}: "
+              f"{error.get('longMessage') or error.get('message')}")
+        for parameter in error.get("parameters") or []:
+            print(f"        {parameter.get('name')} = {parameter.get('value')}")
+    body = getattr(exc, "body", "") or ""
+    if body and not getattr(exc, "errors", None):
+        print(f"      raw body: {body[:1500]}")
+
+
 def migrate_one(db, client, listing, cards):
     parent = str(listing["ebay_parent_id"]).strip()
     print(f"\n  Migrating #{parent} ...")
@@ -375,6 +397,21 @@ def main():
     print("application's API path. The eBay item id, watchers and search")
     print("standing are preserved.")
     print("=" * 70)
+    # eBay's own eligibility rules, printed because none of them can be
+    # checked from here. The first migration attempt failed with a bare 400,
+    # and every one of these produces one -- so they belong where somebody is
+    # about to type an item id, not in a document.
+    print("eBay will refuse the migration unless all of these are true of the")
+    print("listing, and none of them is visible to this script:")
+    print("  1. It is fixed-price. Auctions cannot be migrated at all.")
+    print("  2. Every variation has its own seller-defined SKU.")
+    print("  3. It uses Business Policies for payment, return and shipping.")
+    print("     A listing carrying the legacy per-listing shipping, returns or")
+    print("     payment fields is rejected -- and File Exchange could write")
+    print("     either form, so this is the one worth checking first.")
+    print("  4. Its payment policy has immediate payment enabled.")
+    print("Check the listing in Seller Hub against that list if a call fails.")
+    print("=" * 70)
 
     client = build_client(user_db)
 
@@ -391,7 +428,7 @@ def main():
         try:
             ok = migrate_one(db, client, listing, cards)
         except EbayError as exc:
-            print(f"    FAILED: {exc}")
+            report_call_failure(exc)
             print("    Stopping. Check the listing on eBay before retrying: a "
                   "failed call may still have migrated it.")
             return 1

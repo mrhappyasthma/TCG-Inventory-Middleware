@@ -307,6 +307,47 @@ class MigrateTests(unittest.TestCase):
         self.assertEqual(inventory.bulk_migrate_listing(transport, []), [])
         self.assertEqual(opener.calls, [])
 
+    def test_a_refusal_eBay_does_not_shape_as_errors_still_says_why(self):
+        """
+        The diagnostic gap that cost a live migration attempt.
+
+        eBay refused with a 400 whose body was not the documented
+        ``{"errors": [...]}``, so the parsed list was empty and the exception
+        printed "returned 400" and nothing else -- indistinguishable from a
+        malformed request of our own. The body was in hand the whole time and
+        simply never surfaced.
+        """
+        transport, _ = transport_with(Response(
+            400, {"content-type": "text/plain"},
+            b"A user error has occurred. The listing SKU cannot be null.",
+        ))
+        with self.assertRaises(ApiError) as caught:
+            inventory.bulk_migrate_listing(transport, ["227513097221"])
+
+        self.assertIn("listing SKU cannot be null", str(caught.exception))
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_a_refusal_with_no_body_at_all_says_that(self):
+        # Still better than the status code alone: it rules out a reason
+        # having been sent and discarded.
+        transport, _ = transport_with(Response(400, {}, b""))
+        with self.assertRaises(ApiError) as caught:
+            inventory.bulk_migrate_listing(transport, ["227513097221"])
+        self.assertIn("empty body", str(caught.exception))
+
+    def test_a_documented_error_payload_still_reads_as_before(self):
+        transport, _ = transport_with(Response(
+            400, {"content-type": "application/json"},
+            json.dumps({"errors": [{
+                "errorId": 25709,
+                "longMessage": "Invalid value for header Accept-Language.",
+            }]}).encode("utf-8"),
+        ))
+        with self.assertRaises(ApiError) as caught:
+            inventory.bulk_migrate_listing(transport, ["227513097221"])
+        self.assertIn("Accept-Language", str(caught.exception))
+        self.assertEqual(caught.exception.error_ids, [25709])
+
 
 if __name__ == "__main__":
     unittest.main()
