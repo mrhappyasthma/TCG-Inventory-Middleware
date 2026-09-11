@@ -39,7 +39,7 @@ from .batches import (
     generate_variation_title,
     resolve_condition_descriptor,
 )
-from .db import Database
+from .db import SHARED_SCOPE, Database
 from .plan_exports import DEFAULT_VARIATION_OPTION_TEMPLATE, _derived_specifics
 from .plans import (
     ACTION_END,
@@ -192,13 +192,17 @@ def _inventory_item_payload(
         # the group, or eBay cannot tell which variation this item is.
         aspects[VARIATION_ASPECT_NAME] = [option_name]
 
-    images = [
-        url for url in (
-            item.get("cdn_image") or "",
-            fields.get("cdn_back_image") or "",
-            fields.get("stock_image") or "",
-        ) if url
-    ]
+    # The card's own front scan, and nothing else.
+    #
+    # The back scan and the stock photo are deliberately excluded. Every card
+    # in a set has a near-identical back, so including them puts what look
+    # like duplicate photos on the listing, and a buyer choosing between 105
+    # variations gains nothing from five pictures of the same card back. The
+    # stock photo is a second view of the same front, which reads as another
+    # duplicate. This is the one place where the API push differs from the CSV
+    # path on purpose: the first real listing went up with three pictures per
+    # variation and looked wrong.
+    images = [url for url in (item.get("cdn_image") or "",) if url]
 
     descriptor_value = condition_descriptor_value_id(
         fields.get("condition_descriptor") or "",
@@ -914,3 +918,131 @@ def _uniform_aspects(
             if value and name != VARIATION_ASPECT_NAME:
                 shared[name] = [value]
     return shared
+
+
+def refresh_listing(
+    db: Database,
+    api: Any,
+    ebay_parent_id: str,
+    user_id: Optional[int] = None,
+    log: Optional[Callable[[str, str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Re-send what a live listing is made of, without changing what it sells.
+
+    Pictures, item specifics, the title and the description live on the
+    inventory items and the group -- not on the plan -- so once a listing is
+    up, a correction to any of them has no route through the drafts page: the
+    plan is a diff of quantities and prices, and a picture change produces no
+    diff at all. The first real listing went live with the card backs on it
+    and nothing could reach in to fix it.
+
+    Quantity comes from what eBay is known to hold and price is not sent, so
+    this is a repair rather than a repricing: it cannot move stock or money.
+    Only a listing we created ourselves can be refreshed; a File Exchange
+    listing is invisible to this API.
+    """
+    logs: List[Dict[str, str]] = []
+
+    def record(level: str, message: str) -> None:
+        logs.append({"level": level, "message": message})
+        if log:
+            log(level, message)
+
+    managed = db.get_managed_listing_by_parent(ebay_parent_id)
+    if managed is None:
+        raise PushError(
+            f"listing #{ebay_parent_id} was not created through this API, so "
+            f"its contents cannot be refreshed. It is on the CSV path."
+        )
+
+    cards = db.get_cards_for_listing(ebay_parent_id)
+    if not cards:
+        raise PushError(
+            f"no cards are linked to listing #{ebay_parent_id}. Run a Module "
+            f"B sync first."
+        )
+
+    settings = db.get_listing_settings(
+        user_id=SHARED_SCOPE if user_id is None else user_id
+    )
+    category_id = str(settings.get("category_id") or "183454")
+    marketplace_id = str(settings.get("marketplace_id") or "EBAY_US")
+    option_template = (
+        settings.get("variation_option_template")
+        or DEFAULT_VARIATION_OPTION_TEMPLATE
+    )
+    title_template = settings.get(
+        "variation_title_template",
+        "{set_name}: Pick Your Card - {condition} - Complete Your Set",
+    )
+
+    group_key = str(managed["group_key"])
+    single = is_single(group_key) or not group_key
+    entries: List[Tuple[Dict[str, Any], str]] = []
+    payloads = []
+    for card in cards:
+        # The quantity eBay is known to hold, not what we would like it to
+        # be: a repair must not become a stock change.
+        card = dict(card)
+        card["proposed_qty"] = int(card.get("last_known_qty") or 0)
+        sku = _sku_for(card)
+        option_name = build_variation_option_name(
+            card.get("product_name") or "", card.get("card_number") or "",
+            option_template,
+        )
+        payloads.append({
+            "sku": sku,
+            "locale": locale_for(marketplace_id),
+            **_inventory_item_payload(
+                card,
+                settings=settings,
+                category_id=category_id,
+                option_name=option_name,
+                is_variation=not single,
+            ),
+        })
+        entries.append((card, sku))
+
+    failures: Dict[str, str] = {}
+    for start in range(0, len(payloads), BULK_LIMIT):
+        rows = api.upsert_items(payloads[start:start + BULK_LIMIT])
+        for sku, message in api.failures(rows):
+            failures[sku] = message
+            record("ERROR", f"{sku}: {message}")
+
+    refreshed = len(payloads) - len(failures)
+
+    if not single and refreshed:
+        set_name, _, condition = group_key.partition("|")
+        ebay_group_key = (
+            managed.get("inventory_item_group_key")
+            or inventory_group_key(group_key)
+        )
+        kept = [(card, sku) for card, sku in entries if sku not in failures]
+        api.upsert_group(ebay_group_key, _group_payload(
+            ebay_group_key,
+            kept,
+            title=generate_variation_title(
+                set_name, condition=condition, template=title_template
+            ),
+            description=_group_description([c for c, _ in kept], single),
+            cover_image_url=(
+                db.get_listing_cover_image(ebay_parent_id)
+                or settings.get("cover_image_url")
+                or _first_image([c for c, _ in kept])
+            ),
+            aspects=_uniform_aspects([c for c, _ in kept], settings),
+        ))
+
+    record(
+        "SUCCESS" if not failures else "WARN",
+        f"Listing #{ebay_parent_id}: refreshed {refreshed} variation(s)"
+        + (f", {len(failures)} failed" if failures else ""),
+    )
+    return {
+        "ebay_parent_id": str(ebay_parent_id),
+        "refreshed": refreshed,
+        "failed": len(failures),
+        "logs": logs,
+    }

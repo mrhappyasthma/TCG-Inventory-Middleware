@@ -2595,6 +2595,49 @@ class Database:
 
     # -- listings the Inventory API can see -----------------------------
 
+    def get_cards_for_listing(self, ebay_parent_id: str) -> List[Dict[str, Any]]:
+        """
+        Every card eBay reports as part of one listing.
+
+        Keyed on the eBay item number rather than on a plan's grouping,
+        because this answers "what is actually in that listing" -- which is
+        what a repair has to act on. A plan is a proposal and may not exist
+        any more; the mirror is the record of what went live.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
+                       m.printing, m.card_number, m.language, m.cdn_image,
+                       m.remarks, m.ebay_fields_json, m.price, m.quantity,
+                       v.custom_label, v.offer_id, v.ebay_parent_id,
+                       v.last_known_qty, v.last_known_price
+                FROM ebay_variations v
+                JOIN manifest m ON m.manifest_id = v.manifest_id
+                WHERE TRIM(COALESCE(v.ebay_parent_id, '')) = ?
+                ORDER BY m.card_number, m.manifest_id
+                """,
+                (str(ebay_parent_id).strip(),),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_managed_listing_by_parent(
+        self, ebay_parent_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The managed-listing row for an eBay item number, if we made it."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM ebay_managed_listing
+                WHERE TRIM(COALESCE(ebay_parent_id, '')) = ?
+                """,
+                (str(ebay_parent_id).strip(),),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
     def get_managed_listing(self, group_key: str) -> Optional[Dict[str, Any]]:
         """
         What we know about one listing we manage through the API.

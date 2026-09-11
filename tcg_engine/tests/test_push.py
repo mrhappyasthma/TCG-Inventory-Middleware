@@ -27,7 +27,12 @@ from tcg_engine.plans import (
     approve_plan,
     build_plan,
 )
-from tcg_engine.push import PushError, inventory_group_key, push_plan
+from tcg_engine.push import (
+    PushError,
+    inventory_group_key,
+    push_plan,
+    refresh_listing,
+)
 
 COMPLETE_SETTINGS = {
     "category_id": "183454",
@@ -573,6 +578,78 @@ class ScopedPushTests(PushTestCase):
         with self.assertRaises(PushError):
             push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE,
                       group_keys=["No Such Set|NM"])
+
+
+class ImageTests(PushTestCase):
+    def test_only_the_cards_own_front_scan_is_sent(self):
+        """
+        The first real listing went live with the card backs on it.
+
+        Every card in a set has a near-identical back, so sending them puts
+        what look like duplicate photos on a listing -- and a buyer choosing
+        between a hundred variations gains nothing from more pictures of the
+        same card back. The stock photo is a second view of the same front,
+        which reads as another duplicate.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.db.set_manifest_ebay_fields("ID1001", {
+            "cdn_back_image": "https://cdn.example.com/back.jpg",
+            "stock_image": "https://cdn.example.com/stock.jpg",
+        })
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        images = api.items["ID1001"]["product"]["imageUrls"]
+        self.assertEqual(images, ["https://cdn.example.com/ID1001.jpg"])
+
+
+class RefreshTests(PushTestCase):
+    def test_a_live_listing_can_be_repaired_without_moving_stock_or_price(self):
+        """
+        The route to a picture or specifics correction on a live listing.
+
+        A plan is a diff of quantities and prices, so a picture change
+        produces no diff and can never reach eBay through the drafts page.
+        This does, and by design it cannot reprice or restock: quantity is
+        re-sent as what eBay is already known to hold and no price is sent.
+        """
+        self.add_card("ID1001", "Charizard", "004/102", qty=3)
+        self.add_card("ID1002", "Blastoise", "002/102", qty=3)
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+
+        # The catalogue has moved on since the push; a repair must ignore it.
+        self.db.set_manifest_quantity("ID1001", 99)
+
+        api = FakeEbay()
+        result = refresh_listing(self.db, api, listing_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["refreshed"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertIn("upsert_items", api.kinds())
+        self.assertIn("upsert_group", api.kinds())
+        # Nothing that could change what is on sale.
+        self.assertNotIn("update_price_quantity", api.kinds())
+        self.assertNotIn("publish_group", api.kinds())
+        self.assertEqual(
+            api.items["ID1001"]["availability"]
+               ["shipToLocationAvailability"]["quantity"],
+            3,
+            "a repair must re-send the quantity eBay already holds",
+        )
+
+    def test_a_csv_listing_cannot_be_refreshed(self):
+        # It is invisible to this API; pushing at it would create a duplicate.
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.db.upsert_variation("ID1001", "227511361186", 2,
+                                 custom_label="ID1001")
+        with self.assertRaises(PushError) as caught:
+            refresh_listing(self.db, FakeEbay(), "227511361186",
+                            user_id=SHARED_SCOPE)
+        self.assertIn("CSV path", str(caught.exception))
 
 
 class GroupKeyTests(unittest.TestCase):

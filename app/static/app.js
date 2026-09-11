@@ -2260,6 +2260,32 @@ async function applyRestore() {
     }
 }
 
+// Re-send what a live listing is made of. Pictures, item specifics, the title
+// and the description live on the inventory items rather than on a plan, so
+// once a listing is up there is no route to them through the drafts page -- a
+// plan is a diff of quantities and prices, and a picture change produces no
+// diff at all. Deliberately cannot move stock or price.
+async function refreshListingContents(itemId, button) {
+    if (!confirm(`Re-send listing #${itemId}'s pictures, item specifics, title and description to eBay?\n\nStock and price are not touched.`)) {
+        return;
+    }
+    if (button) { button.disabled = true; button.textContent = "Sending…"; }
+    try {
+        const res = await fetch(`/api/ebay-listings/${encodeURIComponent(itemId)}/refresh`, {
+            method: "POST",
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not refresh the listing");
+        (data.logs || []).forEach(e => logToTerminal(e.level, e.message));
+        logToTerminal(data.failed ? "WARN" : "SUCCESS",
+            `Listing #${itemId}: ${data.refreshed} variation(s) refreshed`);
+    } catch (err) {
+        logToTerminal("ERROR", `Refresh failed: ${err.message}`);
+    } finally {
+        if (button) { button.disabled = false; button.textContent = "Refresh"; }
+    }
+}
+
 // -------------------------------------------------------------------
 // COVER PHOTO
 // -------------------------------------------------------------------
@@ -2421,6 +2447,13 @@ async function fetchEbayListings() {
                         </button>
                     </td>
                     <td class="py-3 px-4 text-slate-500 text-[11px] font-mono">${escapeHtml(l.last_synced || "-")}</td>
+                    <td class="py-3 px-4">
+                        <button type="button" onclick="refreshListingContents('${escapeHtml(l.ebay_parent_id)}', this)"
+                            title="Re-send this listing's pictures, item specifics, title and description. Cannot change stock or price."
+                            class="text-[10px] font-semibold px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-all disabled:opacity-40">
+                            Refresh
+                        </button>
+                    </td>
                 </tr>`;
         }).join("");
 

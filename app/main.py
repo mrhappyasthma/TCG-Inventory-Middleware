@@ -84,7 +84,7 @@ from tcg_engine.pricing_feed import (
     PriceFeedError,
 )
 from tcg_engine.plan_exports import build_plan_exports
-from tcg_engine.push import PushError, push_plan
+from tcg_engine.push import PushError, push_plan, refresh_listing
 from tcg_engine.plans import (
     PlanError,
     approve_plan,
@@ -1768,6 +1768,46 @@ async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)
     except EbayError as exc:
         print(f"[ebay] report sync failed: {exc}", flush=True)
         raise HTTPException(status_code=502, detail=f"eBay refused the request: {exc}")
+
+
+@app.post("/api/ebay-listings/{item_id}/refresh")
+async def refresh_listing_endpoint(
+    item_id: str, user: Dict[str, Any] = Depends(require_active_user)
+):
+    """
+    Re-send a live listing's pictures, specifics, title and description.
+
+    These live on the inventory items rather than on a plan, so once a listing
+    is up there is no route to them through the drafts page: a plan is a diff
+    of quantities and prices, and a picture change produces no diff at all.
+    The first listing this application created went live carrying the card
+    backs, and nothing could reach in to correct it.
+
+    Deliberately cannot move stock or money: quantity is re-sent as what eBay
+    is already known to hold, and no price is sent at all.
+    """
+    client = get_ebay_client()
+    if client is None or not client.oauth.is_connected():
+        raise HTTPException(
+            status_code=409, detail="Connect the eBay account first."
+        )
+
+    adapter = InventoryApiAdapter(client)
+
+    def run():
+        with db.session():
+            return refresh_listing(db, adapter, item_id, user_id=user["id"])
+
+    try:
+        result = await run_in_threadpool(run)
+    except PushError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except EbayError as exc:
+        raise HTTPException(status_code=502, detail=f"eBay refused: {exc}")
+
+    for entry in result.get("logs", []):
+        print(f"[refresh] {entry['level']}: {entry['message']}", flush=True)
+    return {"success": True, **result}
 
 
 @app.post("/api/ebay/disconnect")
