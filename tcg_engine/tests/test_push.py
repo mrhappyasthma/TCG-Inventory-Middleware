@@ -695,6 +695,68 @@ class BulkOfferTests(PushTestCase):
         self.assertEqual(result["pushed"], 1)
 
 
+class VariationOrderTests(PushTestCase):
+    def test_the_dropdown_is_ordered_by_card_number(self):
+        """
+        This order *is* what a buyer sees in the variation dropdown.
+
+        Left in plan order it comes out sorted by manifest id -- the order the
+        cards happened to be catalogued in, which is meaningless to someone
+        looking for 045/132. The CSV path has always sorted here; the API path
+        did not, and the first listings went up scrambled.
+        """
+        # Catalogued in an order that has nothing to do with card numbers.
+        self.add_card("ID1001", "Zapdos", "045/132")
+        self.add_card("ID1002", "Bulbasaur", "001/132")
+        self.add_card("ID1003", "Mew", "151/132")
+        self.add_card("ID1004", "Ivysaur", "002/132")
+
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        group = list(api.groups.values())[0]
+        self.assertEqual(
+            group["variesBy"]["specifications"][0]["values"],
+            ["Bulbasaur (001/132)", "Ivysaur (002/132)",
+             "Zapdos (045/132)", "Mew (151/132)"],
+        )
+        # The SKU list has to agree with it, or the dropdown labels and the
+        # cards behind them come apart.
+        self.assertEqual(
+            group["variantSKUs"], ["ID1002", "ID1004", "ID1001", "ID1003"]
+        )
+
+    def test_a_refresh_fixes_the_order_on_a_live_listing(self):
+        # Which is what makes the listings already up repairable rather than
+        # having to be ended and recreated.
+        self.add_card("ID1001", "Zapdos", "045/132")
+        self.add_card("ID1002", "Bulbasaur", "001/132")
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+
+        api = FakeEbay()
+        refresh_listing(self.db, api, listing_id, user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        self.assertEqual(
+            group["variesBy"]["specifications"][0]["values"],
+            ["Bulbasaur (001/132)", "Zapdos (045/132)"],
+        )
+
+    def test_a_card_with_no_usable_number_sorts_last(self):
+        # Rather than being scattered through the list.
+        self.add_card("ID1001", "Zapdos", "045/132")
+        self.add_card("ID1002", "Promo Card", "")
+        self.add_card("ID1003", "Bulbasaur", "001/132")
+
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        self.assertEqual(group["variantSKUs"][-1], "ID1002")
+
+
 class ImageTests(PushTestCase):
     def test_only_the_cards_own_front_scan_is_sent(self):
         """

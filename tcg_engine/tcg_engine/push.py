@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .batches import (
     build_variation_option_name,
+    variation_sort_key,
     generate_variation_title,
     resolve_condition_descriptor,
 )
@@ -747,8 +748,15 @@ def _push_group(
         or inventory_group_key(group_key)
     )
     set_name, _, condition = group_key.partition("|")
+    # Sorted by card number, because this order *is* the order eBay shows the
+    # variation dropdown in. Left in plan order it comes out sorted by
+    # manifest id -- the order the cards happened to be catalogued in, which
+    # is meaningless to a buyer looking for 045/132. The CSV path has always
+    # sorted here; the API path did not, and the first listings went up
+    # scrambled.
     entries = [
-        (item, _sku_for(item)) for item in live
+        (item, _sku_for(item))
+        for item in sorted(live, key=variation_sort_key)
         if item["action"] != ACTION_REMOVE
     ]
     api.upsert_group(ebay_group_key, _group_payload(
@@ -1167,7 +1175,11 @@ def refresh_listing(
     single = is_single(group_key) or not group_key
     entries: List[Tuple[Dict[str, Any], str]] = []
     payloads = []
-    for card in cards:
+    # Card-number order, for the same reason as a create: this is the order
+    # the variation dropdown appears in. Sorted here rather than in SQL
+    # because a card number is not a number -- "10/132" sorts before "2/132"
+    # as text, and "TG12/TG30" has no integer to sort on at all.
+    for card in sorted(cards, key=variation_sort_key):
         # The quantity eBay is known to hold, not what we would like it to
         # be: a repair must not become a stock change.
         card = dict(card)
