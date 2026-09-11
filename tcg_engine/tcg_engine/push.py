@@ -738,6 +738,7 @@ def _push_group(
             db.upsert_managed_listing(
                 group_key, ebay_parent_id=listing_id, pushed=True
             )
+            _record_cover(db, listing_id, cover_image_url)
             record("INFO", f"{_sku_for(item)}: listed as #{listing_id}")
         else:
             listing_id = managed["ebay_parent_id"]
@@ -776,12 +777,14 @@ def _push_group(
         db.upsert_managed_listing(
             group_key, ebay_parent_id=listing_id, pushed=True
         )
+        _record_cover(db, listing_id, cover_image_url)
         record("INFO", (
             f"{group_key}: listed as #{listing_id} with {len(entries)} "
             f"variation(s)"
         ))
     else:
         listing_id = managed["ebay_parent_id"]
+        _record_cover(db, listing_id, cover_image_url)
         record("INFO", f"{group_key}: updated listing #{listing_id}")
 
     _confirm(db, live, listing_id, counts)
@@ -827,6 +830,26 @@ def _apply_price_quantity(
         if sku in failed:
             _mark(db, item, STATUS_FAILED, counts, failed[sku])
             record("ERROR", f"{sku}: {failed[sku]}")
+
+
+def _record_cover(db: Database, listing_id: str, cover_image_url: str) -> None:
+    """
+    Remember the cover a push chose, against the listing it created.
+
+    Until this existed, a staged cover reached eBay and then vanished from our
+    own records: the drafts page's choice lives in ``listing_plan_group``,
+    keyed by plan, and nothing carried it across to the listing. Two things
+    went wrong as a result -- the eBay Listings tab showed the listing as
+    having no cover, and a later refresh, finding none recorded, replaced the
+    cover on eBay with the first card's photo.
+
+    Only an explicitly chosen cover is recorded. A fallback to the first
+    card's picture is not a decision, and storing it would make it look like
+    one on every screen that reads this.
+    """
+    url = str(cover_image_url or "").strip()
+    if url and listing_id:
+        db.set_listing_cover_image(str(listing_id), url)
 
 
 def _confirm(
@@ -918,6 +941,63 @@ def _uniform_aspects(
             if value and name != VARIATION_ASPECT_NAME:
                 shared[name] = [value]
     return shared
+
+
+def _cover_for_refresh(
+    db: Database,
+    api: Any,
+    ebay_parent_id: str,
+    ebay_group_key: str,
+    cards: List[Dict[str, Any]],
+    settings: Dict[str, str],
+    record: Callable[[str, str], None],
+) -> str:
+    """
+    The cover a refresh should send, in order of how much it is known.
+
+    Writing an inventory item group is a *full replace*, so a refresh that
+    guesses at the cover does not leave it alone -- it overwrites it. That is
+    what happened to the first listing: nothing was recorded against it, the
+    refresh fell back to the first card's photo, and the cover chosen on the
+    drafts page was replaced on eBay.
+
+    So: our own record first; then whatever eBay currently has, read back
+    rather than assumed; and only then the first card's picture, said out loud
+    because at that point it is a change and not a preservation.
+    """
+    recorded = db.get_listing_cover_image(ebay_parent_id)
+    if recorded:
+        return recorded
+
+    # Read eBay's own answer before overwriting it. A group we did not set a
+    # cover on may still have one -- set in Seller Hub, or by an earlier push.
+    getter = getattr(api, "get_group", None)
+    if callable(getter):
+        try:
+            existing = (getter(ebay_group_key) or {}).get("imageUrls") or []
+        except Exception as exc:  # noqa: BLE001 - a read must not stop a repair
+            existing = []
+            record("WARN", f"could not read the current cover from eBay: {exc}")
+        if existing:
+            url = str(existing[0]).strip()
+            if url:
+                # Recorded now, so the next refresh does not have to ask.
+                db.set_listing_cover_image(str(ebay_parent_id), url)
+                record("INFO", f"keeping the cover eBay already has: {url}")
+                return url
+
+    account = str(settings.get("cover_image_url") or "").strip()
+    if account:
+        return account
+
+    fallback = _first_image(cards)
+    if fallback:
+        record("WARN", (
+            "no cover photo is recorded for this listing and eBay reports "
+            "none, so the first card's picture is being used. Set a cover on "
+            "the eBay Listings tab to choose one."
+        ))
+    return fallback
 
 
 def refresh_listing(
@@ -1027,10 +1107,9 @@ def refresh_listing(
                 set_name, condition=condition, template=title_template
             ),
             description=_group_description([c for c, _ in kept], single),
-            cover_image_url=(
-                db.get_listing_cover_image(ebay_parent_id)
-                or settings.get("cover_image_url")
-                or _first_image([c for c, _ in kept])
+            cover_image_url=_cover_for_refresh(
+                db, api, ebay_parent_id, ebay_group_key,
+                [c for c, _ in kept], settings, record,
             ),
             aspects=_uniform_aspects([c for c, _ in kept], settings),
         ))

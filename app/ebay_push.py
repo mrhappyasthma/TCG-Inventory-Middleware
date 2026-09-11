@@ -52,6 +52,17 @@ class InventoryApiAdapter:
             self.transport, group_key, payload
         )
 
+    def get_group(self, group_key: str) -> Dict[str, Any]:
+        """
+        Read a group back before overwriting it.
+
+        Writing a group is a full replace, so anything we do not send is
+        removed. This is how a repair preserves what it does not manage --
+        a cover photo set outside this application, for instance -- rather
+        than silently discarding it.
+        """
+        return inventory.get_inventory_item_group(self.transport, group_key)
+
     def publish_group(self, group_key: str) -> str:
         return inventory.publish_offer_by_inventory_item_group(
             self.transport, group_key, self.marketplace_id

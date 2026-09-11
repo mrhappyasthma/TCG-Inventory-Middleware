@@ -2355,11 +2355,19 @@ async function saveCoverPhoto(e) {
         const id = coverEditItemId;
         closeCoverModal();
 
-        triggerBrowserDownload(data.csv_content, `ebay_cover_photo_${id}.csv`);
-        logToTerminal("SUCCESS", `Cover photo recorded for eBay #${id}.`);
-        logToTerminal("INFO",
-            `Upload ebay_cover_photo_${id}.csv to Seller Hub to apply it. `
-            + "eBay replaces the listing's whole picture set on revision.");
+        // A listing we created through the API is already updated; a legacy
+        // one needs its Revise file uploaded, and File Exchange cannot touch
+        // an API-managed listing at all -- so the two must not be conflated.
+        if (data.applied) {
+            logToTerminal("SUCCESS",
+                `Cover photo applied to eBay #${id} directly (${data.refreshed} variation(s) re-sent).`);
+        } else {
+            triggerBrowserDownload(data.csv_content, `ebay_cover_photo_${id}.csv`);
+            logToTerminal("SUCCESS", `Cover photo recorded for eBay #${id}.`);
+            logToTerminal("INFO",
+                `Upload ebay_cover_photo_${id}.csv to Seller Hub to apply it. `
+                + "eBay replaces the listing's whole picture set on revision.");
+        }
 
         fetchEbayListings();
     } catch (err) {

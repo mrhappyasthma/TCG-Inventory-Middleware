@@ -1066,16 +1066,22 @@ def get_ebay_listings_endpoint(user: Dict[str, Any] = Depends(require_active_use
 
 
 @app.post("/api/ebay-listings/{item_id}/cover")
-def set_listing_cover(
+async def set_listing_cover(
     item_id: str,
     req: CoverImageRequest,
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
-    Record a listing's cover photo and return a Revise file that applies it.
+    Record a listing's cover photo, and apply it however that listing allows.
 
-    Saving locally is not enough on its own: the listing lives on eBay, so the
-    change only takes effect once the returned CSV is uploaded there.
+    Saving locally is never enough on its own: the listing lives on eBay. How
+    the change gets there depends on which path created the listing, and the
+    two are not interchangeable -- File Exchange cannot revise a listing the
+    Inventory API manages, so handing out a CSV for one of those would be
+    handing out something that silently does nothing.
+
+    A listing we created through the API is therefore updated immediately, and
+    a legacy one still gets the Revise file to upload.
     """
     url = (req.cover_image_url or "").strip()
     if not url:
@@ -1094,10 +1100,43 @@ def set_listing_cover(
         )
 
     saved = db.set_listing_cover_image(item_id, url)
+
+    # An API-managed listing can be corrected on the spot. Recorded first, so
+    # that a failure here still leaves the choice stored and retryable.
+    if db.get_managed_listing_by_parent(item_id) is not None:
+        client = get_ebay_client()
+        if client is not None and client.oauth.is_connected():
+            adapter = InventoryApiAdapter(client)
+
+            def run():
+                with db.session():
+                    return refresh_listing(
+                        db, adapter, item_id, user_id=user["id"]
+                    )
+
+            try:
+                result = await run_in_threadpool(run)
+            except (PushError, EbayError) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"The cover was saved but eBay refused the update: "
+                        f"{exc}. Press Refresh on the listing to try again."
+                    ),
+                )
+            return {
+                "success": True,
+                "ebay_parent_id": item_id,
+                "cover_image_url": saved,
+                "applied": True,
+                "refreshed": result.get("refreshed", 0),
+            }
+
     return {
         "success": True,
         "ebay_parent_id": item_id,
         "cover_image_url": saved,
+        "applied": False,
         "csv_content": build_cover_photo_revise_csv(item_id, saved),
     }
 

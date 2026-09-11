@@ -34,6 +34,8 @@ from tcg_engine.push import (
     refresh_listing,
 )
 
+COVER = "https://cdn.example.com/set-logo.png"
+
 COMPLETE_SETTINGS = {
     "category_id": "183454",
     "seller_postal_code": "94305",
@@ -639,6 +641,59 @@ class RefreshTests(PushTestCase):
                ["shipToLocationAvailability"]["quantity"],
             3,
             "a repair must re-send the quantity eBay already holds",
+        )
+
+    def test_a_pushed_cover_is_recorded_against_the_listing(self):
+        """
+        The staged cover has to cross from the plan to the listing.
+
+        It lives in listing_plan_group, keyed by plan. Nothing carried it
+        across, so after the push the eBay Listings tab showed the listing as
+        having no cover -- and the refresh below, finding none recorded,
+        replaced the cover on eBay with the first card's photo.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        self.db.set_plan_group_cover(plan_id, "Base Set|Near Mint", COVER)
+        approve_plan(self.db, plan_id, approved_by=1)
+        push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+        self.assertEqual(self.db.get_listing_cover_image(listing_id), COVER)
+
+        # And a later repair keeps it rather than overwriting it.
+        api = FakeEbay()
+        refresh_listing(self.db, api, listing_id, user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        self.assertEqual(group["imageUrls"], [COVER])
+
+    def test_a_refresh_keeps_a_cover_only_ebay_knows_about(self):
+        # Writing a group is a full replace, so a refresh that guesses does
+        # not leave the cover alone -- it overwrites it. Ask eBay first.
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = self.approved_plan()
+        push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+        self.assertEqual(self.db.get_listing_cover_image(listing_id), "")
+
+        class WithCover(FakeEbay):
+            def get_group(self, group_key):
+                return {"imageUrls": ["https://cdn.example.com/seller-set.jpg"]}
+
+        api = WithCover()
+        refresh_listing(self.db, api, listing_id, user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        self.assertEqual(
+            group["imageUrls"], ["https://cdn.example.com/seller-set.jpg"]
+        )
+        # Learned, so the next refresh need not ask again.
+        self.assertEqual(
+            self.db.get_listing_cover_image(listing_id),
+            "https://cdn.example.com/seller-set.jpg",
         )
 
     def test_a_csv_listing_cannot_be_refreshed(self):
