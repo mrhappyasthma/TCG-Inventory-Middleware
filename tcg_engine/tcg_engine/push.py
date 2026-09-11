@@ -493,11 +493,35 @@ def push_plan(
 
     if group_keys is not None:
         wanted = {str(key) for key in group_keys}
-        unknown = wanted - set(groups)
+        # "Nothing left to push" and "no such listing" are different answers,
+        # and conflating them is how pressing Push twice on a listing that
+        # went up perfectly reported that the plan had no such listing.
+        in_plan = {str(row.get("group_key") or "") for row in all_items}
+        unknown = wanted - in_plan
         if unknown:
             raise PushError(
                 "this plan has no listing(s) called: " + ", ".join(sorted(unknown))
             )
+        done = wanted - set(groups)
+        if done:
+            reason = (
+                "every card in " + ", ".join(sorted(done)) + " has already "
+                "been pushed. Use Refresh on the eBay Listings tab to re-send "
+                "its pictures or specifics; rebuild the draft to push a change "
+                "to stock or price."
+            )
+            record("WARN", f"Nothing was sent to eBay -- {reason}")
+            return {
+                "plan_id": plan_id,
+                "pushed": 0,
+                "failed": 0,
+                "deferred": 0,
+                "listings_created": 0,
+                "listings_updated": 0,
+                "attempted": False,
+                "reason": reason,
+                "logs": logs,
+            }
         groups = {key: value for key, value in groups.items() if key in wanted}
 
     counts = {"pushed": 0, "failed": 0, "deferred": 0}
@@ -724,6 +748,26 @@ def _push_group(
         return (0, 0)
 
     published = bool(managed and managed.get("ebay_parent_id"))
+    if not published:
+        # Ask eBay before creating anything. Our records cannot distinguish
+        # "eBay never published this" from "eBay published it and the reply
+        # was lost" -- a timeout after the listing was created looks exactly
+        # like a listing that was never created. Guessing wrong publishes a
+        # second live listing for the same cards, which is the most expensive
+        # mistake this module can make and the hardest to undo.
+        existing = _already_published(api, live, record)
+        if existing:
+            db.upsert_managed_listing(
+                group_key, ebay_parent_id=existing, pushed=True
+            )
+            managed = dict(managed or {"group_key": group_key})
+            managed["ebay_parent_id"] = existing
+            published = True
+            record("WARN", (
+                f"{group_key or 'ungrouped'}: eBay already has listing "
+                f"#{existing} for these cards, so this is being treated as an "
+                f"update. A previous attempt published it and lost the reply."
+            ))
 
     if single:
         item = live[0]
@@ -903,6 +947,35 @@ def _recover_offer_id(
         record("INFO", f"{sku}: offer id recovered from eBay ({ids[0]})")
         return str(ids[0])
     return ""
+
+
+def _already_published(
+    api: Any, items: List[Dict[str, Any]], record: Callable[[str, str], None]
+) -> str:
+    """
+    The listing id eBay already holds for these cards, if any.
+
+    One question, asked of the SKUs we are about to publish. A published offer
+    carries the id of the listing it belongs to, so if any of them has one,
+    this listing exists and must be updated rather than created again.
+    """
+    lookup = getattr(api, "published_listing_id", None)
+    if not callable(lookup) or not items:
+        return ""
+    # One SKU is enough to answer. Publishing a group publishes every offer in
+    # it, so if the listing exists the first card knows about it -- and asking
+    # all hundred would put back the per-card round trips that bulk creation
+    # just removed.
+    sku = _sku_for(items[0])
+    try:
+        listing = lookup(sku)
+    except Exception as exc:  # noqa: BLE001 - a read must not block a push
+        record("WARN", (
+            f"{sku}: could not check whether eBay already has a listing for "
+            f"this card ({exc}). Continuing."
+        ))
+        return ""
+    return str(listing or "")
 
 
 def _apply_price_quantity(

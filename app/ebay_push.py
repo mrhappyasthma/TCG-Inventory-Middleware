@@ -48,6 +48,24 @@ class InventoryApiAdapter:
         """Up to 25 offers in one call, with a row per SKU."""
         return inventory.bulk_create_offer(self.transport, payloads)
 
+    def published_listing_id(self, sku: str) -> str:
+        """
+        The eBay listing id an already-published offer for this SKU belongs to.
+
+        Asked immediately before publishing, to answer a question that cannot
+        be answered from our own records: did a previous attempt publish this
+        and then lose the reply? eBay creating the listing and the response
+        never arriving is indistinguishable locally from eBay never creating
+        it -- and guessing wrong publishes a second live listing.
+        """
+        for offer in inventory.get_offers(self.transport, sku):
+            listing = (offer.get("listing") or {}).get("listingId")
+            if not listing:
+                listing = offer.get("listingId")
+            if listing:
+                return str(listing)
+        return ""
+
     def offer_ids_for(self, sku: str) -> List[str]:
         """
         The offer ids eBay holds for one SKU.

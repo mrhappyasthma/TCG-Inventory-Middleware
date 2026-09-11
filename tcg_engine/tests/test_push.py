@@ -66,6 +66,9 @@ class FakeEbay:
         self.withdrawn = []
         self.next_offer = 1000
         self.next_listing = 220000
+        # SKUs eBay already has a published listing for, as it would report
+        # after a publish whose reply never reached us.
+        self.published_skus = {}
 
     # -- the surface push_plan expects ---------------------------------
 
@@ -111,6 +114,10 @@ class FakeEbay:
             self.offers[offer_id] = payload
             rows.append({"sku": sku, "statusCode": 200, "offerId": offer_id})
         return rows
+
+    def published_listing_id(self, sku):
+        self.calls.append(("published_listing_id", sku))
+        return self.published_skus.get(sku, "")
 
     def offer_ids_for(self, sku):
         self.calls.append(("offer_ids_for", sku))
@@ -221,9 +228,15 @@ class CreateListingTests(PushTestCase):
         # Items, then offers, then the group, then publish. The group is what
         # makes the listing visible, so anything it references must exist by
         # the time it is written.
+        # Items, then offers, then one question, then the group, then
+        # publish. The question -- does eBay already have a listing for these
+        # cards? -- is asked because a publish whose reply was lost looks
+        # locally identical to one that never happened, and guessing wrong
+        # creates a second live listing. One SKU answers for the whole group.
         self.assertEqual(
             api.kinds(),
-            ["upsert_items", "create_offers", "upsert_group", "publish_group"],
+            ["upsert_items", "create_offers", "published_listing_id",
+             "upsert_group", "publish_group"],
         )
 
         # The listing is now ours to manage through the API, and the eBay item
@@ -594,6 +607,86 @@ class ScopedPushTests(PushTestCase):
                          group_keys=["Base Set|Near Mint"])
         self.assertEqual(rest["pushed"], 2)
         self.assertEqual(self.db.get_plan(plan_id)["status"], "pushed")
+
+    def test_pushing_the_same_listing_twice_creates_nothing(self):
+        """
+        The question anyone will ask after their first successful push.
+
+        Pressing Push again on a listing that went up must not produce a
+        second one, and must not read like an error either -- "this plan has
+        no listing called X" was the old answer, which is alarming and wrong.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        # A second listing, so the plan still has work left and this exercises
+        # the per-listing answer rather than the whole-plan one.
+        self.db.insert_manifest("ID2001", "Pikachu", "Jungle", "Near Mint",
+                                "Holofoil", card_number="060/064")
+        self.db.set_manifest_quantity("ID2001", 1)
+        self.db.set_manifest_ebay_fields("ID2001", {
+            "item_specifics": {"C:Graded": "No"},
+        })
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE manifest SET price = 1.99 WHERE manifest_id = ?",
+                         ("ID2001",))
+            conn.commit()
+        plan_id = self.approved_plan()
+        first = push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE,
+                          group_keys=["Base Set|Near Mint"])
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+
+        api = FakeEbay()
+        again = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE,
+                          group_keys=["Base Set|Near Mint"])
+
+        self.assertFalse(again["attempted"])
+        self.assertIn("already been pushed", again["reason"])
+        self.assertIn("Refresh", again["reason"])
+        self.assertEqual(api.calls, [], "nothing may be sent to eBay")
+        # One listing, still the same one.
+        self.assertEqual(
+            self.db.get_managed_listing("Base Set|Near Mint")["ebay_parent_id"],
+            listing_id,
+        )
+        self.assertEqual(first["listings_created"], 1)
+
+    def test_a_push_interrupted_after_publishing_resumes_as_an_update(self):
+        """
+        Why an interrupted push cannot duplicate a listing.
+
+        The eBay item number is recorded the instant eBay issues it, so a
+        retry sees the listing as already published and takes the update path
+        -- no second publish, no second listing.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        plan_id = self.approved_plan()
+
+        # eBay publishes, and the reply never arrives.
+        class DiesAfterPublish(FakeEbay):
+            def publish_group(self, group_key):
+                listing = super().publish_group(group_key)
+                raise RuntimeError(f"connection lost after publishing {listing}")
+
+        push_plan(self.db, DiesAfterPublish(), plan_id, user_id=SHARED_SCOPE)
+        # Locally this is indistinguishable from never having published.
+        self.assertIsNone(
+            self.db.get_managed_listing("Base Set|Near Mint")["ebay_parent_id"]
+        )
+
+        # But eBay knows, and is asked before anything is created again.
+        api = FakeEbay()
+        api.published_skus = {"ID1001": "227999111222"}
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        self.assertEqual(result["pushed"], 1)
+        self.assertNotIn("publish_group", api.kinds())
+        self.assertEqual(result["listings_created"], 0)
+        self.assertEqual(
+            self.db.get_managed_listing("Base Set|Near Mint")["ebay_parent_id"],
+            "227999111222",
+            "the listing eBay already had must be adopted, not duplicated",
+        )
 
     def test_an_unknown_listing_is_refused_rather_than_pushing_nothing(self):
         # Silently pushing nothing would look like success and leave the user
