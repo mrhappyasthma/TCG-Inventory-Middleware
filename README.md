@@ -675,11 +675,22 @@ python scripts/migrate_csv_listings.py --migrate 227511361186
 python scripts/migrate_csv_listings.py --migrate all
 ```
 
-On the NAS, run it where the app's environment already exists:
+On the NAS, run it where the app's environment already exists — the eBay
+credentials and `DATABASE_URL` are the container's, and a laptop's point at a
+different database entirely:
 
 ```bash
-docker exec -it tcg-middleware python scripts/migrate_csv_listings.py
+cd /volume1/docker/tcg-middleware
+docker compose exec tcg-middleware python scripts/migrate_csv_listings.py
 ```
+
+`tcg-middleware` there is the **service** name from `docker-compose.yml`, not
+the container name — `docker compose exec` resolves it, so it keeps working
+when the container is recreated under a different name. If you would rather
+use `docker exec`, get the real name first with `docker compose ps` or
+`docker ps --format '{{.Names}}'`; they are not the same string
+(`container_name` is `tcg-ebay-middleware`), and a stale one fails with
+*No such container*.
 
 **It cannot be undone.** After a listing migrates, File Exchange and the
 Trading API can no longer revise it — every future change goes through this

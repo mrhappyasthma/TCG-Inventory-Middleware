@@ -101,9 +101,13 @@ def build_client(user_db):
     if not EbayConfig.is_configured():
         raise SystemExit(
             "eBay is not configured in this environment. Run this where the "
-            "app runs, so EBAY_CLIENT_ID and friends are set -- on the NAS "
-            "that is: docker exec -it <container> python "
-            "scripts/migrate_csv_listings.py"
+            "app runs, so EBAY_CLIENT_ID and friends are set. On the NAS, "
+            "from the project directory:\n"
+            "    docker compose exec tcg-middleware python "
+            "scripts/migrate_csv_listings.py\n"
+            "That is the compose *service* name, which survives the container "
+            "being recreated under a different name; `docker exec` needs the "
+            "container name from `docker compose ps`."
         )
     client = EbayClient(EbayConfig.from_env(), store=_ReadOnlyTokenStore(user_db))
     if not client.oauth.is_connected():
