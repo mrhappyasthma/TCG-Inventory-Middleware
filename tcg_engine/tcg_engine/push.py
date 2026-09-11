@@ -689,28 +689,21 @@ def _push_group(
         record("ERROR", f"{group_key or 'ungrouped'}: every card failed")
         return (0, 0)
 
-    # 2. An offer per card. One already on record is reused: a second offer
-    #    for the same SKU is an error, and the offer id is the only handle
-    #    that can change a price.
+    # 2. An offer per card, 25 to a call. One already on record is reused: a
+    #    second offer for the same SKU is an error, and the offer id is the
+    #    only handle that can change a price.
     description = _group_description(group_items, single)
-    for item in list(live):
-        if item.get("offer_id"):
-            continue
-        try:
-            offer_id = api.create_offer(_offer_payload(
-                item,
-                settings=settings,
-                category_id=category_id,
-                marketplace_id=marketplace_id,
-                description=description,
-            ))
-        except Exception as exc:  # noqa: BLE001 - a per-card verdict
-            _mark(db, item, STATUS_FAILED, counts, str(exc))
-            record("ERROR", f"{_sku_for(item)}: {exc}")
-            live.remove(item)
-            continue
-        db.set_variation_offer(item["manifest_id"], offer_id)
-        item["offer_id"] = offer_id
+    _create_offers(
+        db, api,
+        [item for item in live if not item.get("offer_id")],
+        settings=settings,
+        category_id=category_id,
+        marketplace_id=marketplace_id,
+        description=description,
+        counts=counts,
+        record=record,
+    )
+    live = [item for item in live if item["status"] != STATUS_FAILED]
 
     if not live:
         return (0, 0)
@@ -789,6 +782,119 @@ def _push_group(
 
     _confirm(db, live, listing_id, counts)
     return (0 if published else 1, 1 if published else 0)
+
+
+def _create_offers(
+    db: Database,
+    api: Any,
+    items: List[Dict[str, Any]],
+    *,
+    settings: Dict[str, str],
+    category_id: str,
+    marketplace_id: str,
+    description: str,
+    counts: Dict[str, int],
+    record: Callable[[str, str], None],
+) -> None:
+    """
+    Create the offers these cards need, in batches of 25.
+
+    One call per card is what made a hundred-card listing take minutes: the
+    offer loop was 94% of the requests. eBay's bulk endpoint does the same
+    work in a twenty-fifth of the round trips.
+
+    The care that the per-card loop earned is kept. An offer id is the only
+    handle that can later change a card's price, so each one is written down
+    as it comes back, and a SKU eBay reports as created *without* an id is
+    chased up rather than shrugged at -- leaving it unrecorded would make the
+    next push try to create a second offer for that SKU, which eBay refuses.
+    A row eBay rejected fails its own card and no other.
+    """
+    if not items:
+        return
+
+    by_sku = {_sku_for(item): item for item in items}
+    payloads = [
+        {
+            **_offer_payload(
+                item,
+                settings=settings,
+                category_id=category_id,
+                marketplace_id=marketplace_id,
+                description=description,
+            ),
+        }
+        for item in items
+    ]
+
+    for start in range(0, len(payloads), BULK_LIMIT):
+        batch = payloads[start:start + BULK_LIMIT]
+        try:
+            rows = api.create_offers(batch)
+        except Exception as exc:  # noqa: BLE001 - the batch, not the listing
+            for entry in batch:
+                item = by_sku.get(entry["sku"])
+                if item is not None:
+                    _mark(db, item, STATUS_FAILED, counts, str(exc))
+                    record("ERROR", f"{entry['sku']}: {exc}")
+            continue
+
+        rejected = dict(api.failures(rows))
+        for row in rows:
+            sku = str(row.get("sku") or "")
+            item = by_sku.get(sku)
+            if item is None:
+                continue
+            if sku in rejected:
+                _mark(db, item, STATUS_FAILED, counts, rejected[sku])
+                record("ERROR", f"{sku}: {rejected[sku]}")
+                continue
+
+            offer_id = str(row.get("offerId") or "").strip()
+            if not offer_id:
+                offer_id = _recover_offer_id(api, sku, record)
+            if not offer_id:
+                _mark(db, item, STATUS_FAILED, counts, (
+                    "eBay created the offer but returned no offer id, and it "
+                    "could not be read back. Without it the price cannot be "
+                    "changed later, so this card is left out rather than "
+                    "listed with a handle nobody holds."
+                ))
+                continue
+
+            db.set_variation_offer(item["manifest_id"], offer_id)
+            item["offer_id"] = offer_id
+
+        # A SKU eBay said nothing about at all is not a success.
+        answered = {str(row.get("sku") or "") for row in rows}
+        for entry in batch:
+            sku = entry["sku"]
+            item = by_sku.get(sku)
+            if item is None or sku in answered or item.get("offer_id"):
+                continue
+            _mark(db, item, STATUS_FAILED, counts, (
+                "eBay's response did not mention this SKU, so whether its "
+                "offer was created is unknown."
+            ))
+            record("ERROR", f"{sku}: missing from eBay's bulk offer response")
+
+
+def _recover_offer_id(
+    api: Any, sku: str, record: Callable[[str, str], None]
+) -> str:
+    """Ask eBay for an offer id a bulk response did not include."""
+    lookup = getattr(api, "offer_ids_for", None)
+    if not callable(lookup):
+        return ""
+    try:
+        ids = lookup(sku) or []
+    except Exception as exc:  # noqa: BLE001 - recovery is best-effort
+        record("WARN", f"{sku}: could not read the offer back from eBay: {exc}")
+        return ""
+    if ids:
+        record("INFO", f"{sku}: offer id recovered from eBay ({ids[0]})")
+        return str(ids[0])
+    return ""
 
 
 def _apply_price_quantity(

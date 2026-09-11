@@ -95,6 +95,30 @@ class FakeEbay:
         self.offers[offer_id] = payload
         return offer_id
 
+    def create_offers(self, payloads):
+        self.calls.append(("create_offers", [p["sku"] for p in payloads]))
+        rows = []
+        for payload in payloads:
+            sku = payload["sku"]
+            if sku in self.offer_error_skus:
+                rows.append({
+                    "sku": sku, "statusCode": 400,
+                    "errors": [{"longMessage": f"offer refused for {sku}"}],
+                })
+                continue
+            self.next_offer += 1
+            offer_id = str(self.next_offer)
+            self.offers[offer_id] = payload
+            rows.append({"sku": sku, "statusCode": 200, "offerId": offer_id})
+        return rows
+
+    def offer_ids_for(self, sku):
+        self.calls.append(("offer_ids_for", sku))
+        return [
+            oid for oid, payload in self.offers.items()
+            if payload.get("sku") == sku
+        ]
+
     def update_price_quantity(self, requests):
         self.calls.append(("update_price_quantity", [r["sku"] for r in requests]))
         rows = []
@@ -199,8 +223,7 @@ class CreateListingTests(PushTestCase):
         # the time it is written.
         self.assertEqual(
             api.kinds(),
-            ["upsert_items", "create_offer", "create_offer",
-             "upsert_group", "publish_group"],
+            ["upsert_items", "create_offers", "upsert_group", "publish_group"],
         )
 
         # The listing is now ours to manage through the API, and the eBay item
@@ -379,7 +402,7 @@ class LegacyListingTests(PushTestCase):
         self.assertNotIn("publish_group", api2.kinds())
         # The existing offer is reused: a second offer for the same SKU is an
         # error, and the offer id is the only way to change a price.
-        self.assertNotIn("create_offer", api2.kinds())
+        self.assertNotIn("create_offers", api2.kinds())
         self.assertIn("update_price_quantity", api2.kinds())
         live = {r["manifest_id"]: r for r in self.db.get_live_variations()}
         self.assertEqual(live["ID1001"]["last_known_qty"], 7)
@@ -580,6 +603,96 @@ class ScopedPushTests(PushTestCase):
         with self.assertRaises(PushError):
             push_plan(self.db, FakeEbay(), plan_id, user_id=SHARED_SCOPE,
                       group_keys=["No Such Set|NM"])
+
+
+class BulkOfferTests(PushTestCase):
+    def test_offers_are_created_in_batches_of_twenty_five(self):
+        """
+        One call per card is what made a hundred-card listing take minutes.
+
+        The offer loop was 94% of the requests; eBay takes 25 at a time.
+        """
+        for index in range(30):
+            self.add_card(f"ID{2000 + index}", f"Card {index}",
+                          f"{index:03d}/102")
+        api = FakeEbay()
+        result = push_plan(self.db, api, self.approved_plan(),
+                           user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["pushed"], 30)
+        batches = [args for name, args in api.calls if name == "create_offers"]
+        self.assertEqual([len(b) for b in batches], [25, 5])
+        # Every card still has its own offer id recorded, which is the only
+        # handle that can change its price later.
+        offers = {
+            row["manifest_id"]: row["offer_id"]
+            for row in self.db.get_live_variations()
+        }
+        self.assertEqual(len(offers), 30)
+        self.assertTrue(all(offers.values()))
+
+    def test_one_rejected_offer_fails_only_its_own_card(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+        api = FakeEbay(offer_error_skus={"ID1001"})
+
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual((result["pushed"], result["failed"]), (1, 1))
+        items = self.items_by_sku(plan_id)
+        self.assertEqual(items["ID1001"]["status"], STATUS_FAILED)
+        self.assertEqual(items["ID1002"]["status"], STATUS_PUSHED)
+        group = list(api.groups.values())[0]
+        self.assertEqual(group["variantSKUs"], ["ID1002"])
+
+    def test_an_offer_id_missing_from_the_response_is_read_back(self):
+        """
+        The one thing a bulk create can lose.
+
+        An offer id is the only handle that can change a card's price. A row
+        eBay reports as created but returns no id for would otherwise leave
+        the card listed with a handle nobody holds -- and the next push would
+        try to create a second offer for that SKU, which eBay refuses.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+
+        class Forgetful(FakeEbay):
+            def create_offers(self, payloads):
+                rows = super().create_offers(payloads)
+                for row in rows:
+                    row.pop("offerId", None)
+                return rows
+
+        api = Forgetful()
+        result = push_plan(self.db, api, self.approved_plan(),
+                           user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["pushed"], 1)
+        self.assertIn("offer_ids_for", api.kinds())
+        recorded = self.db.get_live_variations()[0]["offer_id"]
+        self.assertTrue(recorded)
+
+    def test_a_card_ebay_says_nothing_about_is_not_a_success(self):
+        # Silence is not consent: if the response omits a SKU, whether its
+        # offer exists is unknown, and listing it would be a guess.
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "002/102")
+        plan_id = self.approved_plan()
+
+        class Silent(FakeEbay):
+            def create_offers(self, payloads):
+                rows = super().create_offers(payloads)
+                return [r for r in rows if r["sku"] != "ID1002"]
+
+            def offer_ids_for(self, sku):
+                return []
+
+        result = push_plan(self.db, Silent(), plan_id, user_id=SHARED_SCOPE)
+        items = self.items_by_sku(plan_id)
+        self.assertEqual(items["ID1002"]["status"], STATUS_FAILED)
+        self.assertIn("did not mention", items["ID1002"]["validation"])
+        self.assertEqual(result["pushed"], 1)
 
 
 class ImageTests(PushTestCase):

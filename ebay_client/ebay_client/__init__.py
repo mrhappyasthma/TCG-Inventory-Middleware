@@ -47,6 +47,7 @@ from .errors import (
 from .inventory import (
     BULK_INVENTORY_ITEM_LIMIT,
     BULK_PRICE_QUANTITY_LIMIT,
+    bulk_create_offer,
     bulk_statuses,
     bulk_update_price_quantity,
     chunked,
@@ -99,6 +100,7 @@ __all__ = [
     "create_or_replace_inventory_item",
     "get_inventory_item",
     "create_offer",
+    "bulk_create_offer",
     "update_offer",
     "get_offers",
     "publish_offer",

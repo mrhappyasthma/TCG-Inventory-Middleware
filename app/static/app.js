@@ -2274,7 +2274,15 @@ async function refreshListingContents(itemId, button) {
         const res = await fetch(`/api/ebay-listings/${encodeURIComponent(itemId)}/refresh`, {
             method: "POST",
         });
-        const data = await res.json();
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            logToTerminal("WARN", (
+                `The connection dropped while listing #${itemId} was being refreshed `
+                + `(a ${res.status} page came back instead of a result). The refresh is `
+                + "probably still running; check the listing on eBay in a minute."
+            ));
+            return;
+        }
         if (!res.ok) throw new Error(data.detail || "Could not refresh the listing");
         (data.logs || []).forEach(e => logToTerminal(e.level, e.message));
         logToTerminal(data.failed ? "WARN" : "SUCCESS",
@@ -3297,6 +3305,19 @@ async function saveEbayPushSetup() {
 // confirm states what it will do in numbers rather than asking "are you
 // sure?". A partial push is offered again because it is resumable: cards
 // already pushed are skipped, so pressing it twice cannot duplicate a listing.
+// Returns the parsed body, or null when the response is not JSON at all.
+// A reverse proxy timing out on a long request answers with an HTML page, and
+// calling res.json() on that throws "Unexpected token '<'" -- which tells the
+// user nothing about what happened to their push.
+async function readJsonResponse(res) {
+    const text = await res.text();
+    try {
+        return JSON.parse(text);
+    } catch (err) {
+        return null;
+    }
+}
+
 async function pushPlan(planId, button, groupKey) {
     const what = groupKey ? `the "${groupKey}" listing from plan ${planId}` : `all of plan ${planId}`;
     if (!confirm(`Push ${what} to eBay now? This creates and updates live listings immediately — there is no draft on eBay's side. Cards already pushed are skipped, and listings made through File Exchange are left for the CSV files.`)) {
@@ -3310,7 +3331,22 @@ async function pushPlan(planId, button, groupKey) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(groupKey ? { group_key: groupKey } : {}),
         });
-        const data = await res.json();
+        // Creating a large listing can outlast the reverse proxy's patience.
+        // What comes back then is the proxy's own HTML error page, not our
+        // JSON -- and the push itself carries on server-side and usually
+        // finishes. Reading that as "the push failed" is wrong and alarming,
+        // so the two are told apart explicitly.
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            logToTerminal("WARN", (
+                `The connection dropped while plan ${planId} was still being pushed `
+                + `(the server answered with a ${res.status} page rather than a result). `
+                + "The push is most likely still running: check eBay Listings in a "
+                + "minute, and press Push again afterwards -- cards already pushed are skipped."
+            ));
+            await fetchDraftPlan();
+            return;
+        }
         if (!res.ok) throw new Error(data.detail || "The push failed");
         (data.logs || []).forEach(entry =>
             logToTerminal(entry.level, entry.message));

@@ -42,6 +42,28 @@ class InventoryApiAdapter:
     def create_offer(self, payload: Dict[str, Any]) -> str:
         return inventory.create_offer(self.transport, payload)
 
+    def create_offers(
+        self, payloads: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Up to 25 offers in one call, with a row per SKU."""
+        return inventory.bulk_create_offer(self.transport, payloads)
+
+    def offer_ids_for(self, sku: str) -> List[str]:
+        """
+        The offer ids eBay holds for one SKU.
+
+        A recovery path, not a normal step: if a bulk create reports a SKU as
+        succeeded but returns no offer id, the id still exists at eBay and is
+        the only handle that can change that card's price later. Asking is far
+        better than assuming there is none, which would make the next push try
+        to create a second offer for the same SKU.
+        """
+        return [
+            str(offer.get("offerId"))
+            for offer in inventory.get_offers(self.transport, sku)
+            if offer.get("offerId")
+        ]
+
     def update_price_quantity(
         self, requests: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:

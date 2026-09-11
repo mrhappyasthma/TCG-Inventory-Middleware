@@ -1177,6 +1177,7 @@ class Database:
                 """
                 SELECT v.manifest_id, v.ebay_parent_id, v.custom_label,
                        v.last_known_qty, v.last_known_price, v.pending_qty,
+                       v.offer_id,
                        m.product_name, m.set_name, m.condition, m.remarks
                 FROM ebay_variations v
                 JOIN manifest m ON m.manifest_id = v.manifest_id

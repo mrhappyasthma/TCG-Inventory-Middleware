@@ -106,6 +106,36 @@ class OfferTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             inventory.create_offer(transport, {"sku": "ID1"})
 
+    def test_bulk_create_returns_an_offer_id_per_sku(self):
+        # 25 offers in one call rather than 25 calls. The ids in the response
+        # are the only handles that can change those cards' prices later, so
+        # the caller has to be able to read them back per SKU.
+        transport, opener = transport_with(ok({"responses": [
+            {"sku": "ID1443", "statusCode": 200, "offerId": "9001"},
+            {"sku": "ID1451", "statusCode": 400,
+             "errors": [{"longMessage": "no inventory item"}]},
+        ]}))
+        rows = inventory.bulk_create_offer(transport, [
+            {"sku": "ID1443", "marketplaceId": "EBAY_US", "format": "FIXED_PRICE"},
+            {"sku": "ID1451", "marketplaceId": "EBAY_US", "format": "FIXED_PRICE"},
+        ])
+        self.assertEqual(rows[0]["offerId"], "9001")
+        self.assertEqual(
+            [sku for sku, _ in
+             [(r.get("sku"), r) for r in inventory.failed_statuses(rows)]],
+            ["ID1451"],
+        )
+        self.assertTrue(opener.calls[0]["url"].endswith("/bulk_create_offer"))
+
+    def test_an_oversized_offer_batch_is_refused(self):
+        transport, _ = transport_with()
+        with self.assertRaises(ValueError):
+            inventory.bulk_create_offer(transport, [
+                {"sku": f"ID{i}", "marketplaceId": "EBAY_US",
+                 "format": "FIXED_PRICE"}
+                for i in range(26)
+            ])
+
     def test_no_offers_for_a_sku_is_an_empty_list(self):
         # This is what every File Exchange listing looks like through the
         # Inventory API: absent, not empty-stock. The distinction decides

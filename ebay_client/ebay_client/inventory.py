@@ -136,6 +136,37 @@ def create_offer(transport, payload: Dict[str, Any]) -> str:
     return str(offer_id)
 
 
+def bulk_create_offer(
+    transport, offers: Sequence[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Create up to 25 unpublished offers in one call.
+
+    The alternative is one call per card, which is what made creating a
+    hundred-card listing take minutes: the offer loop was 94% of the
+    requests. This is the same work in a twenty-fifth of the round trips.
+
+    Returns the per-SKU rows. Each successful row carries the ``offerId``
+    eBay generated, which is the *only* handle that can later change that
+    card's price -- so a caller must read the ids out of this response and
+    store them. Losing one means the next push tries to create a second offer
+    for a SKU that already has one, which eBay refuses.
+    """
+    if not offers:
+        return []
+    if len(offers) > BULK_OFFER_LIMIT:
+        raise ValueError(
+            f"{len(offers)} offers exceeds eBay's limit of "
+            f"{BULK_OFFER_LIMIT} per call; use chunked()"
+        )
+    for entry in offers:
+        validate_sku(entry.get("sku", ""))
+    response = transport.post(
+        f"{INVENTORY_BASE}/bulk_create_offer", {"requests": list(offers)}
+    ) or {}
+    return bulk_statuses(response)
+
+
 def update_offer(transport, offer_id: str, payload: Dict[str, Any]) -> None:
     """
     Replace an existing offer.
