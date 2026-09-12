@@ -3075,10 +3075,10 @@ async function approveDraftPlan() {
             `Draft ${planId} approved: ${data.approved_items} change(s) cleared to push`
         );
 
-        // An approved plan now yields the eBay files it authorised. Offered
-        // rather than auto-downloaded, matching how Module A's files work,
-        // and only the files that actually have rows in them.
-        expandPlanFilesFor = planId;
+        // Open the listing rows straight away: approving is what makes
+        // them pushable, so the next thing anybody wants is the Push
+        // button beside each one.
+        expandPlanListingsFor = planId;
         await fetchDraftPlan();
     } catch (err) {
         logToTerminal("ERROR", `Approval failed: ${err.message}`);
@@ -3086,9 +3086,10 @@ async function approveDraftPlan() {
     }
 }
 
-// Set after approving, so that plan's files open by themselves rather than
-// needing a click straight after the action that produced them.
-let expandPlanFilesFor = null;
+// Set after approving or pushing, so that plan's listing rows open by
+// themselves rather than needing a click straight after the action that
+// changed them.
+let expandPlanListingsFor = null;
 
 function statusBadge(status) {
     const styles = {
@@ -3143,19 +3144,26 @@ function renderPlanHistory(plans) {
                         </button>`
                         : ""}
                 </div>
-                <div id="planFiles${p.id}" class="hidden mt-2"></div>
+                <div id="planListings${p.id}" class="hidden mt-2"></div>
             </div>`).join("")}`;
 
-    if (expandPlanFilesFor) {
-        const planId = expandPlanFilesFor;
-        expandPlanFilesFor = null;
+    if (expandPlanListingsFor) {
+        const planId = expandPlanListingsFor;
+        expandPlanListingsFor = null;
         loadPlanListings(planId);
     }
 }
 
 async function loadPlanListings(planId) {
-    const box = document.getElementById(`planFiles${planId}`);
+    const box = document.getElementById(`planListings${planId}`);
     if (!box) return;
+    // A second press collapses. Without this it removed "hidden" from
+    // an already-open box and re-fetched the same rows, so the button
+    // looked dead.
+    if (!box.classList.contains("hidden")) {
+        box.classList.add("hidden");
+        return;
+    }
     box.classList.remove("hidden");
     box.innerHTML = `<p class="text-[11px] text-slate-500">Reading the plan&hellip;</p>`;
     try {
@@ -3419,9 +3427,9 @@ async function followPushJob(jobId, planId, opts) {
             logToTerminal("WARN", `Nothing was sent to eBay. ${result.reason || ""}`);
         } else if (result) {
             logToTerminal(result.pushed && !result.failed ? "SUCCESS" : "WARN",
-                `Push complete: ${result.pushed} card(s) pushed, ${result.failed} failed, ${result.deferred} left for CSV`);
+                `Push complete: ${result.pushed} card(s) pushed, ${result.failed} failed, ${result.deferred} skipped`);
         }
-        expandPlanFilesFor = planId;
+        expandPlanListingsFor = planId;
         await fetchDraftPlan();
         if (typeof fetchEbayListings === "function") fetchEbayListings();
     };

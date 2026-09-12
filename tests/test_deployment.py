@@ -154,6 +154,38 @@ class JavaScriptParsesTests(unittest.TestCase):
             + "\n  ".join(str(p) for p in problems),
         )
 
+    def test_the_plan_listings_panel_toggles_and_its_id_matches(self):
+        """
+        Two ways this button silently does nothing.
+
+        The panel is rendered with one template id and read back with another,
+        so if the two prefixes drift apart ``getElementById`` returns null and
+        the handler returns early: no error, no visible effect. That nearly
+        happened while renaming it away from "planFiles".
+
+        And it has to collapse on a second press. It used to call
+        ``classList.remove("hidden")`` on an already-visible box and re-fetch
+        the same rows, which looks identical to a dead button.
+        """
+        js = self.source("app.js")
+
+        rendered = re.search(r'<div id="(\w+?)\$\{p\.id\}"', js)
+        self.assertIsNotNone(rendered, "the plan panel div is not rendered")
+        looked_up = re.search(r'getElementById\(`(\w+?)\$\{planId\}`\)', js)
+        self.assertIsNotNone(looked_up, "the plan panel is never looked up")
+        self.assertEqual(
+            rendered.group(1), looked_up.group(1),
+            "the id the plan panel is rendered with and the id it is read "
+            "back with have drifted apart, so the button does nothing",
+        )
+
+        start = js.index("async function loadPlanListings(")
+        body = js[start:start + 1200]
+        self.assertIn(
+            'classList.add("hidden")', body,
+            "a second press must collapse the panel rather than re-fetching",
+        )
+
     def test_module_b_defaults_to_visible_and_the_sync_has_a_home(self):
         """
         Hiding Module B must not hide the capability, or lose the fallback.
