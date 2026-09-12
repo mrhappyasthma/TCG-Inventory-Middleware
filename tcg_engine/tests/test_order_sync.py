@@ -30,13 +30,21 @@ from tcg_engine.order_sync import (
 )
 
 
+# One of ours by default: the fixture seeds this listing in setUp, so a
+# line is "from a listing we manage" unless a test says otherwise.
+OUR_LISTING = "227511361186"
+THEIR_LISTING = "227496856039"
+
+
 def line(order="12-345", item="L1", sku="ID1001", quantity=1,
-         status=STATUS_ACTIVE, sold_at="2026-09-11T09:00:00Z"):
+         status=STATUS_ACTIVE, sold_at="2026-09-11T09:00:00Z",
+         item_id=OUR_LISTING):
     """One projected line, in exactly the shape the app layer hands over."""
     return {
         "order_id": order,
         "line_item_id": item,
         "sku": sku,
+        "legacy_item_id": item_id,
         "quantity": quantity,
         "status": status,
         "sold_at": sold_at,
@@ -50,6 +58,10 @@ class OrderSyncTests(unittest.TestCase):
         self.db.insert_manifest("ID1001", "Charizard", "Base Set", "Near Mint",
                                 "Holofoil", card_number="004/102")
         self.db.set_manifest_quantity("ID1001", 5)
+        # Linked to one of our listings, so an unresolved SKU on it is a
+        # genuine fault rather than somebody else's sale.
+        self.db.upsert_variation("ID1001", OUR_LISTING, 5,
+                                 custom_label="ID1001")
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -175,14 +187,14 @@ class OrderSyncTests(unittest.TestCase):
         first = sync_orders(self.db, [line(sku="ID7777")])
         self.assertEqual(first["unmatched"], 1)
         self.assertEqual(first["deducted"], 0)
-        self.assertTrue(any("matches no catalogued card" in l["message"]
+        self.assertTrue(any("no catalogued card matches" in l["message"]
                             for l in first["logs"]),
                         "the first sighting must name it")
 
         second = sync_orders(self.db, [line(sku="ID7777")])
         self.assertEqual(second["unmatched"], 1, "still counted")
         self.assertEqual(second["repeated_unmatched"], 1)
-        self.assertFalse(any("matches no catalogued card" in l["message"]
+        self.assertFalse(any("no catalogued card matches" in l["message"]
                              for l in second["logs"]),
                          "but not named a second time")
         self.assertTrue(any("still match no catalogued card" in l["message"]
@@ -218,6 +230,72 @@ class OrderSyncTests(unittest.TestCase):
         result = sync_orders(self.db, [])
         self.assertEqual(result["seen"], 0)
         self.assertEqual(result["deducted"], 0)
+
+    # -- whose sale is it anyway ------------------------------------------
+
+    def test_a_sale_from_a_listing_we_do_not_manage_is_not_a_warning(self):
+        """
+        The bug a real first poll surfaced, 46 times over.
+
+        Every warning was an ordinary sale from a listing made by hand -- a
+        promo single, an empty Elite Trainer Box, a Gamecube case. No SKU, no
+        catalogued card, nothing to deduct, and nothing wrong. Reporting those
+        as faults buried the one line that explained them.
+        """
+        result = sync_orders(self.db, [
+            line(sku="", item_id=THEIR_LISTING),
+        ])
+        self.assertEqual(result["foreign"], 1)
+        self.assertEqual(result["unmatched"], 0, "not a fault")
+        self.assertEqual(result["deducted"], 0)
+        self.assertEqual(self.held(), 5)
+        self.assertFalse(
+            any(l["level"] == "WARN" for l in result["logs"]),
+            "somebody else's sale must not warn",
+        )
+
+    def test_a_foreign_sale_is_never_reconsidered(self):
+        # Terminal: there is no future in which it becomes deductible, so
+        # leaving it unclaimed would mean re-deciding it every fifteen
+        # minutes forever.
+        sync_orders(self.db, [line(sku="", item_id=THEIR_LISTING)])
+        row = self.db.get_recent_order_lines()[0]
+        self.assertIsNotNone(row["deducted_at"])
+        self.assertEqual(row["deducted_qty"], 0)
+
+        again = sync_orders(self.db, [line(sku="", item_id=THEIR_LISTING)])
+        self.assertEqual(again["already"], 1)
+        self.assertEqual(again["foreign"], 0, "not counted twice")
+
+    def test_an_unresolved_sku_on_our_own_listing_is_still_a_fault(self):
+        """
+        The case the classification must not swallow.
+
+        A listing we have a record of, whose SKU matches no card, means a card
+        catalogued under another id -- and that is worth naming every time a
+        new one appears.
+        """
+        result = sync_orders(self.db, [
+            line(sku="ID7777", item_id=OUR_LISTING),
+        ])
+        self.assertEqual(result["unmatched"], 1)
+        self.assertEqual(result["foreign"], 0)
+        self.assertTrue(any(l["level"] == "WARN" for l in result["logs"]))
+
+    def test_a_line_with_no_item_number_is_treated_as_ours(self):
+        # Unidentifiable, so it gets the cautious reading: named rather than
+        # dismissed. Better a warning about a sale that was not ours than
+        # silence about one that was.
+        result = sync_orders(self.db, [line(sku="", item_id="")])
+        self.assertEqual(result["unmatched"], 1)
+        self.assertEqual(result["foreign"], 0)
+
+    def test_the_item_number_is_recorded(self):
+        sync_orders(self.db, [line(item_id=OUR_LISTING)])
+        self.assertEqual(
+            self.db.get_recent_order_lines()[0]["legacy_item_id"],
+            OUR_LISTING,
+        )
 
     # -- the first poll ---------------------------------------------------
 
@@ -328,13 +406,16 @@ class OrderSyncTests(unittest.TestCase):
             sync_orders(self.db, [incomplete])
         self.assertIn("quantity", str(caught.exception))
 
-    def test_the_allowed_fields_are_exactly_six(self):
-        # Pinned as a number as well as a set: adding a seventh should be a
+    def test_the_allowed_fields_are_exactly_seven(self):
+        # Pinned as a number as well as a set: adding one should be a
         # decision somebody makes deliberately, with this test in front of
-        # them, rather than a diff nobody notices.
-        self.assertEqual(len(REQUIRED_LINE_FIELDS), 6)
+        # them, rather than a diff nobody notices. legacy_item_id was
+        # added that way: a public listing number, needed to tell our
+        # sales from the ones listed by hand.
+        self.assertEqual(len(REQUIRED_LINE_FIELDS), 7)
         self.assertEqual(REQUIRED_LINE_FIELDS, {
-            "order_id", "line_item_id", "sku", "quantity", "sold_at", "status",
+            "order_id", "line_item_id", "sku", "legacy_item_id",
+            "quantity", "sold_at", "status",
         })
 
     def test_nothing_about_the_buyer_reaches_the_database(self):

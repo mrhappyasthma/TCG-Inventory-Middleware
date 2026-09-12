@@ -1092,6 +1092,7 @@ def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
         # must never report. The watermark stays put.
         log("ERROR", f"Refusing a partial read of orders: {exc}")
         record_logs(collected, "orders")
+        db.record_order_poll(outcome="failed", detail=str(exc)[:200])
         raise OrderSyncError(str(exc))
 
     lines = project_order_lines(raw)
@@ -1103,6 +1104,10 @@ def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
             f"watermark was not moved."
         ))
         record_logs(collected, "orders")
+        db.record_order_poll(
+            orders=len(raw), seen=len(lines),
+            outcome="preview",
+        )
         return {
             "attempted": False, "reason": "preview", "orders": len(raw),
             "seen": len(lines), "deducted": 0, "logs": collected,
@@ -1122,6 +1127,16 @@ def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
     # next window, not to neither.
     db.set_listing_settings(
         {ORDER_WATERMARK_SETTING: format_timestamp(now)}, user_id=SHARED_SCOPE
+    )
+
+    db.record_order_poll(
+        orders=len(raw),
+        seen=result.get("seen", 0),
+        deducted=result.get("deducted", 0),
+        cards=result.get("deducted_cards", 0),
+        foreign_sales=result.get("foreign", 0),
+        unmatched=result.get("unmatched", 0),
+        outcome="adopted" if first_run else "ok",
     )
 
     result["attempted"] = True
@@ -1167,7 +1182,17 @@ def recent_orders_endpoint(
         "last_polled_at": db.get_listing_setting(ORDER_WATERMARK_SETTING, ""),
         "poll_interval_minutes": ORDER_POLL_INTERVAL_MINUTES,
         "enabled": ORDER_POLL_ENABLED,
-        "lines": db.get_recent_order_lines(limit=max(1, min(500, limit))),
+        # The polls themselves. A row of quiet ones is how you know the
+        # poller is alive, which nothing else on the page can tell you.
+        "polls": db.get_order_polls(limit=8),
+        # Only sales that resolved to a catalogued card. The rest are
+        # overwhelmingly ordinary business -- sales from listings this
+        # application does not manage -- and listing them read like a page
+        # of problems, which is exactly what it was not.
+        "lines": db.get_recent_order_lines(
+            limit=max(1, min(500, limit)), matched_only=True
+        ),
+        "unmatched_count": db.count_order_lines(matched=False),
     }
 
 

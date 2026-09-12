@@ -341,6 +341,7 @@ class Database:
                     order_id      TEXT NOT NULL,
                     line_item_id  TEXT NOT NULL,
                     sku           TEXT NOT NULL,
+                    legacy_item_id TEXT,
                     quantity      INTEGER NOT NULL,
                     manifest_id   TEXT,
                     status        TEXT NOT NULL DEFAULT 'ACTIVE',
@@ -353,6 +354,51 @@ class Database:
                 );
                 """,
             )
+            # eBay's item number for the listing a sale came from.
+            #
+            # Added after the first real poll, where every line came back
+            # with a blank SKU. The item number is what distinguishes a
+            # sale from a listing this application does not manage -- of
+            # which there are many, since plenty are listed by hand --
+            # from a sale from one of ours whose SKU did not resolve,
+            # which is a real fault. Reporting the two identically made 46
+            # ordinary sales look like 46 problems.
+            #
+            # A public listing number, not personal data.
+            cursor.execute("PRAGMA table_info(ebay_order_line)")
+            if "legacy_item_id" not in {
+                row["name"] for row in cursor.fetchall()
+            }:
+                cursor.execute(
+                    "ALTER TABLE ebay_order_line ADD COLUMN "
+                    "legacy_item_id TEXT"
+                )
+
+            # One row per order poll, outcome included.
+            #
+            # The console carries the same information in prose, but a
+            # poller's history is the thing most worth seeing at a glance:
+            # "polled at 13:00, no new orders" repeated down the page is
+            # how you know it is alive. A poller that has silently stopped
+            # looks exactly like a shop with no sales, and one quiet poll
+            # looks exactly like fifty.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_poll_run (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    polled_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    orders      INTEGER NOT NULL DEFAULT 0,
+                    seen        INTEGER NOT NULL DEFAULT 0,
+                    deducted    INTEGER NOT NULL DEFAULT 0,
+                    cards       INTEGER NOT NULL DEFAULT 0,
+                    foreign_sales INTEGER NOT NULL DEFAULT 0,
+                    unmatched   INTEGER NOT NULL DEFAULT 0,
+                    outcome     TEXT NOT NULL DEFAULT 'ok',
+                    detail      TEXT
+                );
+                """,
+            )
+
             # The operational log, as the console shows it.
             #
             # The console used to exist only in the browser: it showed what
@@ -752,6 +798,12 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_order_line_seen
                 ON ebay_order_line(first_seen_at DESC);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_order_poll_run_at
+                ON order_poll_run(id DESC);
                 """
             )
             cursor.execute(
@@ -2223,6 +2275,98 @@ class Database:
             )
             conn.commit()
 
+    def record_order_poll(
+        self,
+        orders: int = 0,
+        seen: int = 0,
+        deducted: int = 0,
+        cards: int = 0,
+        foreign_sales: int = 0,
+        unmatched: int = 0,
+        outcome: str = "ok",
+        detail: Optional[str] = None,
+    ) -> None:
+        """
+        Write down that a poll happened, and what it found.
+
+        Recorded even when it found nothing, because that is the case
+        worth being able to see: a run of quiet polls is a working poller,
+        and an absence of them is a stopped one. The two are
+        indistinguishable from the stock figures alone.
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO order_poll_run
+                    (orders, seen, deducted, cards, foreign_sales,
+                     unmatched, outcome, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (int(orders), int(seen), int(deducted), int(cards),
+                 int(foreign_sales), int(unmatched),
+                 str(outcome or "ok"), detail),
+            )
+            conn.commit()
+
+    def get_order_polls(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """The most recent polls, newest first."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM order_poll_run ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def count_order_lines(self, matched: Optional[bool] = None) -> int:
+        """
+        How many order lines are recorded, optionally only the ones that
+        resolved to a catalogued card.
+
+        The unmatched count is almost all ordinary business -- sales from
+        listings this application does not manage -- so it belongs as a
+        number rather than a list.
+        """
+        clause = ""
+        if matched is True:
+            clause = "WHERE manifest_id IS NOT NULL"
+        elif matched is False:
+            clause = "WHERE manifest_id IS NULL"
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT COUNT(*) AS count FROM ebay_order_line {clause}"
+            )
+            return int(cursor.fetchone()["count"])
+
+    def get_known_listing_ids(self) -> set:
+        """
+        Every eBay item number this application has a record of.
+
+        Used to tell a sale from one of our listings apart from a sale
+        from one of the many listed by hand. Both arrive through the same
+        orders feed and only the first has anything to deduct, so
+        reporting them identically turns ordinary business into a page of
+        warnings.
+
+        Reads both sources: the store mirror, which knows every listing a
+        sync or a push has linked, and ebay_managed_listing. A listing
+        this application created is in the mirror the moment its push
+        confirms, so "not in here" genuinely means "not ours".
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT TRIM(ebay_parent_id) AS id FROM ebay_variations
+                WHERE TRIM(COALESCE(ebay_parent_id, '')) != ''
+                UNION
+                SELECT TRIM(ebay_parent_id) AS id FROM ebay_managed_listing
+                WHERE TRIM(COALESCE(ebay_parent_id, '')) != ''
+                """
+            )
+            return {row["id"] for row in cursor.fetchall()}
+
     def get_order_lines(
         self, keys: Optional[Sequence[Tuple[str, str]]] = None
     ) -> Dict[Tuple[str, str], Dict[str, Any]]:
@@ -2264,6 +2408,7 @@ class Database:
         status: str,
         sold_at: Optional[str] = None,
         manifest_id: Optional[str] = None,
+        legacy_item_id: Optional[str] = None,
     ) -> None:
         """
         Record that eBay reported this line item, without claiming a deduction.
@@ -2277,12 +2422,16 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO ebay_order_line
-                    (order_id, line_item_id, sku, quantity, manifest_id,
-                     status, sold_at, first_seen_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
+                    (order_id, line_item_id, sku, legacy_item_id,
+                     quantity, manifest_id, status, sold_at,
+                     first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
                         CURRENT_TIMESTAMP)
                 ON CONFLICT(order_id, line_item_id) DO UPDATE SET
                     sku = excluded.sku,
+                    legacy_item_id = COALESCE(
+                        excluded.legacy_item_id,
+                        ebay_order_line.legacy_item_id),
                     quantity = excluded.quantity,
                     manifest_id = COALESCE(excluded.manifest_id,
                                            ebay_order_line.manifest_id),
@@ -2295,6 +2444,7 @@ class Database:
                     str(order_id).strip(),
                     str(line_item_id).strip(),
                     str(sku or "").strip(),
+                    str(legacy_item_id or "").strip() or None,
                     int(quantity),
                     manifest_id,
                     str(status or "ACTIVE").strip().upper(),
@@ -2329,16 +2479,27 @@ class Database:
             conn.commit()
             return cursor.rowcount == 1
 
-    def get_recent_order_lines(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """The most recently seen order lines, with the card they matched."""
+    def get_recent_order_lines(
+        self, limit: int = 200, matched_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        The most recently seen order lines, with the card they matched.
+
+        ``matched_only`` restricts it to lines that resolved to a
+        catalogued card, which is what a reader actually wants: the rest
+        are overwhelmingly sales from listings this application does not
+        manage, and a list of them reads like a page of problems.
+        """
+        clause = "WHERE o.manifest_id IS NOT NULL" if matched_only else ""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """
+                f"""
                 SELECT o.*, m.product_name, m.set_name, m.condition,
                        m.card_number, m.quantity AS catalogued_qty
                 FROM ebay_order_line o
                 LEFT JOIN manifest m ON m.manifest_id = o.manifest_id
+                {clause}
                 ORDER BY o.first_seen_at DESC, o.rowid DESC
                 LIMIT ?
                 """,

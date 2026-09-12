@@ -598,11 +598,12 @@ function describePollAge(stamp) {
 
 async function loadOrderPoll() {
     const when = document.getElementById("orderPollWhen");
+    const history = document.getElementById("orderPollHistory");
     const box = document.getElementById("orderPollLines");
     const note = document.getElementById("orderPollNote");
     if (!when || !box) return;
     try {
-        const res = await fetch("/api/orders/recent?limit=8");
+        const res = await fetch("/api/orders/recent?limit=12");
         if (!res.ok) return;
         const data = await res.json();
 
@@ -618,38 +619,84 @@ async function loadOrderPoll() {
             ? "font-mono text-amber-400"
             : "font-mono text-slate-400";
 
-        if (note) {
-            if (!data.enabled) {
-                note.innerText = "The background poll is switched off, so nothing is deducting sales. Use Poll now, or set ORDER_POLL_ENABLED.";
-                note.classList.remove("hidden");
-            } else if (minutes === null) {
-                note.innerText = "Never polled. The first poll adopts eBay's 90-day history without deducting it, so it is safe to run.";
-                note.classList.remove("hidden");
-            } else if (overdue) {
-                note.innerText = `Expected every ${data.poll_interval_minutes} min. Sales are not being deducted while it is behind.`;
-                note.classList.remove("hidden");
-            } else {
-                note.classList.add("hidden");
-            }
+        // The polls. A row of quiet ones is the whole point: it is the only
+        // thing on the page that distinguishes a working poller from a
+        // stopped one, since both show zero sales.
+        if (history) {
+            const polls = data.polls || [];
+            history.innerHTML = polls.length
+                ? polls.map(p => {
+                    const at = new Date(String(p.polled_at).replace(" ", "T") + "Z");
+                    const clock = isNaN(at.getTime())
+                        ? String(p.polled_at)
+                        : at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+                    let what;
+                    let tone = "text-slate-500";
+                    if (p.outcome === "failed") {
+                        what = "failed";
+                        tone = "text-rose-400";
+                    } else if (p.outcome === "preview") {
+                        what = `preview, ${p.seen} line(s)`;
+                    } else if (p.outcome === "adopted") {
+                        what = `first poll, ${p.seen} line(s) adopted`;
+                        tone = "text-amber-300/90";
+                    } else if (p.deducted) {
+                        what = `${p.deducted} sale(s), ${p.cards} card(s) deducted`;
+                        tone = "text-accent-emerald";
+                    } else if (p.seen) {
+                        what = `${p.seen} line(s), nothing to deduct`;
+                    } else {
+                        what = "no new orders";
+                    }
+                    return `<div class="flex items-baseline gap-2 text-[11px] ${tone}">
+                        <span class="font-mono text-slate-600 shrink-0">${escapeHtml(clock)}</span>
+                        <span class="truncate">${escapeHtml(what)}</span>
+                    </div>`;
+                  }).join("")
+                : `<p class="text-[11px] text-slate-500">Not polled yet.</p>`;
         }
 
+        // Sales of catalogued cards only. Everything else is a number below,
+        // because it is almost all ordinary business and a list of it reads
+        // like a page of problems.
         const lines = data.lines || [];
         box.innerHTML = lines.length
             ? lines.map(l => {
-                const needsEye = !l.manifest_id || l.status !== "ACTIVE";
-                const detail = l.manifest_id
-                    ? `${escapeHtml(l.product_name || l.manifest_id)}`
-                    : `<span class="text-amber-300">no card for ${escapeHtml(l.sku || "(blank)")}</span>`;
+                const trouble = l.status !== "ACTIVE";
                 const moved = l.deducted_at
                     ? `&minus;${l.deducted_qty}`
-                    : (l.status === "ACTIVE" ? "pending" : escapeHtml(l.status.toLowerCase()));
-                return `<div class="flex items-center gap-2 text-[11px] ${needsEye ? "text-amber-200" : "text-slate-300"}">
-                    <span class="font-mono text-slate-600 truncate">${escapeHtml(String(l.order_id).slice(-8))}</span>
-                    <span class="truncate">${detail}</span>
-                    <span class="ml-auto font-mono shrink-0">${moved}</span>
+                    : "pending";
+                return `<div class="flex items-center gap-2 text-[11px] ${trouble ? "text-amber-200" : "text-slate-300"}">
+                    <span class="font-mono text-slate-600 shrink-0">${escapeHtml(String(l.order_id).slice(-8))}</span>
+                    <span class="truncate">${escapeHtml(l.product_name || l.manifest_id || l.sku)}</span>
+                    <span class="ml-auto font-mono shrink-0">${trouble ? escapeHtml(l.status.toLowerCase()) : moved}</span>
                 </div>`;
               }).join("")
-            : `<p class="text-[11px] text-slate-500">No orders recorded yet.</p>`;
+            : `<p class="text-[11px] text-slate-500">No catalogued card has sold yet.</p>`;
+
+        if (note) {
+            const messages = [];
+            if (!data.enabled) {
+                messages.push("The background poll is switched off, so nothing is deducting sales.");
+            } else if (minutes === null) {
+                messages.push("Never polled. The first poll adopts eBay's 90-day history without deducting it, so it is safe to run.");
+            } else if (overdue) {
+                messages.push(`Expected every ${data.poll_interval_minutes} min. Sales are not being deducted while it is behind.`);
+            }
+            // Stated as a fact rather than a warning: these are sales from
+            // listings this application does not manage, which is most of
+            // them and is not a problem.
+            if (data.unmatched_count) {
+                messages.push(`${data.unmatched_count} sale(s) were from listings this app does not manage \u2014 nothing to deduct for those.`);
+            }
+            note.innerText = messages.join(" ");
+            note.classList.toggle("hidden", messages.length === 0);
+            note.className = messages.length
+                ? (data.enabled && !overdue && minutes !== null
+                    ? "text-[10px] text-slate-500 mt-2 leading-snug"
+                    : "text-[10px] text-amber-300/90 mt-2 leading-snug")
+                : "hidden";
+        }
     } catch (err) {
         // Advisory: the poller runs on the server regardless.
         console.error("order poll status:", err);

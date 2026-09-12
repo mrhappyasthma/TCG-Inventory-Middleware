@@ -729,9 +729,18 @@ sale, so it matters that it is running: Module A used to do it as a side
 effect of a full inventory dump, and that inference went away when uploads
 became deltas.
 
-Module C's card shows the **last successful poll**, in amber once it is more
-than four intervals overdue, because a poller that has silently stopped looks
-exactly like a shop with no sales. **Poll now** runs one immediately.
+Module C's card shows three things, deliberately separated:
+
+* **Recent polls** — "13:00, no new orders" and so on. A row of quiet polls
+  is the only thing that distinguishes a working poller from a stopped one,
+  since both show zero sales.
+* **Cards sold** — only sales that matched a catalogued card. Empty until one
+  of your listings sells.
+* **A count** of sales from listings this app does not manage, stated as a
+  fact rather than a warning.
+
+The **last poll** time turns amber once it is more than four intervals
+overdue. **Poll now** runs one immediately.
 
 ### Why a poll and not a webhook
 
@@ -760,9 +769,12 @@ be the only signal buys latency, not correctness.
 * **A cancellation is reported, never reversed.** Money coming back does not
   put a card on the shelf; it may already have shipped. It is raised for you
   to decide, the same asymmetry the repricer applies to a price drop.
-* **A SKU matching no card is reported every poll** until it is dealt with. It
-  means a card catalogued under another id, or a listing made outside this
-  application — both worth knowing.
+* **A sale we cannot act on is classified, not lumped together.** Most sales
+  through your account are from listings this app does not manage — hand-made
+  singles, sealed product, non-card items. They have no SKU, nothing to
+  deduct, and nothing wrong with them, so they are counted and never
+  reconsidered. A sale from a listing we **do** know, whose SKU resolves to
+  no card, is a real fault and is named — once, then tallied.
 * **Selling more than you hold clamps at zero** and says so. The count was
   already short before that sale.
 * **It only ever reads.** No fulfillment is created, nothing is marked

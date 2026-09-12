@@ -12,12 +12,12 @@ of it, in either database, and that is what its account-deletion exemption
 rests on: a request to erase a buyer can be answered with "nothing about them
 was ever kept".
 
-So the projection is built by **naming the six fields to keep**, never by
+So the projection is built by **naming the fields to keep**, never by
 copying an order and deleting what is unwanted. The difference matters: a
 delete-list silently admits every field eBay adds in future, while a
 keep-list admits nothing that was not decided on. ``order_sync`` then refuses
-any line whose keys are not exactly those six, so a mistake here fails at the
-boundary instead of reaching the database.
+any line whose keys are not exactly the allowed set, so a mistake here fails
+at the boundary instead of reaching the database.
 
 Nothing in here is logged, for the same reason the notification endpoint logs
 only a topic.
@@ -62,11 +62,12 @@ def project_order_lines(
     orders: Sequence[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    eBay's orders reduced to the only six fields allowed past this point.
+    eBay's orders reduced to the only fields allowed past this point.
 
     A keep-list, not a delete-list. Every value is read by name out of the
     payload and placed into a dictionary literal, so nothing travels by
-    accident.
+    accident -- and adding one means changing this, the frozenset in
+    ``order_sync`` and two tests, which is friction on purpose.
     """
     projected: List[Dict[str, Any]] = []
     for order in orders:
@@ -90,6 +91,12 @@ def project_order_lines(
                 "order_id": order_id,
                 "line_item_id": line_item_id,
                 "sku": str(item.get("sku") or "").strip(),
+                # eBay's item number for the listing. A public identifier,
+                # not personal data, and the only way to tell a sale from one
+                # of our listings apart from a sale from one of the many
+                # listed by hand -- which arrive through the same feed, have
+                # no SKU, and have nothing to deduct.
+                "legacy_item_id": str(item.get("legacyItemId") or "").strip(),
                 "quantity": max(0, quantity),
                 "sold_at": sold_at,
                 "status": line_status(order, item),

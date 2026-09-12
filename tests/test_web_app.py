@@ -1673,14 +1673,52 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(res.status_code, 409)
         self.assertIn("eBay", res.json()["detail"])
 
-    def test_55b_the_recent_orders_view_needs_no_connection(self):
+    def test_55b_the_recent_orders_view_separates_polls_from_sales(self):
+        """
+        Three separate things, because one list of all of them was unreadable.
+
+        The first version listed every order line with "no card for (blank)"
+        beside it. That was true and it looked like a page of faults, when
+        almost all of them were ordinary sales from listings this application
+        does not manage. So the card now shows the polls, the sales that
+        matched a catalogued card, and a *count* of the rest.
+        """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        res = self.client.get("/api/orders/recent")
-        self.assertEqual(res.status_code, 200)
-        body = res.json()
-        self.assertIn("last_polled_at", body)
-        self.assertIn("poll_interval_minutes", body)
-        self.assertIsInstance(body["lines"], list)
+
+        # One sale of a card we know, one from somebody else's listing.
+        db.insert_manifest("ID9300", "Wailmer", "Pitch Black", "Near Mint",
+                           "Normal", card_number="015/084")
+        db.set_manifest_quantity("ID9300", 3)
+        db.upsert_order_line("99-00001", "M1", "ID9300", 1, "ACTIVE",
+                             manifest_id="ID9300",
+                             legacy_item_id="227511361186")
+        db.upsert_order_line("99-00002", "M2", "", 1, "ACTIVE",
+                             legacy_item_id="227496856039")
+        db.record_order_poll(orders=0, seen=0)
+
+        try:
+            res = self.client.get("/api/orders/recent")
+            self.assertEqual(res.status_code, 200)
+            body = res.json()
+
+            self.assertIn("last_polled_at", body)
+            self.assertIn("poll_interval_minutes", body)
+
+            # The poll history, which is the only thing that distinguishes a
+            # working poller from a stopped one -- both show zero sales.
+            self.assertTrue(body["polls"], "the poll history must be there")
+            self.assertIn("outcome", body["polls"][0])
+
+            # Only the sale that matched a card is listed by name.
+            listed = [l["order_id"] for l in body["lines"]]
+            self.assertIn("99-00001", listed)
+            self.assertNotIn(
+                "99-00002", listed,
+                "somebody else's sale must be a number, not a list entry",
+            )
+            self.assertGreaterEqual(body["unmatched_count"], 1)
+        finally:
+            db.delete_manifest("ID9300")
 
     def test_55c_the_order_endpoints_need_a_session(self):
         self.client.post("/api/auth/logout")

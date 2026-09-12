@@ -21,10 +21,12 @@ card on the shelf; it may already have shipped. So a line that cancels after
 being deducted is surfaced for a human, in the same spirit as the repricer
 holding a price drop: the direction that can lose something gets a person.
 
-**A SKU that matches no card is never silently dropped.** It means a card
-catalogued under a different id, or a listing made outside this application,
-and both are worth knowing. The line is recorded with no card attached and
-reported every time until it is dealt with.
+**A sale we cannot act on is classified, not lumped together.** A sale from
+a listing this application does not manage -- and plenty are listed by hand
+-- has nothing to deduct and is not a fault; it is recorded once and never
+reconsidered. A sale from a listing we *do* know, whose SKU resolves to no
+card, is a real fault and is named. Reporting both the same way turned 46
+ordinary sales into 46 warnings and buried the summary explaining them.
 
 **It holds nothing about the buyer.** Names, addresses, emails, phone numbers
 and eBay usernames are stripped off in the app layer before anything reaches
@@ -42,7 +44,8 @@ from .orders import base_manifest_id
 # because the projection is a compliance boundary and an extra key here would
 # be a buyer's address arriving somewhere it must never be.
 REQUIRED_LINE_FIELDS = frozenset({
-    "order_id", "line_item_id", "sku", "quantity", "sold_at", "status",
+    "order_id", "line_item_id", "sku", "legacy_item_id", "quantity",
+    "sold_at", "status",
 })
 
 # Our own closed vocabulary, not eBay's. eBay expresses the same facts across
@@ -114,13 +117,17 @@ def sync_orders(
         return {
             "seen": 0, "adopted": 0, "deducted": 0, "deducted_cards": 0,
             "already": 0, "unmatched": 0, "repeated_unmatched": 0,
-            "cancelled": 0, "decisions": [],
+            "foreign": 0, "cancelled": 0, "decisions": [],
             "logs": logs,
         }
 
     known = db.get_order_lines(
         [(l["order_id"], l["line_item_id"]) for l in lines]
     )
+    # Read once: a sale from a listing this application does not manage
+    # has nothing to deduct and is not a fault, and telling the two apart
+    # is the difference between a page of warnings and a quiet poll.
+    ours = db.get_known_listing_ids()
 
     decisions: List[Dict[str, Any]] = []
     deducted = 0
@@ -129,12 +136,14 @@ def sync_orders(
     already = 0
     unmatched = 0
     repeated_unmatched = 0
+    foreign = 0
     cancelled = 0
 
     for line in lines:
         key = (line["order_id"], line["line_item_id"])
         previous = known.get(key)
         sku = str(line["sku"] or "").strip()
+        legacy_item_id = str(line["legacy_item_id"] or "").strip()
         quantity = max(0, int(line["quantity"] or 0))
         status = str(line["status"] or STATUS_ACTIVE).strip().upper()
 
@@ -145,6 +154,7 @@ def sync_orders(
             order_id=line["order_id"],
             line_item_id=line["line_item_id"],
             sku=sku,
+            legacy_item_id=legacy_item_id,
             quantity=quantity,
             status=status,
             sold_at=line.get("sold_at"),
@@ -155,6 +165,7 @@ def sync_orders(
             "order_id": line["order_id"],
             "line_item_id": line["line_item_id"],
             "sku": sku,
+            "legacy_item_id": legacy_item_id,
             "quantity": quantity,
             "status": status,
             "manifest_id": manifest_id,
@@ -209,24 +220,46 @@ def sync_orders(
             continue
 
         if manifest_id is None:
+            # Two very different things arrive here, and reporting them
+            # identically was the mistake. A real first poll produced 46
+            # warnings, every one of them an ordinary sale from a listing
+            # made by hand -- a promo single, an empty Elite Trainer Box,
+            # a Gamecube case. None of it is a card this application
+            # catalogues, none of it has a SKU, and none of it has
+            # anything to deduct.
+            #
+            # eBay's item number is what separates them: if the listing is
+            # not one we have a record of, the sale is simply not ours.
+            if legacy_item_id and legacy_item_id not in ours:
+                foreign += 1
+                decision["outcome"] = "not_our_listing"
+                # Claimed, because it is terminal. There is no future in
+                # which this line becomes deductible, and leaving it
+                # unclaimed means re-deciding it on every poll forever.
+                db.mark_order_line_deducted(
+                    line["order_id"], line["line_item_id"], 0
+                )
+                decisions.append(decision)
+                continue
+
+            # Our listing, or one we cannot identify at all, and the SKU
+            # did not resolve. That is a real fault worth naming: a card
+            # catalogued under another id, or a listing of ours the mirror
+            # has not learned yet.
             unmatched += 1
             decision["outcome"] = "no_such_card"
-            # Named on the first sighting, tallied afterwards.
-            #
-            # An unmatched line is never claimed, so it comes back on
-            # every poll -- and at a poll every fifteen minutes, one
-            # naming itself each time is ninety-six identical lines a
-            # day. A real first poll produced forty-five of them in one
-            # go, which buried the summary that explained them. The
-            # tally at the end is what makes the count impossible to
-            # miss without the list being impossible to read.
+            # Named on the first sighting, tallied afterwards. An
+            # unmatched line is not claimed -- it may yet resolve -- so it
+            # returns on every poll, and at a poll every fifteen minutes
+            # one naming itself each time is ninety-six identical lines a
+            # day.
             if previous is None:
                 record("WARN", (
                     f"{line['order_id']}: sold SKU "
-                    f"{sku or '(blank)'} matches no catalogued card, so "
-                    f"no stock was deducted. It was either catalogued "
-                    f"under another id or listed outside this "
-                    f"application."
+                    f"{sku or '(blank)'} from listing "
+                    f"#{legacy_item_id or '(unknown)'}, which this "
+                    f"application has a record of, but no catalogued card "
+                    f"matches. No stock was deducted."
                 ))
             else:
                 repeated_unmatched += 1
@@ -288,11 +321,19 @@ def sync_orders(
                 f"coming back until the cards exist or the listings are "
                 f"linked."
             ))
+        if foreign:
+            record("INFO", (
+                f"{foreign} sale(s) were from listings this application "
+                f"does not manage, so there was nothing to deduct for "
+                f"them. They are recorded and will not be looked at "
+                f"again."
+            ))
         level = "SUCCESS" if deducted else "INFO"
         record(level, (
             f"{len(lines)} order line(s) seen: {deducted} deducted "
             f"({deducted_cards} card(s)), {already} already handled, "
-            f"{unmatched} matching no card, {cancelled} not a sale."
+            f"{foreign} not our listings, {unmatched} matching no card, "
+            f"{cancelled} not a sale."
         ))
 
     return {
@@ -303,6 +344,7 @@ def sync_orders(
         "already": already,
         "unmatched": unmatched,
         "repeated_unmatched": repeated_unmatched,
+        "foreign": foreign,
         "cancelled": cancelled,
         "decisions": decisions,
         "logs": logs,
