@@ -50,7 +50,7 @@ follow that order:
 |---|---|---|
 | 1 | **A** | Ingest a SortSwift export: catalogue cards and stage a draft |
 | 2 | **B** | Sync what eBay reports back into the store mirror |
-| 3 | **C** | Convert eBay orders into SortSwift stock deductions |
+| 3 | **C** | Read what sold from eBay and deduct it from your stock |
 
 The order reflects the dependency chain: cards have to be catalogued and
 listed before eBay has anything to sync back, and the sync has to have linked
@@ -721,6 +721,79 @@ we store.
 Image headers only: no Pillow, and never a whole file, so a 6 MB photograph
 costs the same as a thumbnail.
 
+
+## 📦 Orders: what sold comes off your stock
+
+Polled from eBay every **15 minutes**. This is the only thing that deducts a
+sale, so it matters that it is running: Module A used to do it as a side
+effect of a full inventory dump, and that inference went away when uploads
+became deltas.
+
+Module C's card shows the **last successful poll**, in amber once it is more
+than four intervals overdue, because a poller that has silently stopped looks
+exactly like a shop with no sales. **Poll now** runs one immediately.
+
+### Why a poll and not a webhook
+
+eBay's REST Notification API — the one this app already receives
+account-deletion notices on — **has no order topic**. Order events exist only
+in legacy Platform Notifications: SOAP XML on the Trading API eBay is
+retiring, needing a second parser and a second verification path, and shipping
+with eBay's own advice to poll `GetOrders` as well. A notification that cannot
+be the only signal buys latency, not correctness.
+
+### What it guarantees
+
+* **Exactly once.** Each poll deliberately re-reads a **30-minute overlap**,
+  because clock skew is real and a missed sale is invisible — nothing notices
+  an order it never read. Double-counting is prevented instead by claiming
+  each `(order_id, line_item_id)` in the database *before* any stock moves, so
+  two pollers, or a restart mid-poll, cannot both deduct.
+* **The first poll deducts nothing.** eBay serves 90 days of order history,
+  all of it already accounted for. So a deployment with no watermark *adopts*:
+  every line recorded as handled, nothing removed. Only sales seen afterwards
+  come off the shelf.
+* **The watermark advances only on success**, and records the moment the poll
+  *started* — so an order modified during the call lands in the next window
+  rather than in neither. A truncated read raises rather than returning what
+  it has, because a partial result reads as a quiet week.
+* **A cancellation is reported, never reversed.** Money coming back does not
+  put a card on the shelf; it may already have shipped. It is raised for you
+  to decide, the same asymmetry the repricer applies to a price drop.
+* **A SKU matching no card is reported every poll** until it is dealt with. It
+  means a card catalogued under another id, or a listing made outside this
+  application — both worth knowing.
+* **Selling more than you hold clamps at zero** and says so. The count was
+  already short before that sale.
+* **It only ever reads.** No fulfillment is created, nothing is marked
+  shipped, no refund is issued.
+
+### No buyer data is kept, ever
+
+`getOrders` returns the buyer's username, registration address, and a `shipTo`
+block with their name, full address, email and phone. **None of it is
+persisted**, in either database — which is what this application's
+account-deletion exemption rests on.
+
+That is enforced rather than intended. The projection in `app/ebay_orders.py`
+is a **keep-list of six named fields** (`order_id`, `line_item_id`, `sku`,
+`quantity`, `sold_at`, `status`), built by reading those values out by name —
+never by copying an order and deleting what is unwanted, because a delete-list
+silently admits whatever eBay adds next. `order_sync` then refuses any line
+whose keys are not exactly those six, so a mistake fails at the boundary
+instead of reaching the database. The test feeds it a full payload carrying
+all of the above and asserts not one value survives.
+
+### Configuration
+
+| Variable | Default | |
+|---|---|---|
+| `ORDER_POLL_ENABLED` | `true` | set to `false` to stop the background poll |
+| `ORDER_POLL_INTERVAL_MINUTES` | `15` | |
+
+The CSV upload stays as the fallback for when the API cannot be reached.
+
+---
 
 ## 📌 A variation's SKU cannot be renamed
 
