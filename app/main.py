@@ -76,8 +76,6 @@ from tcg_engine.orders import (
 )
 from tcg_engine.batches import (
     process_batch_csv,
-    QUANTITY_MODE_SET,
-    QUANTITY_MODES,
 )
 from tcg_engine.sync import sync_active_listings_csv
 from tcg_engine.pricing_feed import (
@@ -576,7 +574,6 @@ async def process_batch_endpoint(
     file: UploadFile = File(...),
     force: bool = Form(False),
     dry_run: bool = Form(False),
-    quantity_mode: str = Form(QUANTITY_MODE_SET),
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
@@ -587,9 +584,11 @@ async def process_batch_endpoint(
     drafts page reviews and the API push applies -- the only route to eBay
     there is.
 
-    Quantities can be additive, so re-processing the same export would
-    inflate stock. Uploads are fingerprinted and a repeat of an
-    already-processed file is refused unless the caller passes force=true.
+    An upload is a **delta of newly scanned cards**: its quantities are added
+    to what is already held, and a card absent from it means nothing at all.
+    So re-processing the same file double-counts stock, which makes the
+    fingerprint load-bearing -- a repeat is refused unless the caller passes
+    force=true.
 
     Pass dry_run=true to see what a file would change without writing
     anything to the catalogue, the store mirror or a draft.
@@ -597,20 +596,7 @@ async def process_batch_endpoint(
     Prices and listing settings come from the signed-in user's own rules, so
     two sellers processing the same export each get their own output.
 
-    quantity_mode="set" (the default) treats the upload as a full inventory
-    dump and replaces quantities; "add" treats it as a delta of newly scanned
-    cards. The wrong one silently doubles live eBay stock on every upload, so
-    an unrecognised value is rejected rather than guessed at.
     """
-    if str(quantity_mode).strip().lower() not in QUANTITY_MODES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"quantity_mode must be one of {', '.join(QUANTITY_MODES)}; "
-                f"got {quantity_mode!r}"
-            ),
-        )
-
     content_bytes = await read_upload_limited(file)
     csv_text = decode_csv_bytes(content_bytes)
 
@@ -628,7 +614,6 @@ async def process_batch_endpoint(
                 force=force,
                 dry_run=dry_run,
                 user_id=user["id"],
-                quantity_mode=quantity_mode,
             )
             # Stage the draft in the same breath as the ingest. Module A used
             # to finish by handing over two files; now it finishes by leaving

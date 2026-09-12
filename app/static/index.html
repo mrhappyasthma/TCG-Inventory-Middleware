@@ -285,28 +285,17 @@
                             </div>
                         </div>
 
-                        <!-- What the file's quantities mean. Getting this wrong
-                             double-counts stock on every upload, so it is shown
-                             up front rather than hidden in settings. -->
+                        <!-- There is no mode to pick any more: an upload is
+                             always a delta of newly scanned cards. Said here
+                             anyway, because the arithmetic is the one thing
+                             about this step that can cost real money if it is
+                             misunderstood. -->
                         <div class="mt-3 p-2.5 rounded-xl bg-dark-900/60 border border-slate-700/70">
-                            <p class="text-[10px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5">This file is</p>
-                            <div class="space-y-1.5">
-                                <label class="flex items-start gap-2 cursor-pointer group/opt">
-                                    <input type="radio" name="batchQuantityMode" value="set" checked class="mt-0.5 accent-accent-cyan">
-                                    <span class="text-[11px] leading-snug">
-                                        <span class="font-semibold text-slate-200">A full inventory dump</span>
-                                        <span class="text-slate-400"> &mdash; quantities in the file replace what's on eBay. Re-uploading is safe.</span>
-                                    </span>
-                                </label>
-                                <label class="flex items-start gap-2 cursor-pointer group/opt">
-                                    <input type="radio" name="batchQuantityMode" value="add" class="mt-0.5 accent-accent-amber">
-                                    <span class="text-[11px] leading-snug">
-                                        <span class="font-semibold text-slate-200">Only newly scanned cards</span>
-                                        <span class="text-slate-400"> &mdash; quantities are added to what's already there.</span>
-                                    </span>
-                                </label>
-                            </div>
-                            <p id="batchModeNote" class="text-[10px] text-slate-500 mt-2 leading-snug">Cards live on eBay but missing from a full dump are treated as sold out and set to 0.</p>
+                            <p class="text-[11px] leading-snug">
+                                <span class="font-semibold text-slate-200">Quantities are added</span>
+                                <span class="text-slate-400"> to what you already hold, so upload only cards you have newly scanned. A card missing from the file is left alone &mdash; sales come from eBay&rsquo;s orders, not from an omission.</span>
+                            </p>
+                            <p class="text-[10px] text-amber-300/90 mt-2 leading-snug">Uploading the same file twice would count its stock twice, so a repeat is refused unless you force it.</p>
                         </div>
                     </div>
 
@@ -330,11 +319,11 @@
                             </svg>
                             <span>Preview only &mdash; nothing is written</span>
                         </button>
-                        <button id="btnForceProcessBatch" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-amber-800 hover:bg-amber-700 text-amber-50 border border-amber-700 flex items-center justify-center gap-1.5 transition-all" title="Apply this file again. In full-dump mode quantities are replaced, so this is safe to repeat; in newly-scanned mode they are added a second time.">
+                        <button id="btnForceProcessBatch" class="w-full text-xs font-semibold py-2 px-3 rounded-lg bg-amber-800 hover:bg-amber-700 text-amber-50 border border-amber-700 flex items-center justify-center gap-1.5 transition-all" title="Apply this file again. Its quantities are added a second time, so only do this if the stock really is on the shelf twice.">
                             <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                             </svg>
-                            <span id="btnForceProcessBatchLabel">Force process (replaces quantities)</span>
+                            <span>Force process (adds its quantities again)</span>
                         </button>
                     </div>
 

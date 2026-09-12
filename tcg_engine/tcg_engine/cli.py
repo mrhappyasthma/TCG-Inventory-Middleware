@@ -35,7 +35,6 @@ def handle_batch(args):
     result = process_batch_file(
         args.input_file, db,
         force=args.force, dry_run=args.dry_run,
-        quantity_mode=args.quantity_mode,
     )
     for log in result["logs"]:
         print(f"[{log['level']}] {log['message']}")
@@ -53,7 +52,7 @@ def handle_batch(args):
     print(
         f"\nCatalogued {result['parsed_rows']} card(s), "
         f"{result['new_catalog_count']} new, "
-        f"{result['zeroed_count']} zeroed as sold out."
+        f"{result['staged_card_count']} staged for eBay."
     )
     print("Review and push the draft in the dashboard.")
 
@@ -205,17 +204,6 @@ def main():
         "--force",
         action="store_true",
         help="Re-process a file that has already been applied",
-    )
-    p_batch.add_argument(
-        "--quantity-mode",
-        choices=["set", "add"],
-        default="set",
-        help=(
-            "'set' (default): the file is a full inventory dump, so its "
-            "quantities replace what is stored and cards absent from it are "
-            "revised to 0. 'add': the file is a delta of newly scanned cards, "
-            "so its quantities are added to the running total."
-        ),
     )
     p_batch.set_defaults(func=handle_batch)
 

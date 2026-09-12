@@ -408,40 +408,25 @@ class TestTCGEngine(unittest.TestCase):
         self.assertEqual(res["staged_card_count"], 0)
         self.assertEqual(res["skipped_count"], 1)
 
-    def test_catalog_quantity_accumulates_in_add_mode(self):
-        """In add mode a second batch adds to the first, for scan deltas."""
+    def test_a_second_batch_adds_to_the_first(self):
+        """
+        An upload is a delta of newly scanned cards, so quantities add.
+
+        This used to be one of two modes, and the other one -- replace,
+        for a full inventory dump -- was the default. Both are gone: the
+        exports are per-batch now, and nothing keeps a full SortSwift
+        count accurate, so replacing our quantity from one would restore
+        stock that had already sold.
+        """
         process_batch_csv(self.MIXED_CONDITION_BATCH, self.db,
-                          source_name="b1.csv", quantity_mode="add")
-        rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
-        self.assertEqual(rows["ID1001"]["quantity"], 1)
-
-        second = self.MIXED_CONDITION_BATCH.replace('"Bin-1"', '"Bin-9"')
-        process_batch_csv(second, self.db, source_name="b2.csv",
-                          quantity_mode="add")
-        rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
-        self.assertEqual(rows["ID1001"]["quantity"], 2)
-
-    def test_catalog_quantity_is_replaced_by_default(self):
-        """
-        The default treats the export as a full inventory dump, so uploading
-        it twice must not double the count. Additive semantics here were the
-        cause of a real overselling bug.
-        """
-        process_batch_csv(self.MIXED_CONDITION_BATCH, self.db, source_name="b1.csv")
+                          source_name="b1.csv")
         rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
         self.assertEqual(rows["ID1001"]["quantity"], 1)
 
         second = self.MIXED_CONDITION_BATCH.replace('"Bin-1"', '"Bin-9"')
         process_batch_csv(second, self.db, source_name="b2.csv")
         rows = {r["manifest_id"]: r for r in self.db.export_all_manifest()}
-        self.assertEqual(rows["ID1001"]["quantity"], 1,
-                         "a full dump replaces rather than accumulating")
-
-    def test_rejects_an_unknown_quantity_mode(self):
-        """A typo must fail loudly rather than silently picking a behaviour."""
-        with self.assertRaises(ValueError):
-            process_batch_csv(self.MIXED_CONDITION_BATCH, self.db,
-                              quantity_mode="increment")
+        self.assertEqual(rows["ID1001"]["quantity"], 2)
 
     def test_catalog_quantity_is_independent_of_live_stock(self):
         process_batch_csv(self.MIXED_CONDITION_BATCH, self.db)
@@ -676,14 +661,14 @@ class TestTCGEngine(unittest.TestCase):
         catalogue was always the better base.
         """
         process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db,
-                          source_name="b.csv", quantity_mode="add")
+                          source_name="b.csv")
         # eBay reports 3 for this card.
         self.db.upsert_variation("ID1001", "998877665544", 3)
         catalogued = self.db.get_manifest_by_id("ID1001")["quantity"]
 
         process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b1.csv",
-            quantity_mode="add", force=True,
+            force=True,
         )
         self.assertEqual(
             self.db.get_manifest_by_id("ID1001")["quantity"], catalogued + 1
@@ -691,7 +676,7 @@ class TestTCGEngine(unittest.TestCase):
 
         process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b2.csv",
-            quantity_mode="add", force=True,
+            force=True,
         )
         self.assertEqual(
             self.db.get_manifest_by_id("ID1001")["quantity"], catalogued + 2,
@@ -703,25 +688,35 @@ class TestTCGEngine(unittest.TestCase):
         self.assertEqual(
             self.db.get_variation("ID1001")["last_known_qty"], 3)
 
-    def test_dry_run_matches_a_real_run_in_set_mode(self):
+    def test_a_preview_reaches_the_same_conclusions_as_a_real_run(self):
         """
-        With replace semantics there is no accumulation to double, so a
-        preview and a real run must reach the same conclusions -- the only
-        difference being that one of them wrote them down.
+        A preview and a real run must agree; only one of them writes.
+
+        Quantities add, so the two cannot be compared by running them back to
+        back and reading the catalogue -- the real run would have moved it.
+        The counts are what is compared, and the preview is asserted to have
+        changed nothing at all.
         """
         process_batch_csv(self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv")
         self.db.upsert_variation("ID1001", "998877665544", 3)
+        before = {r["manifest_id"]: r["quantity"]
+                  for r in self.db.export_all_manifest()}
 
         preview = process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv",
             dry_run=True, force=True,
         )
+        self.assertEqual(
+            {r["manifest_id"]: r["quantity"]
+             for r in self.db.export_all_manifest()},
+            before, "a preview must not move a single quantity",
+        )
+
         applied = process_batch_csv(
             self.PLAIN_EXPORT_BATCH, self.db, source_name="b.csv", force=True,
         )
         comparable = ("staged_card_count", "staged_listing_count",
-                      "zeroed_count", "new_catalog_count", "skipped_count",
-                      "parsed_rows", "reconciled")
+                      "new_catalog_count", "skipped_count", "parsed_rows")
         self.assertEqual(
             {k: preview[k] for k in comparable},
             {k: applied[k] for k in comparable},
@@ -1704,103 +1699,61 @@ class TestTCGEngine(unittest.TestCase):
             )
         return ids
 
-    def test_full_dump_sums_bins_but_replaces_across_uploads(self):
+    def test_rows_for_one_card_sum_within_a_file_then_add_across_files(self):
         """
-        The same card in two bins is one card, so its rows sum -- but the
-        total replaces the stored value rather than adding to it. Uploading
-        the same dump repeatedly must be idempotent.
+        Two halves of the same rule, and they pull in opposite directions.
+
+        A card held in two bins appears on two rows of one file. The bin is
+        not part of a card's identity, so those rows are the same card and
+        their quantities sum: 2 + 1 is 3, not two cards.
+
+        Across files they add, because each file is a separate batch of newly
+        scanned cards. Uploading the same file twice therefore doubles its
+        stock, which is what the duplicate fingerprint exists to prevent --
+        note the force=True here, which is the deliberate override.
         """
         ids = self._seed_live_dump()
 
-        seen = []
-        for n in range(3):
-            process_batch_csv(
-                self.FULL_DUMP, self.db, source_name=f"d{n}.csv", force=True
-            )
-            seen.append({r["product_name"]: r["quantity"]
-                         for r in self.db.export_all_manifest()})
+        first = {r["product_name"]: r["quantity"]
+                 for r in self.db.export_all_manifest()}
+        self.assertEqual(first["Ledyba"], 3, "2 + 1 summed across two bins")
+        self.assertEqual(first["Heracross"], 2)
 
-        self.assertEqual(seen[0], seen[1])
-        self.assertEqual(seen[1], seen[2], "uploads must be idempotent")
-
-        catalogued = {r["product_name"]: r["quantity"]
-                      for r in self.db.export_all_manifest()}
-        self.assertEqual(catalogued["Ledyba"], 3, "2 + 1 across two bins")
-        self.assertEqual(catalogued["Heracross"], 2)
+        process_batch_csv(self.FULL_DUMP, self.db, source_name="again.csv",
+                          force=True)
+        second = {r["product_name"]: r["quantity"]
+                  for r in self.db.export_all_manifest()}
+        self.assertEqual(second["Ledyba"], 6, "a forced repeat adds again")
+        self.assertEqual(second["Heracross"], 4)
 
         # Module A corrects the catalogue and must leave eBay's own figure
-        # alone: only an Active Listings sync, or a confirmed push, may
-        # move that. The difference between the two is what the draft is.
+        # alone: only an Active Listings sync, or a confirmed push, may move
+        # that. The difference between the two is what the draft is.
         variation = self.db.get_variation(ids["Ledyba"])
         self.assertEqual(variation["last_known_qty"], 2,
-                         "ingesting a dump must not claim eBay was updated")
-
-    def test_full_dump_zeroes_absent_cards_in_the_catalogue(self):
-        """A card missing from a full dump has sold out and must be pulled."""
-        ids = self._seed_live_dump()
-        process_batch_csv(self.FULL_DUMP, self.db, source_name="d1.csv",
-                          force=True)
-
-        smaller = chr(10).join(
-            self.FULL_DUMP.splitlines()[:3]  # header + both Ledyba rows
-        ) + chr(10)
-        res = process_batch_csv(smaller, self.db, source_name="d2.csv")
-
-        self.assertEqual(res["zeroed_count"], 1)
-        catalogued = {r["product_name"]: r["quantity"]
-                      for r in self.db.export_all_manifest()}
-        self.assertEqual(catalogued["Heracross"], 0)
-        # eBay's own figure is never written here: only a Module B sync may
-        # move it, and the draft this produces is what asks eBay for zero.
-        self.assertEqual(
-            self.db.get_variation(ids["Heracross"])["last_known_qty"], 2)
-        self.assertTrue(any(
-            "SOLD OUT" in lg["message"] for lg in res["logs"]
-        ), "the operator must be told which cards were pulled")
-    def test_an_absent_card_keeps_being_reported_until_ebay_confirms_zero(self):
+                         "ingesting a batch must not claim eBay was updated")
+    def test_a_card_absent_from_an_upload_is_left_alone(self):
         """
-        Suppression now waits for confirmation rather than for an intention.
+        An upload says nothing about the cards it omits.
 
-        The old rule stopped re-reporting a sold-out card as soon as a Revise
-        row had been *written* for it, tracked in ``pending_qty`` -- because a
-        file may or may not ever be uploaded, and re-emitting the row every
-        time was noise. Nothing writes a file now: the push applies the change
-        and records eBay's confirmed quantity in the same breath. So the card
-        stays reported until eBay's own figure reaches zero, which is the
-        stricter and more honest condition.
-        """
-        ids = self._seed_live_dump()
-        process_batch_csv(self.FULL_DUMP, self.db, source_name="d0.csv",
-                          force=True)
-
-        smaller = chr(10).join(self.FULL_DUMP.splitlines()[:3]) + chr(10)
-        first = process_batch_csv(smaller, self.db, source_name="d1.csv")
-        self.assertEqual(first["zeroed_count"], 1)
-
-        again = process_batch_csv(smaller, self.db, source_name="d2.csv",
-                                  force=True)
-        self.assertEqual(again["zeroed_count"], 1,
-                         "eBay still reports stock, so it is still sold out")
-
-        # Once a sync (or a push) has taught us eBay holds zero, it stops.
-        self.db.upsert_variation(ids["Heracross"], "227511361186", 0,
-                                 custom_label=ids["Heracross"] + "-Bin_A-1")
-        settled = process_batch_csv(smaller, self.db, source_name="d3.csv",
-                                    force=True)
-        self.assertEqual(settled["zeroed_count"], 0)
-    def test_add_mode_does_not_zero_absent_cards(self):
-        """
-        A scan delta says nothing about cards it omits, so add mode must
-        never pull a listing down.
+        It is one batch of newly scanned cards, not a picture of the
+        shelves, so an omission cannot mean "sold out". Module A used to
+        infer exactly that and zero the card, which was right only while
+        the upload was a full dump. Sales come from eBay orders now.
         """
         ids = self._seed_live_dump()
         smaller = chr(10).join(self.FULL_DUMP.splitlines()[:3]) + chr(10)
-        res = process_batch_csv(smaller, self.db, source_name="d1.csv",
-                                quantity_mode="add")
-        self.assertEqual(res["zeroed_count"], 0)
+        before = {r["product_name"]: r["quantity"]
+                  for r in self.db.export_all_manifest()}
+        res = process_batch_csv(smaller, self.db, source_name="d1.csv")
+
+        after = {r["product_name"]: r["quantity"]
+                 for r in self.db.export_all_manifest()}
+        self.assertEqual(after["Heracross"], before["Heracross"],
+                         "an omitted card must not be zeroed")
         self.assertEqual(
             self.db.get_variation(ids["Heracross"])["last_known_qty"], 2,
-            "left exactly as the fixture seeded it",
+            "and eBay's own figure is never touched here",
         )
         self.assertNotIn("SOLD OUT",
                          chr(10).join(lg["message"] for lg in res["logs"]))
@@ -1959,22 +1912,21 @@ class TestTCGEngine(unittest.TestCase):
                                  custom_label=f"{mid}-Bin_A-1")
         before = self.db.get_stats()
 
-        for mode in ("set", "add"):
+        for run in ("first", "second"):
             process_batch_csv(self.FULL_DUMP, self.db,
-                              source_name=f"{mode}.csv", force=True,
-                              quantity_mode=mode)
+                              source_name=f"{run}.csv", force=True)
             after = self.db.get_stats()
             self.assertEqual(
                 after["total_stock"], before["total_stock"],
-                f"{mode} mode moved Copies on eBay",
+                f"the {run} ingest moved Copies on eBay",
             )
             self.assertEqual(
                 after["active_listings"], before["active_listings"],
-                f"{mode} mode moved Cards on eBay",
+                f"the {run} ingest moved Cards on eBay",
             )
             self.assertEqual(
                 self.db.get_variation(mid)["last_known_qty"], 7,
-                f"{mode} mode overwrote eBay's reported quantity",
+                f"the {run} ingest overwrote eBay's reported quantity",
             )
 
         # On Hand did change, which is Module A's business.
@@ -2075,88 +2027,42 @@ class TestTCGEngine(unittest.TestCase):
           '"English","Normal",2,"Bin A-2",""' + chr(10)
     )
 
-    def test_an_unparseable_dump_never_zeroes_live_listings(self):
+    def test_a_file_that_parsed_nothing_changes_nothing(self):
         """
-        Every skip happens before a row reaches file_totals, so a skipped row
-        is indistinguishable from a card the dump omitted -- and the remedy for
-        an omitted card is to stop selling it. A file whose rows all fail to
-        parse would therefore zero the entire catalogue, and the draft built
-        from it would ask eBay to delist the whole store. This is the exact
-        shape of a real report: a SortSwift export with no *ConditionID column.
+        The shape of a real report: a SortSwift export with no *ConditionID.
+
+        Every row is skipped. That used to be the most dangerous input there
+        is -- a skipped row was indistinguishable from a card the dump
+        omitted, and an omitted card was zeroed, so a file that failed
+        entirely would have zeroed the whole catalogue and asked eBay to
+        delist the store. Nothing infers a sale from an omission any more, so
+        the hazard is gone, but the guarantee is still worth pinning: a file
+        that yielded no usable row must leave every figure exactly as it was.
         """
         ids = self._seed_live_dump()
         for mid in ids.values():
             self.db.upsert_variation(mid, "227511361186", 3,
                                      custom_label=mid + "-C-1",
                                      last_known_price=2.49)
+        before = {r["manifest_id"]: r["quantity"]
+                  for r in self.db.export_all_manifest()}
 
         res = process_batch_csv(self.NO_CONDITION_ID_DUMP, self.db,
                                 source_name="no-condid.csv")
 
         self.assertEqual(res["parsed_rows"], 0)
         self.assertEqual(res["skipped_count"], 2)
-        self.assertFalse(res["reconciled"])
-        self.assertEqual(res["zeroed_count"], 0, "nothing may be delisted")
 
-        # Neither the catalogue nor the store mirror moved.
-        for name, mid in ids.items():
+        self.assertEqual(
+            {r["manifest_id"]: r["quantity"]
+             for r in self.db.export_all_manifest()},
+            before, "no catalogued quantity may move",
+        )
+        for mid in ids.values():
             self.assertEqual(self.db.get_variation(mid)["last_known_qty"], 3)
-        self.assertTrue(all(
-            row["quantity"] > 0 for row in self.db.export_all_manifest()
-        ), "no catalogued quantity may be zeroed from a file that failed")
 
         messages = chr(10).join(lg["message"] for lg in res["logs"])
-        self.assertIn("not a reliable picture", messages)
         self.assertIn("Not one row", messages)
-    def test_a_partially_skipped_dump_also_withholds_reconciliation(self):
-        """
-        Even one unreadable row means the file is not a complete picture, and
-        the cost of being wrong is a delisted card.
-        """
-        ids = self._seed_live_dump()
-        for mid in ids.values():
-            self.db.upsert_variation(mid, "227511361186", 3,
-                                     custom_label=mid + "-C-1",
-                                     last_known_price=2.49)
-
-        # One good row, one with no ConditionID.
-        mixed = (
-            '"Game","Set","Card Number","Name","Market Price","Condition",'
-            '"Language","Printing","Quantity","Remarks","*ConditionID"' + chr(10)
-            + '"Pokemon","Chilling Reign","004/198","Ledyba","0.30","NM",'
-              '"English","Normal",3,"Bin A-1","4000"' + chr(10)
-            + '"Pokemon","Chilling Reign","099/198","Mystery","0.30","NM",'
-              '"English","Normal",1,"Bin Z-9",""' + chr(10)
-        )
-        res = process_batch_csv(mixed, self.db, source_name="mixed.csv")
-
-        self.assertEqual(res["skipped_count"], 1)
-        self.assertGreater(res["parsed_rows"], 0)
-        self.assertFalse(res["reconciled"])
-        self.assertEqual(res["zeroed_count"], 0)
-        self.assertIn("not a reliable picture",
-                      chr(10).join(lg["message"] for lg in res["logs"]))
-
-    def test_a_clean_dump_still_reconciles_sold_out_cards(self):
-        """The guard must not disable the feature for a file that parsed fine."""
-        ids = self._seed_live_dump()
-        for mid in ids.values():
-            self.db.upsert_variation(mid, "227511361186", 3,
-                                     custom_label=mid + "-C-1",
-                                     last_known_price=2.49)
-
-        # Header plus the two Ledyba rows only: Heracross genuinely dropped.
-        smaller = chr(10).join(self.FULL_DUMP.splitlines()[:3]) + chr(10)
-        res = process_batch_csv(smaller, self.db, source_name="clean.csv")
-
-        self.assertEqual(res["skipped_count"], 0)
-        self.assertTrue(res["reconciled"])
-        self.assertEqual(res["zeroed_count"], 1)
-        catalogued = {r["product_name"]: r["quantity"]
-                      for r in self.db.export_all_manifest()}
-        self.assertEqual(catalogued["Heracross"], 0)
-
-    # -- eBay puts the same value in different columns per row type ---------
     def test_find_column_can_skip_present_but_empty_columns(self):
         """
         On a variation listing the child rows carry "Start price" and leave

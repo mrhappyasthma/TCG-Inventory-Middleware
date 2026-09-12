@@ -487,57 +487,86 @@ class TestWebApp(unittest.TestCase):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
     # -- quantity mode -----------------------------------------------------
 
-    def test_18_batch_quantity_mode_is_validated_and_defaults_to_set(self):
+    def test_18_an_upload_adds_its_quantities(self):
         """
-        The default must be the full-dump reading, and a bad value must be
-        refused rather than guessed at -- the wrong arithmetic silently
-        doubles live eBay stock on every upload.
+        An upload is a delta of newly scanned cards, so quantities add.
+
+        There is no mode to choose and no full-dump reading any more. A mode
+        parameter, if one is sent, must be ignored rather than honoured --
+        an old client or a bookmarked request must not be able to ask for
+        arithmetic that no longer exists.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
 
-        res = self.client.post(
-            "/api/process/batch",
-            files={"file": ("dump.csv", BATCH_CSV, "text/csv")},
-            data={"force": "true"},
-        )
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.json()["quantity_mode"], "set")
-
-        bad = self.client.post(
-            "/api/process/batch",
-            files={"file": ("dump.csv", BATCH_CSV, "text/csv")},
-            data={"quantity_mode": "increment", "force": "true"},
-        )
-        self.assertEqual(bad.status_code, 400)
-        self.assertIn("quantity_mode", bad.json()["detail"])
-
-        ok = self.client.post(
-            "/api/process/batch",
-            files={"file": ("scan.csv", BATCH_CSV, "text/csv")},
-            data={"quantity_mode": "add", "force": "true"},
-        )
-        self.assertEqual(ok.status_code, 200)
-        self.assertEqual(ok.json()["quantity_mode"], "add")
-
-    def test_19_reuploading_a_dump_does_not_inflate_quantities(self):
-        """The reported bug: a full dump added to itself on every upload."""
-        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-
-        quantities = []
-        for n in range(3):
-            self.client.post(
-                "/api/process/batch",
-                files={"file": (f"dump{n}.csv", BATCH_CSV, "text/csv")},
-                data={"force": "true"},
-            )
+        def deerling():
             rows = self.client.get("/api/inventory",
                                    params={"limit": 200}).json()["items"]
             match = [r for r in rows if "Deerling" in r["product_name"]]
-            self.assertTrue(match)
-            quantities.append(match[0]["quantity"])
+            self.assertTrue(match, "the fixture card is missing")
+            return match[0]["quantity"]
 
-        self.assertEqual(len(set(quantities)), 1,
-                         f"quantity drifted across uploads: {quantities}")
+        before = deerling()
+        res = self.client.post(
+            "/api/process/batch",
+            files={"file": ("scan.csv", BATCH_CSV, "text/csv")},
+            data={"force": "true", "quantity_mode": "set"},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertNotIn("quantity_mode", res.json())
+        self.assertGreater(
+            deerling(), before,
+            "quantities must add; a stale quantity_mode=set must be ignored",
+        )
+
+    def test_19_a_repeat_upload_is_refused_so_stock_cannot_inflate(self):
+        """
+        The guard that replaced idempotence.
+
+        Uploading the same file used to be safe to repeat, because its
+        quantities replaced what was stored. They add now, so a repeat would
+        count the same stock twice -- which is the original overselling bug,
+        approached from the other side. The sha256 fingerprint is what stands
+        in the way, and it is load-bearing rather than a convenience.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        text = BATCH_CSV.replace("Deerling", "Sneasel")
+
+        first = self.client.post(
+            "/api/process/batch",
+            files={"file": ("repeat.csv", text, "text/csv")},
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertFalse(first.json()["duplicate"])
+
+        def sneasel():
+            rows = self.client.get("/api/inventory",
+                                   params={"limit": 200}).json()["items"]
+            match = [r for r in rows if "Sneasel" in r["product_name"]]
+            return match[0]["quantity"] if match else None
+
+        after_first = sneasel()
+        self.assertIsNotNone(after_first)
+
+        # Same bytes again: refused, and nothing added.
+        repeat = self.client.post(
+            "/api/process/batch",
+            files={"file": ("repeat-again.csv", text, "text/csv")},
+        )
+        self.assertEqual(repeat.status_code, 200, repeat.text)
+        self.assertTrue(repeat.json()["duplicate"],
+                        "a repeat must be refused, or stock inflates")
+        self.assertEqual(sneasel(), after_first, "the repeat changed stock")
+
+        # Forcing it through is the deliberate override, and it does add.
+        forced = self.client.post(
+            "/api/process/batch",
+            files={"file": ("repeat-forced.csv", text, "text/csv")},
+            data={"force": "true"},
+        )
+        self.assertEqual(forced.status_code, 200, forced.text)
+        self.assertFalse(forced.json()["duplicate"])
+        self.assertGreater(sneasel(), after_first,
+                           "force must mean what it says")
 
     # -- asset cache coherence ---------------------------------------------
 

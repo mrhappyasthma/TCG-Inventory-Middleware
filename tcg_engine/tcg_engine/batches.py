@@ -73,15 +73,19 @@ VARIATION_ATTRIBUTE_NAME = "Card"
 # delimiter in that position and must not survive inside an option name.
 VARIATION_PICTURE_SEPARATOR = "="
 
-# How a batch's quantities relate to what is already on hand.
+# An upload is always a delta of newly scanned cards, so its quantities are
+# added to what is already held. There is no replace mode.
 #
-# SortSwift can export either a full dump of everything you hold or a delta of
-# just-scanned cards, and the two need opposite arithmetic. Getting it wrong is
-# not a cosmetic error: treating a full dump as a delta adds your whole
-# inventory on top of itself every time you upload, which oversells on eBay.
-QUANTITY_MODE_SET = "set"   # the file is the truth; replace what we hold
-QUANTITY_MODE_ADD = "add"   # the file is new stock; add to what we hold
-QUANTITY_MODES = (QUANTITY_MODE_SET, QUANTITY_MODE_ADD)
+# It had one, and defaulted to it, because the export used to be a full dump
+# of the whole shelf -- and treating such a file as a delta added the entire
+# inventory on top of itself on every upload, climbing 3 to 6 to 9 and
+# overselling. That premise is gone: the exports are per-batch now, and
+# nothing keeps a full SortSwift count accurate any more, so replacing our
+# quantities from one would restore stock that has already sold.
+#
+# Which makes the duplicate-upload fingerprint load-bearing rather than a
+# convenience: additive quantities mean processing the same file twice
+# double-counts, and `force` is the only way past it.
 
 DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
 
@@ -376,9 +380,7 @@ def _empty_batch_result(
 ) -> Dict[str, Any]:
     """Build a no-op batch result carrying the supplied log messages."""
     result = {
-        "zeroed_count": 0,
         "parsed_rows": 0,
-        "reconciled": False,
         "staged_card_count": 0,
         "staged_listing_count": 0,
         "new_catalog_count": 0,
@@ -398,7 +400,6 @@ def process_batch_csv(
     force: bool = False,
     dry_run: bool = False,
     user_id: int = SHARED_SCOPE,
-    quantity_mode: str = QUANTITY_MODE_SET,
 ) -> Dict[str, Any]:
     """
     Process fresh SortSwift inventory batch CSV.
@@ -412,22 +413,15 @@ def process_batch_csv(
     - Standalone Single Listings (for cards at or above the threshold, and for
       every card when 'group_by_set' is disabled)
 
-    Revise quantities are additive, so processing the same export twice would
-    double the live stock. Uploads are therefore fingerprinted and a repeat is
-    refused unless ``force`` is set.
+    An upload is a **delta of newly scanned cards**, so its quantities are
+    added to what is already held. Processing the same file twice therefore
+    double-counts stock, which is why uploads are fingerprinted and a repeat
+    is refused unless ``force`` is set. A card held in two bins appears on
+    two rows and both are added, because the bin is not part of a card's
+    identity.
 
-    ``quantity_mode`` decides what the file's quantities mean:
-
-    * ``"set"`` (default) treats the export as a **full inventory dump**. The
-      quantity in the file becomes the quantity on eBay. Rows for the same card
-      still sum, because a card held in two bins appears twice and the bin is
-      not part of a card's identity -- but the total replaces whatever was
-      there before, so re-uploading is idempotent. Cards that are live on eBay
-      and absent from the file are revised down to zero, since a full dump
-      omitting a card means it is gone.
-    * ``"add"`` treats the export as a **delta of newly scanned cards** and
-      adds to the running total, which is only correct if the file contains
-      nothing you have already processed.
+    A card **absent** from an upload means nothing: this file is one batch,
+    not a picture of the shelves. Sales are learned from eBay's orders.
 
     ``user_id`` selects whose pricing rules and listing settings to apply.
     Both are per-user, so two sellers can process the same export and each get
@@ -459,13 +453,6 @@ def process_batch_csv(
     # logged once each; a few hundred identical lines bury the summary.
     warn_tallies: Dict[str, int] = {}
     log_tallies: Dict[str, int] = {}
-
-    mode = str(quantity_mode or QUANTITY_MODE_SET).strip().lower()
-    if mode not in QUANTITY_MODES:
-        raise ValueError(
-            f"quantity_mode must be one of {QUANTITY_MODES}, got {quantity_mode!r}"
-        )
-    replace_quantities = mode == QUANTITY_MODE_SET
 
     # The rules cannot change while a batch runs, so read them once instead of
     # once per card.
@@ -847,10 +834,7 @@ def process_batch_csv(
         # Our own catalogued stock count for this card.
         file_totals[manifest_id] = file_totals.get(manifest_id, 0) + quantity
         if not dry_run:
-            if replace_quantities:
-                db.set_manifest_quantity(manifest_id, file_totals[manifest_id])
-            else:
-                db.increment_manifest_quantity(manifest_id, quantity)
+            db.increment_manifest_quantity(manifest_id, quantity)
 
         ebay_custom_label = f"{manifest_id}-{clean_remark}" if clean_remark else manifest_id
 
@@ -886,14 +870,13 @@ def process_batch_csv(
             known_label = (variation.get("custom_label") or "").strip()
             revise_label = known_label or ebay_custom_label
 
-            # Accumulation in add mode rests on increment_manifest_quantity
-            # above, which adds to the catalogue's own figure. That is the
-            # right base and always was: it is correct whether or not eBay has
-            # been told anything yet. The previous base -- eBay's last
-            # reported quantity, or a `pending_qty` recording what a generated
-            # file had asked for -- needed that second column precisely
-            # because two scan batches uploaded before a sync would otherwise
-            # both start from the same stale number and lose the first.
+            # Accumulation rests on increment_manifest_quantity above, which
+            # adds to the catalogue's own figure. That is the right base: it
+            # is correct whether or not eBay has been told anything yet. The
+            # bases tried before it -- eBay's last reported quantity, or a
+            # `pending_qty` recording what a generated file had asked for --
+            # both meant two batches uploaded before a sync started from the
+            # same stale number and the first was lost.
             live_count += 1
             _log_once(logs, log_tallies, "LIVE",
                       f"Row {row_idx}: [LIVE] #{ebay_item_id} [{revise_label}] "
@@ -965,101 +948,16 @@ def process_batch_csv(
                           f"{product_name} grouped into '{set_name}' / "
                           f"{condition_name} (Price: ${effective_price:.2f})")
 
-    # -----------------------------------------------------------------
-    # REPLACE MODE: RECONCILE AGAINST THE FULL DUMP
-    # -----------------------------------------------------------------
-    # What used to happen here was the other half of this module: comparing
-    # every card against what eBay was believed to hold and writing a Revise
-    # row for the ones that differed. That is now the planner's job --
-    # ``build_plan`` computes the same diff from stored state, the drafts page
-    # shows it, and the API push applies it. Two independent answers to "what
-    # does eBay need" is one too many, and this one could only ever be acted
-    # on by a human uploading a file.
+    # A card absent from an upload means nothing at all: the upload is a
+    # delta of newly scanned cards, so it says only what was in that batch.
     #
-    # What remains is the part that belongs to ingest rather than to eBay:
-    # noticing that a card live on eBay is absent from a full dump, and
-    # therefore sold out.
-    zeroed_count = 0
-
-    # Zeroing is only safe if we actually understood the file. Every skip
-    # happens before a row reaches file_totals, so a skipped row looks
-    # identical to a card the dump omitted -- and the remedy for an omitted
-    # card is to stop selling it. A file whose rows we could not parse is
-    # therefore the most dangerous input there is: with every row skipped,
-    # file_totals is empty and every live listing would be revised to zero,
-    # delisting the whole store from a file that in fact listed all of it.
-    #
-    # So reconcile only against a file that parsed cleanly. One unreadable row
-    # costs this run's sold-out detection, which is a trivially recoverable
-    # loss next to wiping live inventory.
-    reconcile = replace_quantities and skipped_count == 0
-
-    if replace_quantities and skipped_count:
-        _flush_warn_tallies(logs, warn_tallies)
-        logs.append({
-            "level": "WARN",
-            "message": (
-                f"{skipped_count} row(s) could not be processed, so this file is "
-                f"not a reliable picture of your stock. Cards missing from it "
-                f"have NOT been revised down to 0 -- a skipped row is "
-                f"indistinguishable from a card you no longer hold. Fix the "
-                f"skipped rows above and re-run to reconcile sold-out cards."
-            ),
-        })
-
-    if reconcile:
-
-        # A full dump lists everything on hand, so a card that is live on eBay
-        # and absent from the file has sold out. Left alone it would keep its
-        # old eBay quantity and carry on selling stock that is gone.
-        for live in db.get_live_variations():
-            live_id = live["manifest_id"]
-            if live_id in file_totals:
-                continue
-            outstanding = live.get("pending_qty")
-            believed_qty = (
-                int(live.get("last_known_qty") or 0)
-                if outstanding is None
-                else int(outstanding)
-            )
-            if believed_qty == 0:
-                # Already zero on eBay, or already asked to be. Re-emitting the
-                # row on every dump would be noise.
-                continue
-
-            item_id = str(live["ebay_parent_id"]).strip()
-            label = (live.get("custom_label") or "").strip() or live_id
-            zeroed_count += 1
-
-            if not dry_run:
-                # The catalogue is ours to correct from the dump. eBay's own
-                # figure is not touched: only a Module B sync may move
-                # last_known_qty, and the draft this stock change produces is
-                # what will ask eBay for zero.
-                db.set_manifest_quantity(live_id, 0)
-
-            logs.append({
-                "level": "WARN",
-                "message": (
-                    f"[SOLD OUT] #{item_id} [{label}] "
-                    f"{live.get('product_name') or live_id} "
-                    f"({live.get('set_name') or '?'} | {live.get('condition') or '?'}) "
-                    f"is not in this dump, so the catalogue is set to 0 "
-                    f"(eBay currently reports {live.get('last_known_qty')})."
-                ),
-            })
-
-    if zeroed_count:
-        logs.append({
-            "level": "WARN",
-            "message": (
-                f"{zeroed_count} card(s) live on eBay were absent from this "
-                f"dump and are now 0 in the catalogue. The draft will ask eBay "
-                f"to stop selling them, so check that list before approving "
-                f"it: those listings stop selling."
-            ),
-        })
-
+    # This used to be where sold-out cards were detected -- a card live on
+    # eBay and missing from a *full dump* had gone, and its quantity was set
+    # to zero. That inference only worked while the upload was a complete
+    # picture of the shelves. Sales are now learned from eBay's own orders,
+    # which is a better source than an omission: it names the order, the
+    # quantity and the moment, and it cannot mistake a partial export for a
+    # sale.
     total_added_cards = len(staged_singles) + sum(len(c) for c in staged_variations.values())
 
     # Tallies before the summary, so the counts read as detail leading into it
@@ -1071,8 +969,7 @@ def process_batch_csv(
         "level": "INFO",
         "message": (
             f"Ingest finished: {len(file_totals)} card(s) read, "
-            f"{new_catalog_count} new to the catalogue, "
-            f"{zeroed_count} zeroed as sold out. They route to "
+            f"{new_catalog_count} new to the catalogue. They route to "
             f"{len(staged_variations)} Set/Condition variation listing(s) "
             f"({sum(len(c) for c in staged_variations.values())} child cards) "
             f"and {len(staged_singles)} single listing(s). Rebuild the draft "
@@ -1113,10 +1010,7 @@ def process_batch_csv(
         )
 
     return {
-        "zeroed_count": zeroed_count,
         "parsed_rows": parsed_rows,
-        "reconciled": reconcile,
-        "quantity_mode": mode,
         # How the cards route, which is what the draft will group them into.
         # Informational: the planner derives the grouping itself from stored
         # state, so these are a preview of it and never its input.
@@ -1136,7 +1030,6 @@ def process_batch_file(
     force: bool = False,
     dry_run: bool = False,
     user_id: int = SHARED_SCOPE,
-    quantity_mode: str = QUANTITY_MODE_SET,
 ) -> Dict[str, Any]:
     """
     Ingest a SortSwift export from disk.
@@ -1154,6 +1047,5 @@ def process_batch_file(
             force=force,
             dry_run=dry_run,
             user_id=user_id,
-            quantity_mode=quantity_mode,
         )
     return result

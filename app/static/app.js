@@ -1145,37 +1145,6 @@ async function handleOrdersUpload(file) {
     }
 }
 
-// Which arithmetic the uploaded file implies. Defaults to treating it as a
-// full inventory dump, because that is what SortSwift's inventory export is
-// and because the additive reading double-counts stock on every upload.
-function selectedQuantityMode() {
-    const picked = document.querySelector('input[name="batchQuantityMode"]:checked');
-    return picked ? picked.value : "set";
-}
-
-// "Force" means something different in each mode, so the button must not
-// promise one behaviour while doing the other.
-function syncBatchModeLabels() {
-    const isSet = selectedQuantityMode() === "set";
-    const label = document.getElementById("btnForceProcessBatchLabel");
-    if (label) {
-        label.innerText = isSet
-            ? "Force process (replaces quantities)"
-            : "Force process (adds quantities)";
-    }
-    const note = document.getElementById("batchModeNote");
-    if (note) {
-        note.innerText = isSet
-            ? "Cards live on eBay but missing from a full dump are treated as sold out and set to 0."
-            : "Only use this for a file containing nothing you have already processed.";
-    }
-}
-
-document.querySelectorAll('input[name="batchQuantityMode"]').forEach(el => {
-    el.addEventListener("change", syncBatchModeLabels);
-});
-syncBatchModeLabels();
-
 // -------------------------------------------------------------------
 // PER-MODULE BUSY STATE
 // -------------------------------------------------------------------
@@ -1254,7 +1223,6 @@ async function handleBatchUpload(file, mode = "normal") {
     formData.append("file", file);
     formData.append("force", mode === "force" ? "true" : "false");
     formData.append("dry_run", mode === "dry-run" ? "true" : "false");
-    formData.append("quantity_mode", selectedQuantityMode());
 
     const intent = mode === "dry-run"
         ? "rebuilding files only"
@@ -1308,9 +1276,6 @@ async function handleBatchUpload(file, mode = "normal") {
         if (data.parsed_rows > 0) parts.push(`${data.parsed_rows} card(s) read`);
         if (data.new_catalog_count > 0) parts.push(`${data.new_catalog_count} new`);
         if (data.skipped_count > 0) parts.push(`${data.skipped_count} skipped`);
-        // Worth calling out separately: these are cards being pulled from
-        // sale, not routine changes.
-        if (data.zeroed_count > 0) parts.push(`${data.zeroed_count} sold out → 0`);
         const suffix = data.dry_run ? " (nothing written)" : "";
         // Every row unusable is a failure, not an empty result. Saying
         // "nothing to do" there reads like everything was already in order,
@@ -1331,20 +1296,6 @@ async function handleBatchUpload(file, mode = "normal") {
             + (planned ? ` Draft staged with ${planned} change(s).` : "")
         );
 
-        if (data.reconciled === false && data.skipped_count > 0
-            && data.parsed_rows > 0) {
-            logToTerminal(
-                "WARN",
-                `[MODULE A] Sold-out reconciliation was skipped: ${data.skipped_count} row(s) could not be read, so a missing card cannot be told apart from an unreadable one. No listing was revised to 0.`
-            );
-        }
-
-        if (data.zeroed_count > 0) {
-            logToTerminal(
-                "WARN",
-                `[MODULE A] ${data.zeroed_count} card(s) live on eBay were absent from this dump, so the catalogue is now 0 for them. The draft will ask eBay to stop selling them — check that list before approving it.`
-            );
-        }
 
         // A preview wrote nothing, so there is nothing to refresh.
         if (!data.dry_run) {
