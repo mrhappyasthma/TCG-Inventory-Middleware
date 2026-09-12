@@ -228,15 +228,19 @@ def _inventory_item_payload(
 
     # The card's own front scan, and nothing else.
     #
-    # The back scan and the stock photo are deliberately excluded. Every card
-    # in a set has a near-identical back, so including them puts what look
+    # Exactly one picture, and the back scan is deliberately excluded. Every
+    # card in a set has a near-identical back, so including it puts what look
     # like duplicate photos on the listing, and a buyer choosing between 105
-    # variations gains nothing from five pictures of the same card back. The
-    # stock photo is a second view of the same front, which reads as another
-    # duplicate. This is the one place where the API push differs from the CSV
-    # path on purpose: the first real listing went up with three pictures per
+    # variations gains nothing from five pictures of the same card back. This
+    # is the one place where the API push differs from the old CSV path on
+    # purpose: the first real listing went up with three pictures per
     # variation and looked wrong.
-    images = [url for url in (item.get("cdn_image") or "",) if url]
+    #
+    # The stock photo is used only when there is no scan. Alongside a scan it
+    # is a second view of the same front and reads as another duplicate; on
+    # its own it is the difference between a listing with a picture and one
+    # with none.
+    images = [url for url in (card_image(item),) if url]
 
     descriptor_value = condition_descriptor_value_id(
         fields.get("condition_descriptor") or "",
@@ -1114,10 +1118,27 @@ def _group_description(items: List[Dict[str, Any]], single: bool) -> str:
     )
 
 
+def card_image(item: Dict[str, Any]) -> str:
+    """
+    The picture to list a card with: its own scan, or failing that the
+    generic catalogue photo SortSwift carries for it.
+
+    The queries resolve this already and hand over ``image_url``; the
+    fallbacks are here for callers holding a row that predates it, so a
+    stale dict cannot quietly turn into a listing with no photograph.
+    """
+    for key in ("image_url", "cdn_image", "stock_image"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _first_image(items: List[Dict[str, Any]]) -> str:
     for item in items:
-        if item.get("cdn_image"):
-            return str(item["cdn_image"])
+        found = card_image(item)
+        if found:
+            return found
     return ""
 
 

@@ -2418,5 +2418,101 @@ class TestTCGEngine(unittest.TestCase):
                          [0.19, 0.13], "newest first, nothing lost")
         self.assertIn("SNAP-2", history[0]["source"])
 
+class StockImageFallbackTests(unittest.TestCase):
+    """
+    A card with no scan of its own still has a picture to show.
+
+    The SortSwift export has always carried a generic catalogue photo per
+    card, and the ingest has always parsed it -- but the only thing that ever
+    read it was the Add-file row builder, which no longer exists. So an
+    unscanned card showed an empty frame on the dashboard and went to eBay
+    with no photograph at all, which is worse than a generic one.
+    """
+
+    # Three cards: one with only the generic catalogue photo, one with both,
+    # one with neither.
+    EXPORT = (
+        "Set,Card Number,Name,Condition,Language,Printing,Quantity,"
+        "Remarks,CDN Image,Stock Image,Price,*ConditionID\n"
+        "Base Set,025/102,Pikachu,NM,EN,Normal,1,No Remark,,"
+        "https://stock/pika.jpg,0.50,4000\n"
+        "Base Set,004/102,Charizard,NM,EN,Normal,1,No Remark,"
+        "https://scan/zard.jpg,https://stock/zard.jpg,9.99,4000\n"
+        "Base Set,013/102,Grubbin,NM,EN,Normal,1,No Remark,,,0.20,4000\n"
+    )
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "stock.db"))
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_the_exports_stock_image_column_reaches_the_catalogue(self):
+        process_batch_csv(self.EXPORT, self.db)
+
+        by_name = {
+            card["product_name"]: card for card in self.db.get_inventory()
+        }
+        self.assertEqual(
+            by_name["Pikachu"]["stock_image"], "https://stock/pika.jpg"
+        )
+        # The two are kept apart on purpose. A scan shows the copy actually
+        # being sold, so "have I photographed this one yet" has to stay
+        # answerable -- filling the stock photo into cdn_image would make
+        # every card look photographed.
+        self.assertEqual(by_name["Pikachu"]["cdn_image"], "")
+
+    def test_a_scan_wins_and_a_stock_photo_stands_in_for_a_missing_one(self):
+        process_batch_csv(self.EXPORT, self.db)
+
+        resolved = {
+            card["product_name"]: card["image_url"]
+            for card in self.db.get_inventory()
+        }
+        self.assertEqual(resolved["Charizard"], "https://scan/zard.jpg")
+        self.assertEqual(resolved["Pikachu"], "https://stock/pika.jpg")
+        # Neither available is still neither. The caller renders a
+        # placeholder rather than a broken image.
+        self.assertEqual(resolved["Grubbin"], "")
+
+    def test_the_same_answer_reaches_planning_and_the_push(self):
+        """
+        Display and the push must not disagree about a card's picture, or a
+        listing goes up without the photo the drafts page showed.
+        """
+        process_batch_csv(self.EXPORT, self.db)
+
+        for cards in (
+            self.db.get_inventory(),
+            self.db.get_cards_for_planning(),
+        ):
+            resolved = {c["product_name"]: c["image_url"] for c in cards}
+            self.assertEqual(resolved["Pikachu"], "https://stock/pika.jpg")
+            self.assertEqual(resolved["Charizard"], "https://scan/zard.jpg")
+
+    def test_a_stock_photo_is_backfilled_onto_a_card_catalogued_without_one(self):
+        """
+        Cards catalogued before this column existed have no stock photo
+        stored. A later upload carrying one fills it in, so the fallback
+        arrives without anyone having to re-catalogue anything.
+        """
+        manifest_id, _, _ = self.db.get_or_create_manifest(
+            "Pikachu", "Base Set", "NM", "Normal"
+        )
+        self.assertIsNone(
+            self.db.get_manifest_by_id(manifest_id)["stock_image"]
+        )
+
+        self.db.get_or_create_manifest(
+            "Pikachu", "Base Set", "NM", "Normal",
+            stock_image="https://stock/pika.jpg",
+        )
+        self.assertEqual(
+            self.db.get_manifest_by_id(manifest_id)["stock_image"],
+            "https://stock/pika.jpg",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

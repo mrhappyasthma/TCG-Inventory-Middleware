@@ -1672,13 +1672,32 @@ let lastInventoryItems = [];
 // pointer and starts flickering between enter and leave.
 const CARD_PREVIEW_OFFSET = 18;
 
+// The picture for a card: its own scan, or failing that the generic
+// catalogue photo SortSwift carries for it.
+//
+// The server resolves this and sends image_url; the other two are read as
+// a fallback so an older response still shows something.
+function cardImage(item) {
+    return String(item.image_url || item.cdn_image || item.stock_image || "").trim();
+}
+
+// Whether what we are showing is a generic photo rather than this copy.
+// Worth marking: on a used-condition listing the point of a photo is the
+// actual card, so the rows still wanting a scan should be visible at a
+// glance rather than indistinguishable from the photographed ones.
+function cardImageIsStock(item) {
+    return !String(item.cdn_image || "").trim()
+        && !!String(item.stock_image || "").trim();
+}
+
 function cardPreviewAttrs(item) {
     // Nothing is emitted for a card with no picture, so the whole preview
     // path is inert rather than showing an empty frame or a broken image.
-    if (!item.cdn_image) return "";
+    const url = cardImage(item);
+    if (!url) return "";
     // The data attribute is both the payload and the CSS hook for the
     // zoom-in cursor, so a cell without a picture gets neither.
-    return `data-card-image="${escapeHtml(item.cdn_image)}"`;
+    return `data-card-image="${escapeHtml(url)}"`;
 }
 
 // A row-height thumbnail, shared by the inventory table and the drafts page.
@@ -1691,13 +1710,21 @@ function cardPreviewAttrs(item) {
 // An absent picture still renders a placeholder of the same size, so the
 // column does not change width row to row and the table stays aligned.
 function cardThumbnailCell(item, cellClasses = "py-2 px-4") {
-    if (!item.cdn_image) {
+    const url = cardImage(item);
+    if (!url) {
         return `<td class="${cellClasses}"><span class="block w-7 h-10 rounded border border-dashed border-slate-800" title="No image in the export"></span></td>`;
     }
+    // A dashed border on the generic photo, solid on a real scan. The
+    // picture itself is the same size either way, so nothing shifts.
+    const stock = cardImageIsStock(item);
+    const border = stock ? "border-dashed border-slate-600" : "border-slate-700";
+    const hint = stock
+        ? "Catalogue photo -- this copy has not been scanned"
+        : "";
     return `
         <td class="${cellClasses}" ${cardPreviewAttrs(item)}>
-            <img src="${escapeHtml(item.cdn_image)}" alt="" loading="lazy"
-                class="block h-10 w-auto rounded border border-slate-700 bg-dark-900"
+            <img src="${escapeHtml(url)}" alt="" loading="lazy" title="${escapeHtml(hint)}"
+                class="block h-10 w-auto rounded border ${border} bg-dark-900"
                 onerror="this.style.visibility='hidden'">
         </td>`;
 }

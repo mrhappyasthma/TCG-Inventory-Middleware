@@ -878,6 +878,61 @@ class ImageTests(PushTestCase):
         self.assertEqual(images, ["https://cdn.example.com/ID1001.jpg"])
 
 
+    def test_a_card_with_no_scan_is_listed_with_the_catalogue_photo(self):
+        """
+        A listing with no photograph is a listing nobody clicks.
+
+        The stock photo is excluded when we have a scan, because it is a
+        second view of the same front. When we do not, it is the only
+        picture there is, and a generic photo of the right card beats an
+        empty frame.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        with self.db.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE manifest
+                   SET cdn_image = NULL,
+                       stock_image = 'https://stock.example.com/charizard.jpg'
+                 WHERE manifest_id = 'ID1001'
+                """
+            )
+            conn.commit()
+
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        images = api.items["ID1001"]["product"]["imageUrls"]
+        self.assertEqual(
+            images, ["https://stock.example.com/charizard.jpg"]
+        )
+
+    def test_the_group_cover_falls_back_to_a_catalogue_photo_too(self):
+        """
+        The listing's own picture is picked from the cards in it, so a
+        group whose cards are all unscanned would otherwise have no cover
+        at all -- which is the one image a browsing buyer actually sees.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        with self.db.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE manifest
+                   SET cdn_image = NULL,
+                       stock_image = 'https://stock.example.com/charizard.jpg'
+                """
+            )
+            conn.commit()
+
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        group = api.groups[next(iter(api.groups))]
+        self.assertEqual(
+            group["imageUrls"], ["https://stock.example.com/charizard.jpg"]
+        )
+
+
 class RefreshTests(PushTestCase):
     def test_a_live_listing_can_be_repaired_without_moving_stock_or_price(self):
         """

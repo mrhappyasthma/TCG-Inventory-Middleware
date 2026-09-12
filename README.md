@@ -721,6 +721,42 @@ we store.
 Image headers only: no Pillow, and never a whole file, so a 6 MB photograph
 costs the same as a thumbnail.
 
+### Which picture a card is shown and listed with
+
+Two columns arrive from the SortSwift export and they are **not**
+interchangeable:
+
+* `CDN Image` -- a **scan of the actual copy** being sold. On a
+  used-condition listing this is the whole point of a photograph: it is
+  evidence of the grade.
+* `Stock Image` -- the **generic catalogue photo** for that card, identical
+  for every copy in existence.
+
+A card is shown and listed with its scan when there is one, and with the
+catalogue photo when there is not. Both are stored, and the scan is never
+overwritten by the stock photo, so *"have I photographed this one yet"* stays
+answerable -- the dashboard marks a fallback with a **dashed** thumbnail
+border and a tooltip, and a scan with a solid one.
+
+The fallback matters because the alternative was nothing at all: an unscanned
+card previously showed an empty frame in the app and went to eBay with **no
+picture on its variation**, and a listing with no photo is a listing nobody
+clicks. The export had always carried the column and Module A had always
+parsed it -- the only thing that ever read it was the File Exchange Add-file
+row builder, which was deleted with the rest of the CSV path, so the value
+went nowhere for a while.
+
+The stock photo is used *only* as a fallback. Alongside a scan it is a second
+view of the same card front, which on a listing reads as a duplicate photo --
+the first real listing went up with three near-identical pictures per
+variation and looked wrong. And `scripts/check_images.py` measures whichever
+of the two is actually being sent, labelling it `(stock)`, because eBay's
+500-pixel minimum applies to what we send and not to what we hold.
+
+The group **cover photo** falls back the same way, one level up: a chosen
+cover, else a live listing's existing cover, else the first picture among the
+cards in the group -- scan or stock.
+
 
 ## 📦 Orders: what sold comes off your stock
 

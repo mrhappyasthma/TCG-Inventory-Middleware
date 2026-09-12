@@ -203,9 +203,16 @@ def images_for(db, parent):
                 targets.append((COVER_LABEL, cover))
             break
     for card in db.get_cards_for_listing(str(parent).strip()):
-        url = str(card.get("cdn_image") or "").strip()
+        # The resolved picture, not the scan: a card with no scan is listed
+        # with SortSwift's generic catalogue photo, and eBay applies its
+        # 500-pixel minimum to whatever we actually send. A stock photo too
+        # small to accept would block every future revision of the listing
+        # exactly as an undersized scan does.
+        url = str(card.get("image_url") or card.get("cdn_image") or "").strip()
         if url:
             label = f"{card['manifest_id']} {card.get('product_name') or ''}"
+            if not str(card.get("cdn_image") or "").strip():
+                label = f"{label} (stock)"
             targets.append((label[:38], url))
     return targets
 

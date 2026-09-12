@@ -1270,6 +1270,14 @@ class TestWebApp(unittest.TestCase):
         # The batch fixture carries one, so this also proves it is populated
         # rather than merely present.
         self.assertEqual(rows[0]["cdn_image"], "https://cdn.example.com/deerling.jpg")
+        # And the resolved picture the page actually renders, which is the
+        # scan when there is one and the generic catalogue photo when there
+        # is not. The page reads this rather than choosing for itself, so
+        # that display and the eBay push cannot disagree.
+        self.assertIn("stock_image", rows[0])
+        self.assertEqual(
+            rows[0]["image_url"], "https://cdn.example.com/deerling.jpg"
+        )
 
     # -- connecting the eBay account ---------------------------------------
 

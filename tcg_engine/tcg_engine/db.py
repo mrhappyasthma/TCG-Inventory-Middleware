@@ -173,6 +173,28 @@ def apply_pricing_rules(
     return 1.99, None
 
 
+# The picture for a card: its own scan if we have one, otherwise the
+# generic catalogue photo SortSwift carries for that card.
+#
+# Two columns rather than one, because a scan and a stock photo are not
+# interchangeable: the scan shows the copy actually being sold, which is
+# the whole point of a photo on a used-condition listing, and
+# "have I photographed this one yet" has to stay answerable. But a card
+# with no scan previously showed an empty frame on the dashboard and went
+# to eBay with no picture at all, which is worse than a generic one --
+# a listing with no photo is a listing nobody clicks.
+#
+# Spelled once and interpolated, so display and the push cannot disagree
+# about which image a card has.
+CARD_IMAGE_SQL = """
+                COALESCE(
+                    NULLIF(TRIM(COALESCE(m.cdn_image, '')), ''),
+                    NULLIF(TRIM(COALESCE(m.stock_image, '')), ''),
+                    ''
+                ) AS image_url
+""".strip()
+
+
 class Database:
     """
     SQLite Database manager for TCG inventory.
@@ -266,6 +288,7 @@ class Database:
                     market_price REAL DEFAULT 0.0,
                     quantity INTEGER DEFAULT 0,
                     cdn_image TEXT,
+                    stock_image TEXT,
                     remarks TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -694,6 +717,27 @@ class Database:
                     "ALTER TABLE ebay_variations ADD COLUMN offer_id TEXT"
                 )
 
+            # SortSwift's generic catalogue photo for the card, used when
+            # there is no scan of the actual copy.
+            #
+            # The export has carried this column all along and it was
+            # parsed and thrown away: it only ever reached the Add file's
+            # row builder, which has been deleted. A card with no scan
+            # therefore showed no picture on the dashboard and went to
+            # eBay with no image at all, which is worse than a generic
+            # one -- a listing with no photo is a listing nobody clicks.
+            #
+            # Kept in its own column rather than filled into cdn_image,
+            # so that "we have a scan of this card" stays answerable. It
+            # decides whether a photo is worth taking.
+            cursor.execute("PRAGMA table_info(manifest)")
+            if "stock_image" not in {
+                row["name"] for row in cursor.fetchall()
+            }:
+                cursor.execute(
+                    "ALTER TABLE manifest ADD COLUMN stock_image TEXT"
+                )
+
             # When the automatic repricer first computed a price *below* what
             # this variation is listed at. It is the start of a hold: a rise
             # applies at once, a fall has to keep being true for the whole
@@ -1028,6 +1072,7 @@ class Database:
         price: float = 0.0,
         market_price: float = 0.0,
         cdn_image: Optional[str] = None,
+        stock_image: Optional[str] = None,
         remarks: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Insert a new card into the master manifest."""
@@ -1044,9 +1089,9 @@ class Database:
                 INSERT INTO manifest (
                     manifest_id, product_name, set_name, condition, printing,
                     sku_id, tcgplayer_id, card_number, set_code, language,
-                    price, market_price, cdn_image, remarks
+                    price, market_price, cdn_image, stock_image, remarks
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     m_id,
@@ -1062,6 +1107,7 @@ class Database:
                     float(price or 0.0),
                     float(market_price or 0.0),
                     str(cdn_image).strip() if cdn_image else None,
+                    str(stock_image).strip() if stock_image else None,
                     str(remarks).strip() if remarks and str(remarks).strip().lower() != "no remark" else None,
                 ),
             )
@@ -1082,6 +1128,7 @@ class Database:
         price: float = 0.0,
         market_price: float = 0.0,
         cdn_image: Optional[str] = None,
+        stock_image: Optional[str] = None,
         remarks: Optional[str] = None,
     ) -> Tuple[str, bool, Dict[str, Any]]:
         """
@@ -1133,6 +1180,9 @@ class Database:
                     if cdn_image and not existing.get("cdn_image"):
                         updates.append("cdn_image = ?")
                         params.append(str(cdn_image).strip())
+                    if stock_image and not existing.get("stock_image"):
+                        updates.append("stock_image = ?")
+                        params.append(str(stock_image).strip())
                     if price and not existing.get("price"):
                         updates.append("price = ?")
                         params.append(float(price))
@@ -1175,9 +1225,10 @@ class Database:
                     INSERT INTO manifest (
                         manifest_id, product_name, set_name, condition, printing,
                         sku_id, tcgplayer_id, card_number, set_code, language,
-                        price, market_price, cdn_image, remarks
+                        price, market_price, cdn_image, stock_image,
+                        remarks
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         next_id,
@@ -1193,6 +1244,7 @@ class Database:
                         float(price or 0.0),
                         float(market_price or 0.0),
                         str(cdn_image).strip() if cdn_image else None,
+                        str(stock_image).strip() if stock_image else None,
                         str(remarks).strip()
                         if remarks and str(remarks).strip().lower() != "no remark"
                         else None,
@@ -1767,7 +1819,7 @@ class Database:
         direction = "DESC" if str(sort_dir).upper() == "DESC" else "ASC"
         order_by = ", ".join(f"{expr} {direction}" for expr in order_spec)
 
-        query = """
+        query = f"""
             SELECT
                 m.manifest_id,
                 m.product_name,
@@ -1783,6 +1835,8 @@ class Database:
                 -- from the SortSwift export and is often the only picture of
                 -- the actual card we hold.
                 COALESCE(m.cdn_image, '') AS cdn_image,
+                COALESCE(m.stock_image, '') AS stock_image,
+                {CARD_IMAGE_SQL},
                 COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
                 COALESCE(v.last_known_qty, 0) AS last_known_qty,
                 v.pending_qty AS pending_qty
@@ -2703,10 +2757,11 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """
+                f"""
                 SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
                        m.printing, m.card_number, m.language, m.sku_id,
-                       m.tcgplayer_id, m.set_code, m.cdn_image, m.remarks,
+                       m.tcgplayer_id, m.set_code, m.cdn_image,
+                       m.stock_image, {CARD_IMAGE_SQL}, m.remarks,
                        m.ebay_fields_json,
                        COALESCE(m.quantity, 0) AS quantity,
                        m.price, m.market_price,
@@ -3040,7 +3095,8 @@ class Database:
                        m.product_name, m.set_name, m.condition, m.printing,
                        m.card_number, m.language, m.quantity AS catalogued_qty,
                        m.price AS catalogued_price, m.market_price,
-                       m.cdn_image, m.remarks, m.ebay_fields_json,
+                       m.cdn_image, m.stock_image, {CARD_IMAGE_SQL},
+                       m.remarks, m.ebay_fields_json,
                        v.ebay_parent_id, v.custom_label, v.offer_id,
                        v.last_known_qty, v.last_known_price
                 FROM listing_plan_item i
@@ -3177,8 +3233,10 @@ class Database:
                                  IS NOT NULL THEN 1 ELSE 0 END AS cover_is_staged,
                        -- A card's own picture, used as the fallback suggestion
                        -- when nothing has been chosen for the listing.
-                       MIN(NULLIF(TRIM(COALESCE(m.cdn_image, '')), ''))
-                           AS first_card_image
+                       MIN(COALESCE(
+                           NULLIF(TRIM(COALESCE(m.cdn_image, '')), ''),
+                           NULLIF(TRIM(COALESCE(m.stock_image, '')), '')
+                       )) AS first_card_image
                 FROM listing_plan_item i
                 JOIN manifest m ON m.manifest_id = i.manifest_id
                 LEFT JOIN ebay_variations v ON v.manifest_id = i.manifest_id
@@ -3303,9 +3361,10 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """
+                f"""
                 SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
                        m.printing, m.card_number, m.language, m.cdn_image,
+                       m.stock_image, {CARD_IMAGE_SQL},
                        m.remarks, m.ebay_fields_json, m.price, m.quantity,
                        v.custom_label, v.offer_id, v.ebay_parent_id,
                        v.last_known_qty, v.last_known_price

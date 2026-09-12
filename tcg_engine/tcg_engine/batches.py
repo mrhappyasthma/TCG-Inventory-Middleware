@@ -803,6 +803,7 @@ def process_batch_csv(
                 price=effective_price,
                 market_price=market_price_val,
                 cdn_image=cdn_image,
+                stock_image=stock_image,
                 remarks=remarks,
             )
 
