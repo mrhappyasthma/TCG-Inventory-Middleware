@@ -89,6 +89,9 @@ async function initAuth() {
             // The console starts with what happened while nobody was here,
             // rather than empty.
             loadPersistedLogs();
+            // And the order poller's own state, which is the only way to
+            // tell a working poller from a stopped one.
+            loadOrderPoll();
         } else if (data.is_pending) {
             document.getElementById("pendingApprovalBanner").classList.remove("hidden");
         } else {
@@ -572,6 +575,116 @@ async function refreshMarketPrices() {
         button.disabled = false;
         label.innerText = "Refresh now";
         icon.classList.remove("animate-spin");
+    }
+}
+
+// -- orders ---------------------------------------------------------------
+//
+// The poller runs on the server whether or not this page is open. These only
+// show what it has done -- and, more importantly, when it last succeeded: a
+// poller that has silently stopped looks exactly like a shop with no sales.
+
+function describePollAge(stamp) {
+    if (!stamp) return "never";
+    const when = new Date(String(stamp).replace(" ", "T") + "Z");
+    if (isNaN(when.getTime())) return String(stamp);
+    const minutes = Math.round((Date.now() - when.getTime()) / 60000);
+    if (minutes < 2) return "just now";
+    if (minutes < 90) return `${minutes} min ago`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 36) return `${hours} hr ago`;
+    return `${Math.round(hours / 24)} days ago`;
+}
+
+async function loadOrderPoll() {
+    const when = document.getElementById("orderPollWhen");
+    const box = document.getElementById("orderPollLines");
+    const note = document.getElementById("orderPollNote");
+    if (!when || !box) return;
+    try {
+        const res = await fetch("/api/orders/recent?limit=8");
+        if (!res.ok) return;
+        const data = await res.json();
+
+        when.innerText = describePollAge(data.last_polled_at);
+        // Stale is worth flagging: eBay serves ninety days of orders, so a
+        // poller that stopped long enough leaves sales it can never read.
+        const minutes = data.last_polled_at
+            ? (Date.now() - new Date(String(data.last_polled_at).replace(" ", "T") + "Z").getTime()) / 60000
+            : null;
+        const overdue = minutes !== null
+            && minutes > Math.max(60, (data.poll_interval_minutes || 15) * 4);
+        when.className = overdue
+            ? "font-mono text-amber-400"
+            : "font-mono text-slate-400";
+
+        if (note) {
+            if (!data.enabled) {
+                note.innerText = "The background poll is switched off, so nothing is deducting sales. Use Poll now, or set ORDER_POLL_ENABLED.";
+                note.classList.remove("hidden");
+            } else if (minutes === null) {
+                note.innerText = "Never polled. The first poll adopts eBay's 90-day history without deducting it, so it is safe to run.";
+                note.classList.remove("hidden");
+            } else if (overdue) {
+                note.innerText = `Expected every ${data.poll_interval_minutes} min. Sales are not being deducted while it is behind.`;
+                note.classList.remove("hidden");
+            } else {
+                note.classList.add("hidden");
+            }
+        }
+
+        const lines = data.lines || [];
+        box.innerHTML = lines.length
+            ? lines.map(l => {
+                const needsEye = !l.manifest_id || l.status !== "ACTIVE";
+                const detail = l.manifest_id
+                    ? `${escapeHtml(l.product_name || l.manifest_id)}`
+                    : `<span class="text-amber-300">no card for ${escapeHtml(l.sku || "(blank)")}</span>`;
+                const moved = l.deducted_at
+                    ? `&minus;${l.deducted_qty}`
+                    : (l.status === "ACTIVE" ? "pending" : escapeHtml(l.status.toLowerCase()));
+                return `<div class="flex items-center gap-2 text-[11px] ${needsEye ? "text-amber-200" : "text-slate-300"}">
+                    <span class="font-mono text-slate-600 truncate">${escapeHtml(String(l.order_id).slice(-8))}</span>
+                    <span class="truncate">${detail}</span>
+                    <span class="ml-auto font-mono shrink-0">${moved}</span>
+                </div>`;
+              }).join("")
+            : `<p class="text-[11px] text-slate-500">No orders recorded yet.</p>`;
+    } catch (err) {
+        // Advisory: the poller runs on the server regardless.
+        console.error("order poll status:", err);
+    }
+}
+
+async function pollOrders(button) {
+    const label = button ? button.innerText : "Poll now";
+    if (button) {
+        button.disabled = true;
+        button.innerText = "Reading…";
+    }
+    try {
+        const res = await fetch("/api/orders/poll", {
+            method: "POST", body: new FormData(),
+        });
+        const data = await readJsonResponse(res);
+        if (!res.ok) throw new Error(data.detail || "The poll failed");
+
+        (data.logs || []).forEach(l => logToTerminal(l.level, `[ORDERS] ${l.message}`));
+        if (data.first_run) {
+            logToTerminal("WARN",
+                `[ORDERS] First poll: ${data.adopted} line(s) adopted from eBay's history without deducting. Later sales will deduct.`);
+        }
+        await loadOrderPoll();
+        // A deduction moves the catalogue, so anything showing it is stale.
+        fetchStats();
+        fetchInventory();
+    } catch (err) {
+        logToTerminal("ERROR", `[ORDERS] ${err.message}`);
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerText = label;
+        }
     }
 }
 

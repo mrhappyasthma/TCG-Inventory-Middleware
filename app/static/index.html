@@ -439,10 +439,29 @@
                     <div>
                         <div class="flex items-center justify-between mb-3">
                             <span class="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-indigo-950 text-indigo-400 border border-indigo-800/50">Module C</span>
-                            <span class="text-xs text-slate-400">eBay &rarr; SortSwift</span>
+                            <span class="text-xs text-slate-400">eBay &rarr; your stock</span>
                         </div>
-                        <h3 class="text-base font-bold font-heading text-white group-hover:text-brand-400 transition-colors">3. Process eBay Orders</h3>
-                        <p class="text-xs text-slate-400 mt-1">Parses raw eBay Orders CSV, extracts manifest IDs & sold quantities, and outputs SortSwift Import CSV.</p>
+                        <h3 class="text-base font-bold font-heading text-white group-hover:text-brand-400 transition-colors">3. eBay Orders</h3>
+                        <p class="text-xs text-slate-400 mt-1">Reads what sold and takes it off your catalogue, by itself, every few minutes. This is the only thing that deducts a sale.</p>
+
+                        <!--
+                            The poller's own state, because a poller that has
+                            silently stopped looks exactly like a shop with no
+                            sales. The last successful poll is the one number
+                            that tells them apart.
+                        -->
+                        <div class="mt-4 p-2.5 rounded-xl bg-dark-900/60 border border-slate-700/70">
+                            <div class="flex items-center justify-between gap-2">
+                                <p class="text-[11px] text-slate-300">Last poll <span id="orderPollWhen" class="font-mono text-slate-400">&mdash;</span></p>
+                                <button type="button" id="btnPollOrders" onclick="pollOrders(this)" class="shrink-0 text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                                    Poll now
+                                </button>
+                            </div>
+                            <div id="orderPollLines" class="mt-2 space-y-1"></div>
+                            <p id="orderPollNote" class="hidden text-[10px] text-amber-300/90 mt-2 leading-snug"></p>
+                        </div>
+
+                        <p class="text-[10px] text-slate-500 mt-3 leading-snug">The upload below is a fallback for when the API cannot be reached. It converts an eBay Orders CSV into a SortSwift deduction file, which nothing needs while the poller is running.</p>
 
                         <!-- Dropzone 1 -->
                         <div id="dropzoneOrders" class="dropzone mt-4 p-6 rounded-xl border-2 border-dashed border-slate-700 bg-dark-900/40 hover:bg-dark-900/80 hover:border-brand-500/70 text-center cursor-pointer transition-all">

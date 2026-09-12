@@ -1,11 +1,10 @@
 # Design: automating Module C (orders → stock deductions)
 
-**Status: designed, not built.** This file records where the project stands,
-what eBay actually offers for order events, and the design that follows.
-Written before any code, because the obvious plan — real-time
-notifications — turns out not to exist in the API this project uses, and
-because the question of who owns a quantity after a sale mattered more than
-the transport did.
+**Status: built.** Shipped in `3d4cd70`. This file records why it is a poll
+rather than a webhook, why our catalogue owns the quantity, and the
+properties the implementation had to have -- all of which were decided
+before any code, because the obvious plan did not survive contact with the
+API and the harder question turned out not to be the transport.
 
 ---
 
@@ -216,41 +215,46 @@ fallback for a poller that cannot reach eBay, exactly as Module B's does.
 
 ---
 
-## 5. Build order
+## 5. What was built
 
-Both research steps this originally opened with are answered: there is no
-order topic to subscribe to, and SortSwift is out of the loop. So it is all
-code.
+| Piece | Where |
+|---|---|
+| `get_orders`, paginating to exhaustion | `ebay_client/orders.py` |
+| The six-field projection | `app/ebay_orders.py` |
+| `ebay_order_line` and its accessors | `tcg_engine/db.py` |
+| Reconcile, deduct once, adopt on a first run | `tcg_engine/order_sync.py` |
+| The poll loop, endpoints and watermark | `app/main.py` |
+| Module C's card, showing the last successful poll | `app/static/` |
 
-1. `ebay_client/orders.py` — `get_orders(transport, since, limit, offset)`,
-   paginating to exhaustion, with its own tests against an injected opener.
-   Knows nothing about cards.
-2. The adapter in `app/`, projecting away the personal data (§4b). **Test
-   that the projection is exhaustive**: feed it a full realistic payload and
-   assert the output's keys are exactly the six allowed.
-3. `ebay_order_line` and its accessors (§4c).
-4. `tcg_engine/order_sync.py` — reconcile projected lines against what has
-   been seen, map SKUs to cards, deduct the catalogue once each.
-5. The poll loop and the endpoints, following the repricer's shape: a manual
-   "Poll now", a background interval, terminal logging, and a preview that
-   contacts eBay but writes nothing.
-6. The dashboard: Module C's card shows what was deducted and when the last
-   poll succeeded. The upload stays as the fallback.
+Configured by `ORDER_POLL_ENABLED` and `ORDER_POLL_INTERVAL_MINUTES`
+(default 15). The watermark lives in `listing_settings` under
+`orders_last_polled_at`, advances only on success, and is recorded as the
+moment the poll *started* -- so an order modified during the call falls in
+the next window rather than in neither.
+
+One thing the design did not anticipate and the implementation added: the
+**first poll adopts**. With no watermark, eBay hands over ninety days of
+history, every sale in it already accounted for. Deducting that would take
+three months of stock off the shelf a second time, so the first run records
+every line as handled with a deducted quantity of zero and removes nothing.
 
 ## 6. Risks
 
-* **A missed sale is invisible.** Nothing in the system notices an order that
-  was never polled. The overlap window and the line-item table make
-  double-counting impossible, so the bias should be heavily toward re-seeing
-  orders. A "last successful poll" timestamp on screen is worth more than it
-  sounds: a poller that silently stopped looks exactly like a shop with no
-  sales.
+* **A missed sale is invisible**, and that is still true -- nothing notices
+  an order it never read. Mitigated rather than solved: a thirty-minute
+  overlap on every poll, `ebay_order_line` making a second deduction
+  impossible so the bias can safely favour re-reading, a refusal to return a
+  truncated page, and the last successful poll on screen in amber once it is
+  overdue. That last one earns its place: a poller that silently stopped
+  looks exactly like a shop with no sales.
 * **Multi-quantity line items.** A buyer taking three of one card is one line
   item with `quantity: 3`. The deduction must use that quantity, not count
   line items.
-* **Personal data creeping in later.** The projection is the only thing
-  standing between `getOrders` and a compliance problem. It needs a test that
-  fails when a field is added, not a comment asking for care.
+* **Personal data creeping in later.** Handled the way it had to be: the
+  projection is a keep-list of six named fields, `order_sync` refuses any
+  line whose keys are not exactly those six, and the test feeds a full
+  payload carrying a buyer's username, name, email, phone and address and
+  asserts not one value survives.
 * **The 90-day filter window.** A poller offline for longer than that has a
   gap it cannot close from the API. Worth a warning when the watermark is
   older than, say, 60 days.
