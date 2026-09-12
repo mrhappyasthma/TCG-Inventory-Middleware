@@ -320,6 +320,39 @@ class Database:
                 );
                 """,
             )
+            # Order line items eBay has reported, and whether each has been
+            # deducted from the catalogue.
+            #
+            # Keyed on (order_id, line_item_id) because that is the unit that
+            # sells: one order can carry several cards, and a buyer taking
+            # three of one card is a single line item with a quantity of
+            # three. This table is what makes a deduction happen exactly
+            # once, which matters because the poller deliberately re-reads a
+            # window of orders it has already seen -- overlapping is how a
+            # sale is not missed, and this is how it is not counted twice.
+            #
+            # It holds nothing about the buyer. No name, address, email,
+            # phone or eBay username reaches this table, which is the whole
+            # basis of the account-deletion exemption; the projection in the
+            # app layer is what enforces it.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ebay_order_line (
+                    order_id      TEXT NOT NULL,
+                    line_item_id  TEXT NOT NULL,
+                    sku           TEXT NOT NULL,
+                    quantity      INTEGER NOT NULL,
+                    manifest_id   TEXT,
+                    status        TEXT NOT NULL DEFAULT 'ACTIVE',
+                    sold_at       TIMESTAMP,
+                    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    deducted_at   TIMESTAMP,
+                    deducted_qty  INTEGER,
+                    PRIMARY KEY (order_id, line_item_id)
+                );
+                """,
+            )
             # The operational log, as the console shows it.
             #
             # The console used to exist only in the browser: it showed what
@@ -713,6 +746,12 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_run_log_id
                 ON run_log(id DESC);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_order_line_seen
+                ON ebay_order_line(first_seen_at DESC);
                 """
             )
             cursor.execute(
@@ -2183,6 +2222,166 @@ class Database:
                 (hold_since, manifest_id),
             )
             conn.commit()
+
+    def get_order_lines(
+        self, keys: Optional[Sequence[Tuple[str, str]]] = None
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """
+        Order lines already seen, keyed by (order_id, line_item_id).
+
+        Returned as a dict because the caller's question is always "have I
+        dealt with this one", asked once per line item against a batch eBay
+        just handed over.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if keys:
+                rows: List[Dict[str, Any]] = []
+                # Chunked: SQLite's parameter limit is finite and a poll can
+                # legitimately carry hundreds of line items.
+                pairs = list(keys)
+                for start in range(0, len(pairs), 200):
+                    batch = pairs[start:start + 200]
+                    clause = " OR ".join(
+                        "(order_id = ? AND line_item_id = ?)" for _ in batch
+                    )
+                    params = [value for pair in batch for value in pair]
+                    cursor.execute(
+                        f"SELECT * FROM ebay_order_line WHERE {clause}", params
+                    )
+                    rows.extend(dict(r) for r in cursor.fetchall())
+            else:
+                cursor.execute("SELECT * FROM ebay_order_line")
+                rows = [dict(r) for r in cursor.fetchall()]
+        return {(r["order_id"], r["line_item_id"]): r for r in rows}
+
+    def upsert_order_line(
+        self,
+        order_id: str,
+        line_item_id: str,
+        sku: str,
+        quantity: int,
+        status: str,
+        sold_at: Optional[str] = None,
+        manifest_id: Optional[str] = None,
+    ) -> None:
+        """
+        Record that eBay reported this line item, without claiming a deduction.
+
+        Separate from ``mark_order_line_deducted`` on purpose: seeing a sale
+        and acting on it are different facts, and conflating them is how an
+        overlapping poll would deduct twice. ``first_seen_at`` and
+        ``deducted_at`` are never overwritten by a later sighting.
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO ebay_order_line
+                    (order_id, line_item_id, sku, quantity, manifest_id,
+                     status, sold_at, first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP)
+                ON CONFLICT(order_id, line_item_id) DO UPDATE SET
+                    sku = excluded.sku,
+                    quantity = excluded.quantity,
+                    manifest_id = COALESCE(excluded.manifest_id,
+                                           ebay_order_line.manifest_id),
+                    status = excluded.status,
+                    sold_at = COALESCE(ebay_order_line.sold_at,
+                                       excluded.sold_at),
+                    last_seen_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    str(order_id).strip(),
+                    str(line_item_id).strip(),
+                    str(sku or "").strip(),
+                    int(quantity),
+                    manifest_id,
+                    str(status or "ACTIVE").strip().upper(),
+                    sold_at,
+                ),
+            )
+            conn.commit()
+
+    def mark_order_line_deducted(
+        self, order_id: str, line_item_id: str, quantity: int
+    ) -> bool:
+        """
+        Claim a line item for deduction, exactly once.
+
+        The ``deducted_at IS NULL`` guard is in the UPDATE rather than in a
+        prior read, so two pollers running at once cannot both claim the same
+        sale. Returns whether this call was the one that claimed it, and the
+        caller must only decrement stock when it was.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE ebay_order_line
+                SET deducted_at = CURRENT_TIMESTAMP, deducted_qty = ?
+                WHERE order_id = ? AND line_item_id = ?
+                  AND deducted_at IS NULL
+                """,
+                (int(quantity), str(order_id).strip(),
+                 str(line_item_id).strip()),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def get_recent_order_lines(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """The most recently seen order lines, with the card they matched."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT o.*, m.product_name, m.set_name, m.condition,
+                       m.card_number, m.quantity AS catalogued_qty
+                FROM ebay_order_line o
+                LEFT JOIN manifest m ON m.manifest_id = o.manifest_id
+                ORDER BY o.first_seen_at DESC, o.rowid DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def decrement_manifest_quantity(
+        self, manifest_id: str, quantity: int
+    ) -> int:
+        """
+        Take stock off a card, clamping at zero, and report what was taken.
+
+        Clamped because a negative on-hand count is not a thing that can be
+        true, and because the arithmetic can legitimately disagree with
+        reality: a card sold on eBay that our catalogue never knew about, or
+        one sold twice through a race we did not see. Returning the amount
+        actually removed lets the caller say "1 of 2 deducted, the card was
+        already at 1" rather than silently doing something else.
+        """
+        take = max(0, int(quantity))
+        if not take:
+            return 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(quantity, 0) AS quantity FROM manifest "
+                "WHERE manifest_id = ?",
+                (manifest_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return 0
+            held = int(row["quantity"])
+            removed = min(held, take)
+            if removed:
+                cursor.execute(
+                    "UPDATE manifest SET quantity = quantity - ? "
+                    "WHERE manifest_id = ?",
+                    (removed, manifest_id),
+                )
+                conn.commit()
+            return removed
 
     def record_log_entries(
         self,

@@ -1534,6 +1534,259 @@ class TestWebApp(unittest.TestCase):
         finally:
             user_db.save_ebay_token(None)
 
+    # -- orders -------------------------------------------------------------
+
+    def test_54_the_order_projection_keeps_only_six_fields(self):
+        """
+        The compliance boundary, tested against a realistic payload.
+
+        getOrders hands back a buyer's username, registration address, and a
+        shipTo block with their name, full address, email and phone number.
+        None of it may cross into the engine or either database -- that is
+        what the account-deletion exemption rests on. So this feeds the
+        adapter an order carrying all of it and asserts the output's keys are
+        exactly the six allowed, and that no value from the payload's personal
+        fields appears anywhere in the result.
+        """
+        from app.ebay_orders import project_order_lines
+        from tcg_engine.order_sync import REQUIRED_LINE_FIELDS
+
+        secrets = [
+            "buyer_hidden_1", "Jane Q. Buyer", "jane@example.com",
+            "+1 555 0100", "42 Elm Street", "Springfield", "62704",
+        ]
+        order = {
+            "orderId": "12-34567-89012",
+            "legacyOrderId": "987654321",
+            "creationDate": "2026-09-11T09:00:00.000Z",
+            "lastModifiedDate": "2026-09-11T09:05:00.000Z",
+            "orderFulfillmentStatus": "NOT_STARTED",
+            "orderPaymentStatus": "PAID",
+            "sellerId": "seller123",
+            "buyer": {
+                "username": "buyer_hidden_1",
+                "taxAddress": {"stateOrProvince": "IL", "postalCode": "62704"},
+                "buyerRegistrationAddress": {
+                    "fullName": "Jane Q. Buyer",
+                    "email": "jane@example.com",
+                    "primaryPhone": {"phoneNumber": "+1 555 0100"},
+                    "contactAddress": {
+                        "addressLine1": "42 Elm Street",
+                        "city": "Springfield",
+                        "postalCode": "62704",
+                    },
+                },
+            },
+            "pricingSummary": {"total": {"value": "5.98", "currency": "USD"}},
+            "cancelStatus": {"cancelState": "NONE_REQUESTED"},
+            "fulfillmentStartInstructions": [{
+                "fulfillmentInstructionsType": "SHIP_TO",
+                "shippingStep": {
+                    "shipTo": {
+                        "fullName": "Jane Q. Buyer",
+                        "email": "jane@example.com",
+                        "primaryPhone": {"phoneNumber": "+1 555 0100"},
+                        "contactAddress": {
+                            "addressLine1": "42 Elm Street",
+                            "city": "Springfield",
+                            "postalCode": "62704",
+                        },
+                    },
+                },
+            }],
+            "lineItems": [
+                {"lineItemId": "10-11-12", "sku": "ID1435", "quantity": 2,
+                 "title": "Charizard", "lineItemFulfillmentStatus": "NOT_STARTED",
+                 "lineItemCost": {"value": "2.99", "currency": "USD"}},
+                {"lineItemId": "10-11-13", "sku": "ID1401", "quantity": 1,
+                 "title": "Blastoise", "lineItemFulfillmentStatus": "NOT_STARTED"},
+            ],
+        }
+
+        lines = project_order_lines([order])
+        self.assertEqual(len(lines), 2, "one entry per line item")
+        for entry in lines:
+            with self.subTest(line=entry["line_item_id"]):
+                self.assertEqual(set(entry), set(REQUIRED_LINE_FIELDS))
+
+        # Not one personal value survives, at any depth.
+        rendered = repr(lines)
+        for secret in secrets:
+            self.assertNotIn(secret, rendered,
+                             f"{secret!r} survived the projection")
+
+        self.assertEqual(lines[0]["order_id"], "12-34567-89012")
+        self.assertEqual(lines[0]["sku"], "ID1435")
+        self.assertEqual(lines[0]["quantity"], 2)
+        self.assertEqual(lines[0]["status"], "ACTIVE")
+        # The moment of sale, not of the last modification -- a cancellation
+        # weeks later must not make the sale look recent.
+        self.assertEqual(lines[0]["sold_at"], "2026-09-11T09:00:00.000Z")
+
+    def test_54b_the_projection_reads_cancellation_from_three_places(self):
+        from app.ebay_orders import project_order_lines
+
+        def one(**order_fields):
+            order = {
+                "orderId": "1-1", "creationDate": "2026-09-11T09:00:00.000Z",
+                "orderPaymentStatus": "PAID",
+                "cancelStatus": {"cancelState": "NONE_REQUESTED"},
+                "lineItems": [{"lineItemId": "L1", "sku": "ID1", "quantity": 1}],
+            }
+            order.update(order_fields)
+            return project_order_lines([order])[0]["status"]
+
+        self.assertEqual(one(), "ACTIVE")
+        self.assertEqual(
+            one(cancelStatus={"cancelState": "CANCELED"}), "CANCELED")
+        self.assertEqual(
+            one(orderPaymentStatus="FULLY_REFUNDED"), "REFUNDED")
+        # A line refunded on its own, inside an order that was not.
+        self.assertEqual(
+            project_order_lines([{
+                "orderId": "1-1", "creationDate": "2026-09-11T09:00:00.000Z",
+                "orderPaymentStatus": "PAID",
+                "cancelStatus": {"cancelState": "NONE_REQUESTED"},
+                "lineItems": [{"lineItemId": "L1", "sku": "ID1", "quantity": 1,
+                               "refunds": [{"refundId": "r1"}]}],
+            }])[0]["status"],
+            "REFUNDED",
+        )
+        # A requested cancellation is not one: the buyer asking is not the
+        # same as it happening, and the card may still be going out.
+        self.assertEqual(
+            one(cancelStatus={"cancelState": "CANCEL_REQUESTED"}), "ACTIVE")
+
+    def test_54c_an_order_or_line_with_no_id_is_skipped(self):
+        from app.ebay_orders import project_order_lines
+
+        self.assertEqual(project_order_lines([{"lineItems": []}]), [])
+        self.assertEqual(project_order_lines([{
+            "orderId": "1-1",
+            "lineItems": [{"sku": "ID1", "quantity": 1}],
+        }]), [], "a line with no id cannot be deduplicated, so it is skipped")
+
+    def test_55_polling_without_a_connection_is_refused_not_attempted(self):
+        """A 409, and above all not a report of zero sales."""
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.post("/api/orders/poll")
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("eBay", res.json()["detail"])
+
+    def test_55b_the_recent_orders_view_needs_no_connection(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.get("/api/orders/recent")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertIn("last_polled_at", body)
+        self.assertIn("poll_interval_minutes", body)
+        self.assertIsInstance(body["lines"], list)
+
+    def test_55c_the_order_endpoints_need_a_session(self):
+        self.client.post("/api/auth/logout")
+        for method, path in (
+            ("post", "/api/orders/poll"),
+            ("get", "/api/orders/recent"),
+        ):
+            with self.subTest(path=path):
+                res = getattr(self.client, method)(path)
+                self.assertIn(res.status_code, (401, 403))
+
+    def test_55d_the_watermark_only_advances_on_a_successful_poll(self):
+        """
+        A failed poll must re-read the same window, not step over it.
+
+        If the watermark moved regardless, every sale in the window a failed
+        poll was reading would be skipped by the next one -- and a skipped
+        sale is invisible: nothing in the system notices an order it never
+        read.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        before = db.get_listing_setting(main.ORDER_WATERMARK_SETTING, "")
+
+        # A connected client whose order read fails part-way.
+        class _Oauth:
+            def is_connected(self):
+                return True
+
+        class _Client:
+            oauth = _Oauth()
+            seller = object()
+
+        with mock.patch.object(main, "get_ebay_client", return_value=_Client()),              mock.patch.object(main, "get_orders",
+                               side_effect=main.OrderPageError("truncated")):
+            res = self.client.post("/api/orders/poll")
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(
+            db.get_listing_setting(main.ORDER_WATERMARK_SETTING, ""), before,
+            "a failed poll must leave the watermark alone",
+        )
+
+    def test_55e_a_first_poll_adopts_history_and_moves_the_watermark(self):
+        """
+        The first poll must not deduct ninety days of already-counted sales.
+
+        And it must move the watermark, or every later poll would keep
+        re-adopting the same history instead of deducting new sales.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        db.set_listing_settings({main.ORDER_WATERMARK_SETTING: ""},
+                                user_id=main.SHARED_SCOPE)
+        db.insert_manifest("ID9200", "Sneasel", "Unified Minds", "Near Mint",
+                           "Holofoil", card_number="032/236")
+        db.set_manifest_quantity("ID9200", 4)
+
+        order = {
+            "orderId": "55-00001-00001",
+            "creationDate": "2026-09-01T09:00:00.000Z",
+            "orderPaymentStatus": "PAID",
+            "cancelStatus": {"cancelState": "NONE_REQUESTED"},
+            "lineItems": [{"lineItemId": "A1", "sku": "ID9200",
+                           "quantity": 2}],
+        }
+
+        class _Oauth:
+            def is_connected(self):
+                return True
+
+        class _Client:
+            oauth = _Oauth()
+            seller = object()
+
+        try:
+            with mock.patch.object(main, "get_ebay_client",
+                                   return_value=_Client()),                  mock.patch.object(main, "get_orders", return_value=[order]):
+                first = self.client.post("/api/orders/poll")
+                self.assertEqual(first.status_code, 200, first.text)
+                body = first.json()
+                self.assertTrue(body["first_run"])
+                self.assertEqual(body["adopted"], 1)
+                self.assertEqual(body["deducted"], 0)
+                self.assertEqual(
+                    db.get_manifest_by_id("ID9200")["quantity"], 4,
+                    "a first poll must not deduct history",
+                )
+                self.assertTrue(
+                    db.get_listing_setting(main.ORDER_WATERMARK_SETTING, ""),
+                    "the watermark must advance, or history is re-adopted",
+                )
+
+                # A *new* sale after adoption does deduct.
+                second_order = dict(order, orderId="55-00001-00002")
+                second_order["lineItems"] = [
+                    {"lineItemId": "B1", "sku": "ID9200", "quantity": 1}
+                ]
+                with mock.patch.object(main, "get_orders",
+                                       return_value=[second_order]):
+                    second = self.client.post("/api/orders/poll")
+                self.assertEqual(second.status_code, 200, second.text)
+                self.assertFalse(second.json()["first_run"])
+                self.assertEqual(second.json()["deducted"], 1)
+                self.assertEqual(
+                    db.get_manifest_by_id("ID9200")["quantity"], 3)
+        finally:
+            db.delete_manifest("ID9200")
+
     # -- automatic repricing ----------------------------------------------
 
     def test_48_the_repricer_preview_needs_no_ebay_connection(self):

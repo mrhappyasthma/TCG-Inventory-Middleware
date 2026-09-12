@@ -25,6 +25,25 @@ SORTSWIFT_HEADERS = [
 
 
 
+def base_manifest_id(label: str) -> str:
+    """
+    The card a SKU refers to, with any bin suffix stripped.
+
+    eBay knows a variation by a label like ``ID1001-Bin_A-12``: the manifest
+    id plus the physical bin it was in when the listing was created. The bin
+    is not part of a card's identity -- the same card can sit in two bins, and
+    a variation's SKU cannot be renamed once eBay has it -- so the id is what
+    identifies the card and the rest is a note to whoever picks it.
+
+    Falls back to the label itself when no id can be found, so the caller
+    reports "no card called X" against what eBay actually said rather than
+    against something this guessed at.
+    """
+    text = str(label or "").strip()
+    match = re.search(r"(ID\d+)", text, re.IGNORECASE)
+    return match.group(1).upper() if match else text
+
+
 def _find_header_line(text_lines: List[str]) -> int:
     """
     Find line index where the CSV headers start.
@@ -144,9 +163,7 @@ def process_orders_csv(
             continue
 
         raw_custom_label = custom_label.strip()
-        # Extract base manifest ID (e.g. 'ID1001' from 'ID1001-BIN_A12' or 'ID1001')
-        match = re.search(r"(ID\d+)", raw_custom_label, re.IGNORECASE)
-        manifest_id = match.group(1).upper() if match else raw_custom_label
+        manifest_id = base_manifest_id(raw_custom_label)
 
         # Lookup card in master manifest
         card = db.get_manifest_by_id(manifest_id)
