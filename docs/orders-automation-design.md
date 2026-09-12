@@ -1,9 +1,11 @@
 # Design: automating Module C (orders → stock deductions)
 
-**Status: not started.** This file records where the project stands, what eBay
-actually offers for order events, and the design that follows from it. Written
-before any code, because the obvious plan — real-time notifications — turns
-out not to be available in the API this project uses.
+**Status: designed, not built.** This file records where the project stands,
+what eBay actually offers for order events, and the design that follows.
+Written before any code, because the obvious plan — real-time
+notifications — turns out not to exist in the API this project uses, and
+because the question of who owns a quantity after a sale mattered more than
+the transport did.
 
 ---
 
@@ -28,11 +30,11 @@ Sign-In-only auth, the background jobs and the dashboard.
 
 | Step | Module | Direction | State |
 |---|---|---|---|
-| 1 | **A** — SortSwift export ingest | CSV **in** | Automated on upload. Catalogues cards, corrects quantities, detects sold-out cards, **stages a draft** |
+| 1 | **A** — SortSwift export ingest | CSV **in** | Automated on upload. Catalogues cards, **adds** their quantities, **stages a draft** |
 | — | Drafts → push | **API out** | The only route to eBay. Reviewed, approved, pushed through the Inventory API |
 | — | Automatic repricer | **API out** | Nightly, price only, with a boundary margin and a 14-day hold on falls |
 | 2 | **B** — store mirror sync | **API in** (Feed API) or CSV in | Automated when eBay is connected; the manual upload is the fallback |
-| 3 | **C** — orders → deductions | CSV **in**, CSV **out** | **Entirely manual.** Download the orders report, upload it, download the deduction file, import it into SortSwift |
+| 3 | **C** — orders → stock deductions | CSV **in** | **Entirely manual, and now the only gap.** Download the orders report and upload it. Nothing else deducts a sale from the catalogue |
 
 Everything eBay-bound is now API-only: all eleven listings were migrated with
 `bulkMigrateListing`, and the File Exchange output path was deleted. Module C
@@ -45,8 +47,10 @@ is the last place a CSV is handled by hand on the eBay side.
   preference — it underpins the account-deletion exemption, and
   `/api/ebay/notifications` logs the **topic only** for the same reason.
 * **Google Sign-In is the only auth mechanism.**
-* **SortSwift's export is a full inventory dump.** Quantities replace stored
-  values; cards absent from it are sold out. This matters enormously below.
+* **A SortSwift upload is a delta of newly scanned cards.** Its quantities
+  **add**; a card absent from it means nothing. Our catalogue owns the
+  number. This is what makes the work below necessary rather than merely
+  convenient.
 * **Nothing writes to eBay without an approved plan** — except the repricer,
   which is a deliberate, argued exception limited to price.
 
@@ -60,9 +64,9 @@ as stated, because the first half does not exist in the API this project uses.
 **The REST Notification API has no order topic.** Its topics cover listing and
 item events — `ITEM_AVAILABILITY`, `ITEM_PRICE_REVISION`,
 `MARKETPLACE_ACCOUNT_DELETION`, listing-preview task status, buyer quote
-requests. Nothing fires when an order is created or paid for. The authoritative
-check is `getTopics` against our own connected account, which is the first task
-below.
+requests. Nothing fires when an order is created or paid for. `getTopics`
+against our own connected account would confirm it from the source, and is
+worth one call before relying on this.
 
 **Order events exist only in legacy Platform Notifications**, part of the
 XML/SOAP Trading API: `FixedPriceTransaction`, `AuctionCheckoutComplete`,
@@ -86,46 +90,42 @@ interval, which is the property to aim for.
 
 ---
 
-## 3. The harder problem: who owns the quantity after a sale
+## 3. Settled: our catalogue owns the quantity
 
-This deserves settling before any code, because it decides how much the
-automation is worth.
+This was the open question, and it is now answered. Mark is removing the
+re-upload of deductions into SortSwift — his inventory is too large to keep in
+step that way — and SortSwift uploads are per-batch deltas rather than a full
+dump of the shelf.
 
-When a card sells, three systems have to end up agreeing:
+So the arithmetic changed in `c85b96b`, before any of this was built:
 
-| System | How it learns | Automated? |
+* an upload's quantities **add** to what is held; there is no replace mode;
+* a card **absent** from an upload means nothing, so the sold-out-if-absent
+  reconciliation is gone;
+* **our catalogue is the source of truth for physical stock.**
+
+Which resolves the design completely, and also makes it urgent:
+
+| System | How it learns a sale | Automated? |
 |---|---|---|
-| **eBay** | Decrements its own quantity at the moment of sale | Yes, by eBay |
-| **Our store mirror** (`ebay_variations.last_known_qty`) | Module B sync, or a confirmed push | Yes |
-| **SortSwift** | The deduction file, imported by hand | **No** |
-| **Our catalogue** (`manifest.quantity`) | The next SortSwift export | Indirectly |
+| **eBay** | Decrements itself at the moment of sale | Yes, by eBay |
+| **Our store mirror** | Module B sync, or a confirmed push | Yes |
+| **Our catalogue** | **Nothing, until this is built** | **No — this is the gap** |
+| SortSwift | No longer kept in step, by choice | n/a |
 
-Module C's entire purpose is the third row. Our catalogue is *not* the source
-of truth for physical stock: SortSwift is, and its export is a full dump that
-**replaces** our quantities. So deducting from our own catalogue and stopping
-there is worse than useless — it would be silently overwritten by the next
-export, and in the meantime the draft would propose a quantity change that
-eBay has already made itself.
+**There is now nothing that deducts a sale from the catalogue.** The old route
+was the sold-out sweep on a full dump, and that is gone. Left as is, the
+catalogue drifts upward from reality: sell two of five, and it still says
+five, while eBay says three. The draft then proposes pushing five — selling
+stock that is not there.
 
-**The consequence: automating the eBay half does not make this hands-off.**
-Polling `getOrders` removes the "download the orders report from Seller Hub"
-step. Importing the result into SortSwift stays manual unless SortSwift can
-accept it programmatically.
+So this is no longer an efficiency project. It closes a hole that the switch
+to deltas opened, and it is the only remaining way a sale reaches our own
+records.
 
-**Open question, and the one worth answering first:** does SortSwift offer an
-API or a watched-folder import? If it does, this becomes genuinely end-to-end.
-If it does not, the realistic win is:
-
-* no more downloading a report from Seller Hub on a schedule;
-* deductions accumulate automatically and are always ready;
-* a standing, dated list of what sold since the last import, so nothing is
-  missed and nothing is counted twice — which is the part a manual process
-  gets wrong.
-
-That is worth having. It is just not "no more CSVs", and it should not be
-built under that expectation.
-
----
+It also means there is **no deduction file to produce**. Nothing consumes it:
+SortSwift is out of the loop, and our catalogue is written directly. The
+orders poller adjusts `manifest.quantity` and records what it did.
 
 ## 4. The design
 
@@ -207,38 +207,35 @@ change away from a sale is **surfaced, never acted on**: it appears in the
 console and the log, and a human decides. Mirrors the repricer's hold: the
 asymmetric direction is the one that gets a human.
 
-### 4e. Reuse the output, not just the input
+### 4e. There is no file at the end of it
 
-`build_deduction_csv` and `deduction_row` already produce exactly the right
-file, negative quantities and all. The poller feeds them rows instead of a
-parsed CSV. Nothing about the SortSwift format needs revisiting.
+`build_deduction_csv` and `deduction_row` exist to produce a file SortSwift
+imports, and SortSwift is out of the loop (§3). The poller writes the
+catalogue directly and records what it did. The CSV upload path stays as the
+fallback for a poller that cannot reach eBay, exactly as Module B's does.
 
 ---
 
 ## 5. Build order
 
-1. **Call `getTopics`** against the connected account and write down the
-   actual topic list. One call; settles §2 from the source rather than from
-   documentation, and it is cheap to be wrong about here and expensive later.
-2. **Find out whether SortSwift can import programmatically.** This decides
-   whether step 6 is the end of the story or the middle of it (§3).
-3. `ebay_client/orders.py` — `get_orders(transport, since, limit, offset)`,
+Both research steps this originally opened with are answered: there is no
+order topic to subscribe to, and SortSwift is out of the loop. So it is all
+code.
+
+1. `ebay_client/orders.py` — `get_orders(transport, since, limit, offset)`,
    paginating to exhaustion, with its own tests against an injected opener.
    Knows nothing about cards.
-4. The adapter in `app/`, projecting away the personal data (§4b). **Test that
-   the projection is exhaustive**: feed it a full realistic payload and assert
-   the output dict's keys are exactly the six allowed.
-5. `tcg_engine/order_sync.py` — reconcile projected lines against
-   `ebay_order_line`, map SKUs to cards, decide what is newly deductible.
-6. The poll loop and the endpoint, following the repricer's shape: a manual
+2. The adapter in `app/`, projecting away the personal data (§4b). **Test
+   that the projection is exhaustive**: feed it a full realistic payload and
+   assert the output's keys are exactly the six allowed.
+3. `ebay_order_line` and its accessors (§4c).
+4. `tcg_engine/order_sync.py` — reconcile projected lines against what has
+   been seen, map SKUs to cards, deduct the catalogue once each.
+5. The poll loop and the endpoints, following the repricer's shape: a manual
    "Poll now", a background interval, terminal logging, and a preview that
    contacts eBay but writes nothing.
-7. The dashboard: Module C's card becomes "pending deductions", with the
-   download; the upload stays as the fallback exactly as Module B's does.
-
-Steps 1 and 2 are research and should happen before any of the rest.
-
----
+6. The dashboard: Module C's card shows what was deducted and when the last
+   poll succeeded. The upload stays as the fallback.
 
 ## 6. Risks
 
