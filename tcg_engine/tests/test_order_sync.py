@@ -162,15 +162,32 @@ class OrderSyncTests(unittest.TestCase):
             "the operator has to be told it needs a decision",
         )
 
-    def test_an_unmatched_sku_is_reported_every_time(self):
-        # It is not dropped once and forgotten: until the card is catalogued,
-        # every poll should keep saying so.
-        for _ in range(2):
-            result = sync_orders(self.db, [line(sku="ID7777")])
-            self.assertEqual(result["unmatched"], 1)
-            self.assertEqual(result["deducted"], 0)
-            self.assertTrue(any("matches no catalogued card" in l["message"]
-                                for l in result["logs"]))
+    def test_an_unmatched_sku_is_named_once_then_tallied(self):
+        """
+        Still reported on every poll, but not re-named on every poll.
+
+        An unmatched line is never claimed, so it comes back forever. At
+        a poll every fifteen minutes, naming it each time is ninety-six
+        identical lines a day -- and a real first poll produced
+        forty-five in one go, which buried the summary explaining them.
+        So the first sighting names it and later ones are counted.
+        """
+        first = sync_orders(self.db, [line(sku="ID7777")])
+        self.assertEqual(first["unmatched"], 1)
+        self.assertEqual(first["deducted"], 0)
+        self.assertTrue(any("matches no catalogued card" in l["message"]
+                            for l in first["logs"]),
+                        "the first sighting must name it")
+
+        second = sync_orders(self.db, [line(sku="ID7777")])
+        self.assertEqual(second["unmatched"], 1, "still counted")
+        self.assertEqual(second["repeated_unmatched"], 1)
+        self.assertFalse(any("matches no catalogued card" in l["message"]
+                             for l in second["logs"]),
+                         "but not named a second time")
+        self.assertTrue(any("still match no catalogued card" in l["message"]
+                            for l in second["logs"]),
+                        "the tally has to be impossible to miss")
 
     def test_a_blank_sku_is_reported_rather_than_guessed_at(self):
         result = sync_orders(self.db, [line(sku="")])
@@ -244,6 +261,47 @@ class OrderSyncTests(unittest.TestCase):
         row = self.db.get_recent_order_lines()[0]
         self.assertIsNotNone(row["deducted_at"])
         self.assertEqual(row["deducted_qty"], 0)
+
+    def test_adoption_claims_a_line_whose_sku_matches_nothing(self):
+        """
+        The hazard the first version of this walked straight into.
+
+        A real first poll saw 85 order lines and adopted none of them, because
+        every SKU was blank and the unmatched check skipped the claim. Every
+        one of those sales was then lying in wait: catalogue a card under that
+        id, or fix whatever made the SKU blank, and the next poll would deduct
+        three months of sales in one go.
+        """
+        result = sync_orders(self.db, [
+            line(item="L1", sku=""),
+            line(item="L2", sku="ID7777"),
+        ], adopt=True)
+        self.assertEqual(result["adopted"], 2,
+                         "every line seen must be claimed, matched or not")
+
+        # Now make both resolvable. They must still never deduct.
+        self.db.insert_manifest("ID7777", "Sneasel", "Base Set", "Near Mint",
+                                "Normal")
+        self.db.set_manifest_quantity("ID7777", 3)
+        later = sync_orders(self.db, [
+            line(item="L1", sku="ID7777"),
+            line(item="L2", sku="ID7777"),
+        ])
+        self.assertEqual(later["deducted"], 0)
+        self.assertEqual(self.held("ID7777"), 3,
+                         "adopted history must never deduct, ever")
+
+    def test_adoption_claims_a_cancelled_line_too(self):
+        sync_orders(self.db, [line(status=STATUS_CANCELED)], adopt=True)
+        row = self.db.get_recent_order_lines()[0]
+        self.assertIsNotNone(row["deducted_at"])
+
+    def test_adoption_still_reports_an_unmatched_sku(self):
+        # Claiming it silently would hide the thing worth investigating: a
+        # blank SKU on every order is a configuration problem, not a quiet
+        # week.
+        result = sync_orders(self.db, [line(sku="")], adopt=True)
+        self.assertEqual(result["unmatched"], 1)
 
     # -- the compliance boundary ------------------------------------------
 

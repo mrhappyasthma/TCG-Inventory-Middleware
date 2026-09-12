@@ -113,7 +113,8 @@ def sync_orders(
         record("INFO", "No order activity since the last poll.")
         return {
             "seen": 0, "adopted": 0, "deducted": 0, "deducted_cards": 0,
-            "already": 0, "unmatched": 0, "cancelled": 0, "decisions": [],
+            "already": 0, "unmatched": 0, "repeated_unmatched": 0,
+            "cancelled": 0, "decisions": [],
             "logs": logs,
         }
 
@@ -127,6 +128,7 @@ def sync_orders(
     adopted = 0
     already = 0
     unmatched = 0
+    repeated_unmatched = 0
     cancelled = 0
 
     for line in lines:
@@ -161,6 +163,28 @@ def sync_orders(
             "removed": 0,
         }
 
+        if adopt:
+            # Claimed *before* any check that could skip this line.
+            # An unmatched or cancelled line left unclaimed is a
+            # ninety-day-old sale lying in wait: catalogue a card under
+            # that id later, and the next poll deducts a sale from
+            # three months ago. The first version of this claimed only
+            # lines that would otherwise have deducted, which adopted
+            # nothing at all on a store whose SKUs did not match.
+            #
+            # Zero as the recorded quantity, because that is what was
+            # taken. The honest record is "seen, accounted for,
+            # nothing removed".
+            db.mark_order_line_deducted(
+                line["order_id"], line["line_item_id"], 0
+            )
+            adopted += 1
+            decision["outcome"] = "adopted"
+            if manifest_id is None and status in STANDING_STATUSES:
+                unmatched += 1
+            decisions.append(decision)
+            continue
+
         if status not in STANDING_STATUSES:
             cancelled += 1
             decision["outcome"] = "not_a_sale"
@@ -187,29 +211,30 @@ def sync_orders(
         if manifest_id is None:
             unmatched += 1
             decision["outcome"] = "no_such_card"
-            record("WARN", (
-                f"{line['order_id']}: sold SKU {sku or '(blank)'} matches no "
-                f"catalogued card, so no stock was deducted. It was either "
-                f"catalogued under another id or listed outside this "
-                f"application."
-            ))
+            # Named on the first sighting, tallied afterwards.
+            #
+            # An unmatched line is never claimed, so it comes back on
+            # every poll -- and at a poll every fifteen minutes, one
+            # naming itself each time is ninety-six identical lines a
+            # day. A real first poll produced forty-five of them in one
+            # go, which buried the summary that explained them. The
+            # tally at the end is what makes the count impossible to
+            # miss without the list being impossible to read.
+            if previous is None:
+                record("WARN", (
+                    f"{line['order_id']}: sold SKU "
+                    f"{sku or '(blank)'} matches no catalogued card, so "
+                    f"no stock was deducted. It was either catalogued "
+                    f"under another id or listed outside this "
+                    f"application."
+                ))
+            else:
+                repeated_unmatched += 1
             decisions.append(decision)
             continue
 
         if not quantity:
             decision["outcome"] = "zero_quantity"
-            decisions.append(decision)
-            continue
-
-        if adopt:
-            # Claimed so a later poll will not deduct it, with a recorded
-            # quantity of zero because that is what was taken: nothing. The
-            # honest record is "seen, accounted for, nothing removed".
-            db.mark_order_line_deducted(
-                line["order_id"], line["line_item_id"], 0
-            )
-            adopted += 1
-            decision["outcome"] = "adopted"
             decisions.append(decision)
             continue
 
@@ -255,6 +280,14 @@ def sync_orders(
             f"deducted."
         ))
     else:
+        if repeated_unmatched:
+            record("WARN", (
+                f"{repeated_unmatched} order line(s) still match no "
+                f"catalogued card and were reported on an earlier poll. "
+                f"They are listed on the Orders card and will keep "
+                f"coming back until the cards exist or the listings are "
+                f"linked."
+            ))
         level = "SUCCESS" if deducted else "INFO"
         record(level, (
             f"{len(lines)} order line(s) seen: {deducted} deducted "
@@ -269,6 +302,7 @@ def sync_orders(
         "deducted_cards": deducted_cards,
         "already": already,
         "unmatched": unmatched,
+        "repeated_unmatched": repeated_unmatched,
         "cancelled": cancelled,
         "decisions": decisions,
         "logs": logs,
