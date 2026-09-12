@@ -372,6 +372,12 @@ The drafts page therefore arrives at step 4, before any write risk exists.
 
 ## 10. Open questions
 
+* **Automating Module C** is the next piece, and it has its own file: see
+  `docs/orders-automation-design.md`. The headline is that the REST
+  Notification API has **no order topic**, so it is a poll rather than a
+  webhook -- and that the harder question is not the fetch but who owns a
+  quantity after a sale, since SortSwift's export replaces ours.
+
 * ~~**How to write to the existing File Exchange listings**~~ (§3a) — settled
   as **option 1, migration**, once the Inventory API path had proved itself on
   real listings it created itself. What changed the answer was that the second
