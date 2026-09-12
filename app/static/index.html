@@ -240,11 +240,11 @@
             <div class="flex items-center justify-between">
                 <div>
                     <h2 class="text-lg font-bold font-heading text-white tracking-tight">Data Conversion Pipeline</h2>
-                    <p class="text-xs text-slate-400">Drag & drop your CSV files to process sales, inventory batches, and store state syncs.</p>
+                    <p class="text-xs text-slate-400">Drag & drop your SortSwift export and your eBay orders report. eBay itself is written to through its API, from the Drafts tab.</p>
                 </div>
             </div>
 
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div id="pipelineGrid" class="grid grid-cols-1 md:grid-cols-3 gap-6">
 
                 <!-- Step 1: Process SortSwift Batch (Upstream) - Module A -->
                 <div class="glass-card relative p-5 rounded-2xl border border-slate-800/80 bg-dark-800/60 hover:border-slate-700/80 transition-all flex flex-col justify-between group">
@@ -354,8 +354,17 @@
                     </div>
                 </div>
 
-                <!-- Step 2: Sync Active eBay Inventory - Module B -->
-                <div class="glass-card relative p-5 rounded-2xl border border-slate-800/80 bg-dark-800/60 hover:border-slate-700/80 transition-all flex flex-col justify-between group">
+                <!--
+                    Step 2: Sync Active eBay Inventory - Module B.
+
+                    Hidden while an eBay account is connected, because the
+                    Feed API fetches the same report without anybody
+                    downloading one. It comes back if the connection goes
+                    away: the mirror is what every diff is computed against,
+                    so there has to be a way to populate it that does not
+                    depend on the API being reachable.
+                -->
+                <div id="moduleBCard" class="glass-card relative p-5 rounded-2xl border border-slate-800/80 bg-dark-800/60 hover:border-slate-700/80 transition-all flex flex-col justify-between group">
                     <div id="busySync" class="hidden absolute inset-0 z-20 rounded-2xl bg-dark-900/85 backdrop-blur-sm flex flex-col items-center justify-center gap-3 text-center px-5">
                         <svg class="w-8 h-8 animate-spin text-accent-emerald" fill="none" viewBox="0 0 24 24">
                             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"></circle>
@@ -387,10 +396,12 @@
                             slow or unhappy, and as the reference for checking
                             the automated path against.
                         -->
-                        <p id="syncAutomatedHint" class="hidden text-[11px] text-slate-500 mt-2 rounded-lg border border-slate-700/70 bg-dark-900/60 px-2.5 py-1.5">
-                            An eBay account is connected, so you can
-                            <button type="button" onclick="openEbayModal()" class="text-accent-cyan underline decoration-dotted hover:text-accent-emerald">sync without downloading anything</button>.
-                            Uploading still works, and is the way to cross-check that result.
+                        <p class="text-[11px] text-slate-400 mt-2 rounded-lg border border-amber-800/50 bg-amber-950/30 px-2.5 py-1.5">
+                            No eBay account is connected, so this upload is the
+                            only way to refresh the store mirror &mdash; and every
+                            draft is computed against it.
+                            <button type="button" onclick="openEbayModal()" class="text-accent-cyan underline decoration-dotted hover:text-accent-emerald">Connect one</button>
+                            and the same report is fetched for you.
                         </p>
 
                         <!-- Dropzone 3 -->
@@ -595,13 +606,26 @@
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <div>
                         <h2 class="text-lg font-bold font-heading text-white tracking-tight">eBay Listings</h2>
-                        <p class="text-xs text-slate-400">Your live listings as eBay sees them, rolled up from the store mirror. Populated by a Module B sync.</p>
+                        <p class="text-xs text-slate-400">Your live listings as eBay sees them, rolled up from the store mirror.</p>
                     </div>
-                    <button onclick="fetchEbayListings()" class="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-slate-200 transition-all self-start sm:self-auto" title="Refresh listings">
-                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                        </svg>
-                    </button>
+                    <div class="flex items-center gap-2 self-start sm:self-auto">
+                        <!--
+                            The real sync, not just a re-read of our own
+                            mirror. It lives here because this is where the
+                            mirror is displayed, and because Module B's
+                            upload card is hidden while an account is
+                            connected -- leaving the account menu as the
+                            only route to it, two clicks deep.
+                        -->
+                        <button id="btnListingsSync" onclick="syncFromEbay(this)" class="hidden text-xs font-semibold px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed" title="Fetch the Active Inventory report from eBay and update the store mirror. Reads only.">
+                            Sync from eBay
+                        </button>
+                        <button onclick="fetchEbayListings()" class="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-slate-200 transition-all" title="Re-read the table from our own records. Does not contact eBay.">
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                        </button>
+                    </div>
                 </div>
 
                 <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden bg-dark-800/40">
@@ -949,7 +973,7 @@
                     Seller Hub. This only reads &mdash; it updates what we believe eBay holds,
                     which is what makes a draft accurate.
                 </p>
-                <button id="btnEbaySync" onclick="syncFromEbay()" class="mt-3 text-xs font-semibold px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                <button id="btnEbaySync" onclick="syncFromEbay(this)" class="mt-3 text-xs font-semibold px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                     Sync from eBay
                 </button>
                 <div id="ebaySyncResult" class="hidden mt-3 rounded-xl border border-slate-700 bg-dark-900/60 p-3 text-[11px] text-slate-300 space-y-1"></div>

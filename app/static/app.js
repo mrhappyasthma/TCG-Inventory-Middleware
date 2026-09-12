@@ -2016,6 +2016,23 @@ function closeEbayModal() {
     document.getElementById("ebayModal").classList.add("hidden");
 }
 
+function setModuleBVisible(visible) {
+    const card = document.getElementById("moduleBCard");
+    const grid = document.getElementById("pipelineGrid");
+    if (card) card.classList.toggle("hidden", !visible);
+    if (grid) {
+        grid.classList.toggle("md:grid-cols-3", visible);
+        grid.classList.toggle("md:grid-cols-2", !visible);
+    }
+    // The capability does not go away with the card, so the automated
+    // sync appears on the Listings tab, where the mirror it refreshes is
+    // what you are looking at. Otherwise the only route to it is the
+    // account menu, two clicks deep.
+    document
+        .getElementById("btnListingsSync")
+        ?.classList.toggle("hidden", visible);
+}
+
 async function refreshEbayStatus() {
     const box = document.getElementById("ebayStatusBox");
     const connect = document.getElementById("btnEbayConnect");
@@ -2048,11 +2065,15 @@ async function refreshEbayStatus() {
             ? `<p class="text-amber-300 mt-1">${escapeHtml(data.misconfiguration)}</p>`
             : "";
 
-        // Module B's card points at the automated path once there is an
-        // account to use it with, without hiding the upload.
-        document
-            .getElementById("syncAutomatedHint")
-            ?.classList.toggle("hidden", !data.connected);
+        // Module B's manual upload is hidden once there is an account to
+        // fetch the same report automatically. It is not deleted: the
+        // store mirror is what every draft is computed against, so there
+        // has to be a way to populate it that does not depend on the API
+        // being reachable. Losing a connection brings it back.
+        //
+        // The grid drops to two columns with it, or the remaining two
+        // cards sit at a third of the width each with a hole beside them.
+        setModuleBVisible(!data.connected);
 
         connect.disabled = false;
         if (data.connected) {
@@ -2104,9 +2125,15 @@ async function connectEbayAccount() {
     }
 }
 
-async function syncFromEbay() {
-    const button = document.getElementById("btnEbaySync");
+async function syncFromEbay(trigger) {
+    // The trigger is passed in because this is reachable from two
+    // places: the eBay panel, and the Listings tab -- which is where it
+    // has to be reachable from, since Module B's card is hidden while an
+    // account is connected. Whichever button was pressed is the one that
+    // should show that it is working.
+    const button = trigger || document.getElementById("btnEbaySync");
     const box = document.getElementById("ebaySyncResult");
+    const label = button ? button.innerText : "Sync from eBay";
     if (button) {
         button.disabled = true;
         button.innerText = "Waiting for eBay…";
@@ -2154,7 +2181,7 @@ async function syncFromEbay() {
     } finally {
         if (button) {
             button.disabled = false;
-            button.innerText = "Sync from eBay";
+            button.innerText = label;
         }
     }
 }

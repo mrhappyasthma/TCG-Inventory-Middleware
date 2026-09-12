@@ -154,6 +154,47 @@ class JavaScriptParsesTests(unittest.TestCase):
             + "\n  ".join(str(p) for p in problems),
         )
 
+    def test_module_b_defaults_to_visible_and_the_sync_has_a_home(self):
+        """
+        Hiding Module B must not hide the capability, or lose the fallback.
+
+        The manual Active Listings upload is hidden while an eBay account is
+        connected, because the Feed API fetches the same report. Two things
+        have to hold for that to be safe.
+
+        It must default to **visible** in the markup. The card is hidden by
+        ``refreshEbayStatus``, which is an async call; if the element were
+        hardcoded hidden, a deployment with no eBay integration -- or one
+        where that call fails -- would have no way to populate the store
+        mirror at all, and every draft is computed against the mirror.
+
+        And the automated sync has to be reachable from the page rather than
+        only from the account menu, so the Listings tab carries it.
+        """
+        html = self.source("index.html")
+        js = self.source("app.js")
+
+        card = re.search(r'<div id="moduleBCard"([^>]*)>', html)
+        self.assertIsNotNone(card, "moduleBCard is missing from index.html")
+        classes = card.group(1)
+        self.assertNotIn(
+            "hidden", classes,
+            "Module B must start visible: it is the only way to populate the "
+            "store mirror without a working eBay connection",
+        )
+        self.assertIn("setModuleBVisible(!data.connected)", js)
+
+        # The grid has to collapse with it, or two cards sit at a third of the
+        # width with a hole beside them.
+        self.assertIn('id="pipelineGrid"', html)
+        self.assertIn("md:grid-cols-2", js)
+
+        # And the real sync -- not just a re-read of our own records -- is on
+        # the Listings tab, shown exactly when the upload card is not.
+        self.assertIn('id="btnListingsSync"', html)
+        self.assertIn('onclick="syncFromEbay(this)"', html)
+        self.assertIn('.getElementById("btnListingsSync")', js)
+
     def test_no_inline_handler_interpolates_a_quoted_json_string(self):
         """
         An inline handler attribute must not contain JSON.stringify.
