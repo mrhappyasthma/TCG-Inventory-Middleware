@@ -19,7 +19,7 @@ happens to be imported first.
 import os
 import sys
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from fastapi import HTTPException, Request, UploadFile
 
@@ -284,6 +284,25 @@ def owner_inventory() -> Database:
     owner = user_db.get_owner_user_id()
     return db if owner is None else inventory_for(owner)
 
+
+def record_logs(
+    inv: Database, logs: Sequence[Dict[str, str]], source: str
+) -> None:
+    """
+    Persist a pipeline's console lines, never at the cost of the work.
+
+    The console is the only record of what an unattended job did, and until
+    this existed it lived in the browser tab that happened to be open. But a
+    log that can fail the operation it describes is worse than no log, so
+    every error here is swallowed after being printed.
+    """
+    if not logs:
+        return
+    try:
+        with inv.session():
+            inv.record_log_entries(logs, source=source)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[log] could not record the {source} log: {exc}", flush=True)
 
 # -- request dependencies ---------------------------------------------------
 

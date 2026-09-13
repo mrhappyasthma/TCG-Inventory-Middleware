@@ -35,6 +35,7 @@ from app import main  # noqa: E402
 from app.main import app, db, user_db  # noqa: E402
 from app import deps  # noqa: E402
 from app.routes import ebay as ebay_routes  # noqa: E402
+from app.routes import orders as orders_routes  # noqa: E402
 
 # A SortSwift export row, reused so the duplicate-batch guard can be exercised.
 BATCH_CSV = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
@@ -1879,7 +1880,7 @@ class TestWebApp(unittest.TestCase):
         read.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        before = db.get_listing_setting(main.ORDER_WATERMARK_SETTING, "")
+        before = db.get_listing_setting(orders_routes.ORDER_WATERMARK_SETTING, "")
 
         # A connected client whose order read fails part-way.
         class _Oauth:
@@ -1890,12 +1891,12 @@ class TestWebApp(unittest.TestCase):
             oauth = _Oauth()
             seller = object()
 
-        with mock.patch.object(deps, "get_ebay_client", return_value=_Client()),              mock.patch.object(main, "get_orders",
-                               side_effect=main.OrderPageError("truncated")):
+        with mock.patch.object(deps, "get_ebay_client", return_value=_Client()),              mock.patch.object(deps, "get_orders",
+                               side_effect=orders_routes.OrderPageError("truncated")):
             res = self.client.post("/api/orders/poll")
         self.assertEqual(res.status_code, 409)
         self.assertEqual(
-            db.get_listing_setting(main.ORDER_WATERMARK_SETTING, ""), before,
+            db.get_listing_setting(orders_routes.ORDER_WATERMARK_SETTING, ""), before,
             "a failed poll must leave the watermark alone",
         )
 
@@ -1907,7 +1908,7 @@ class TestWebApp(unittest.TestCase):
         re-adopting the same history instead of deducting new sales.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        db.set_listing_settings({main.ORDER_WATERMARK_SETTING: ""},
+        db.set_listing_settings({orders_routes.ORDER_WATERMARK_SETTING: ""},
                                 user_id=main.SHARED_SCOPE)
         db.insert_manifest("ID9200", "Sneasel", "Unified Minds", "Near Mint",
                            "Holofoil", card_number="032/236")
@@ -1932,7 +1933,7 @@ class TestWebApp(unittest.TestCase):
 
         try:
             with mock.patch.object(deps, "get_ebay_client",
-                                   return_value=_Client()),                  mock.patch.object(main, "get_orders", return_value=[order]):
+                                   return_value=_Client()),                  mock.patch.object(deps, "get_orders", return_value=[order]):
                 first = self.client.post("/api/orders/poll")
                 self.assertEqual(first.status_code, 200, first.text)
                 body = first.json()
@@ -1944,7 +1945,7 @@ class TestWebApp(unittest.TestCase):
                     "a first poll must not deduct history",
                 )
                 self.assertTrue(
-                    db.get_listing_setting(main.ORDER_WATERMARK_SETTING, ""),
+                    db.get_listing_setting(orders_routes.ORDER_WATERMARK_SETTING, ""),
                     "the watermark must advance, or history is re-adopted",
                 )
 
@@ -1953,7 +1954,7 @@ class TestWebApp(unittest.TestCase):
                 second_order["lineItems"] = [
                     {"lineItemId": "B1", "sku": "ID9200", "quantity": 1}
                 ]
-                with mock.patch.object(main, "get_orders",
+                with mock.patch.object(deps, "get_orders",
                                        return_value=[second_order]):
                     second = self.client.post("/api/orders/poll")
                 self.assertEqual(second.status_code, 200, second.text)
