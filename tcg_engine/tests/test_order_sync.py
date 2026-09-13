@@ -254,6 +254,37 @@ class OrderSyncTests(unittest.TestCase):
             "somebody else's sale must not warn",
         )
 
+    def test_a_sold_line_carries_everything_needed_to_go_and_find_the_card(self):
+        """
+        The sold list has to answer "where do I get it from".
+
+        eBay's packing slip carries a bin only for listings old enough to
+        have it baked into their SKU; anything listed through the API shows
+        the bare manifest id, because a variation's SKU cannot be renamed
+        after the fact. So for most of the store this is the only place the
+        bin appears, and a sold list without it means searching the catalogue
+        by hand for every order.
+        """
+        self.db.set_manifest_remarks("ID1001", "Bin A-12")
+        sync_orders(self.db, [line(quantity=1)])
+
+        row = self.db.get_recent_order_lines(matched_only=True)[0]
+        self.assertEqual(row["remarks"], "Bin A-12")
+        # And enough to identify the card in the box once you are at it.
+        self.assertEqual(row["product_name"], "Charizard")
+        self.assertEqual(row["card_number"], "004/102")
+        self.assertEqual(row["condition"], "Near Mint")
+        self.assertEqual(row["printing"], "Holofoil")
+
+    def test_a_card_with_no_bin_reports_an_empty_one_rather_than_nothing(self):
+        """
+        The page states "no bin" explicitly, so it needs a value it can tell
+        apart from a column that was never selected.
+        """
+        sync_orders(self.db, [line(quantity=1)])
+        row = self.db.get_recent_order_lines(matched_only=True)[0]
+        self.assertEqual(row["remarks"], "")
+
     def test_a_foreign_sale_is_never_reconsidered(self):
         # Terminal: there is no future in which it becomes deductible, so
         # leaving it unclaimed would mean re-deciding it every fifteen

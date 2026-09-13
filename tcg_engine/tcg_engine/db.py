@@ -2582,7 +2582,16 @@ class Database:
             cursor.execute(
                 f"""
                 SELECT o.*, m.product_name, m.set_name, m.condition,
-                       m.card_number, m.quantity AS catalogued_qty
+                       m.card_number, m.printing,
+                       m.quantity AS catalogued_qty,
+                       -- Where the card physically is. The whole point of a
+                       -- sold list is "go and get this one", and a name
+                       -- without a bin means searching the catalogue by hand
+                       -- for every order. eBay's packing slip only carries a
+                       -- bin for listings old enough to have it baked into
+                       -- their SKU, so for anything listed through the API
+                       -- this is the only place it appears.
+                       COALESCE(m.remarks, '') AS remarks
                 FROM ebay_order_line o
                 LEFT JOIN manifest m ON m.manifest_id = o.manifest_id
                 {clause}

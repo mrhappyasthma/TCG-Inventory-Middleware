@@ -816,6 +816,32 @@ be the only signal buys latency, not correctness.
 * **It only ever reads.** No fulfillment is created, nothing is marked
   shipped, no refund is issued.
 
+### Where to get the card from
+
+Each row under **Cards sold** is a pick line, not a log entry. It carries the
+card, its number, set, condition and printing — enough to pick the right copy
+out of a box of near-identical ones — and, in green, **the bin**.
+
+| What you have | Where the bin comes from |
+|---|---|
+| The **dashboard**, for any sale of a catalogued card | The `Bin / Remark` column, shown on the sold row. Always current, and [editable by hand](#editing-a-bin-by-hand). |
+| eBay's **packing slip**, for a listing created in the File Exchange era | Baked into the SKU when the listing was created: `ID1074-Bin_A-12`. Frozen at that value forever — [the SKU cannot be renamed](#-a-variations-sku-cannot-be-renamed) — so if the card has moved since, the slip is wrong and the dashboard is right. |
+| eBay's **packing slip**, for a listing created through the API | Nothing. The SKU is the bare manifest id, e.g. `ID1074`. |
+
+So the packing slip alone is not enough, which is why the manifest id appears
+on each sold row: it is what the slip prints, and it is how a slip in your
+hand matches a row on screen.
+
+A card with no bin recorded says **no bin** rather than showing a gap, because
+"go to A-12" and "you will have to hunt for this one" are different
+instructions and an empty space states neither.
+
+> **Not yet decided**: whether *newly* created listings should carry the bin
+> in their SKU, so the packing slip answers this without the dashboard. It
+> would help, but the SKU is immutable once set, so a card that later moved
+> would have a slip that lied — and the bin is now editable, which makes that
+> more likely, not less. `docs/ebay-api-design.md` §10.
+
 ### No buyer data is kept, ever
 
 `getOrders` returns the buyer's username, registration address, and a `shipTo`
@@ -824,8 +850,9 @@ persisted**, in either database — which is what this application's
 account-deletion exemption rests on.
 
 That is enforced rather than intended. The projection in `app/ebay_orders.py`
-is a **keep-list of six named fields** (`order_id`, `line_item_id`, `sku`,
-`quantity`, `sold_at`, `status`), built by reading those values out by name —
+is a **keep-list of seven named fields** (`order_id`, `line_item_id`, `sku`,
+`legacy_item_id`, `quantity`, `sold_at`, `status`), built by reading those
+values out by name —
 never by copying an order and deleting what is unwanted, because a delete-list
 silently admits whatever eBay adds next. `order_sync` then refuses any line
 whose keys are not exactly those six, so a mistake fails at the boundary

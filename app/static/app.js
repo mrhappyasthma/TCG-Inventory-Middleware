@@ -659,6 +659,12 @@ async function loadOrderPoll() {
         // Sales of catalogued cards only. Everything else is a number below,
         // because it is almost all ordinary business and a list of it reads
         // like a page of problems.
+        //
+        // Written as a pick list rather than a log, because the question this
+        // answers is "something sold, where do I go and get it". So the bin
+        // is the loud element, and the manifest id is shown because that is
+        // what eBay prints on the packing slip for anything listed through
+        // the API -- it is how a slip in your hand matches a row here.
         const lines = data.lines || [];
         box.innerHTML = lines.length
             ? lines.map(l => {
@@ -666,10 +672,29 @@ async function loadOrderPoll() {
                 const moved = l.deducted_at
                     ? `&minus;${l.deducted_qty}`
                     : "pending";
-                return `<div class="flex items-center gap-2 text-[11px] ${trouble ? "text-amber-200" : "text-slate-300"}">
-                    <span class="font-mono text-slate-600 shrink-0">${escapeHtml(String(l.order_id).slice(-8))}</span>
-                    <span class="truncate">${escapeHtml(l.product_name || l.manifest_id || l.sku)}</span>
-                    <span class="ml-auto font-mono shrink-0">${trouble ? escapeHtml(l.status.toLowerCase()) : moved}</span>
+                const name = l.product_name || l.manifest_id || l.sku || "(unknown)";
+                const number = l.card_number ? ` #${l.card_number}` : "";
+                const detail = [l.set_name, l.condition, l.printing]
+                    .map(v => String(v || "").trim())
+                    .filter(Boolean)
+                    .join(" \u00b7 ");
+                const bin = String(l.remarks || "").trim();
+                // An absent bin is stated rather than left blank: it is the
+                // difference between "go to A-12" and "you will have to hunt
+                // for this one", and a gap says neither.
+                const binChip = bin
+                    ? `<span class="px-1.5 py-0.5 rounded font-mono text-[10px] bg-emerald-950/70 text-emerald-200 border border-emerald-800/60">${escapeHtml(bin)}</span>`
+                    : `<span class="px-1.5 py-0.5 rounded text-[10px] text-slate-500 border border-dashed border-slate-700">no bin</span>`;
+                return `<div class="px-2 py-1.5 rounded-lg bg-dark-900/50 border border-slate-800">
+                    <div class="flex items-baseline gap-2 text-[11px] ${trouble ? "text-amber-200" : "text-slate-200"}">
+                        <span class="truncate font-medium">${escapeHtml(name + number)}</span>
+                        <span class="ml-auto font-mono shrink-0">${trouble ? escapeHtml(String(l.status).toLowerCase()) : moved}</span>
+                    </div>
+                    <div class="flex items-center gap-2 mt-1 text-[10px] text-slate-500">
+                        ${binChip}
+                        <span class="truncate">${escapeHtml(detail)}</span>
+                        <span class="ml-auto font-mono shrink-0 text-slate-600">${escapeHtml(l.manifest_id || l.sku || "")}</span>
+                    </div>
                 </div>`;
               }).join("")
             : `<p class="text-[11px] text-slate-500">No catalogued card has sold yet.</p>`;
