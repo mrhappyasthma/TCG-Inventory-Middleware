@@ -1,14 +1,5 @@
 import os
-import sys
-import io
-import csv
 import mimetypes
-# The OAuth callback renders eBay's own error text into a small HTML page.
-# That text arrives in a query string, so it is attacker-controlled for anyone
-# who can get a person to click a link -- it must be escaped.
-import time
-from datetime import datetime
-from typing import List
 
 # Importing app.deps first is load-bearing, not stylistic: it puts the
 # project root on sys.path and loads .env, and `auth` reads GOOGLE_CLIENT_ID
@@ -20,10 +11,7 @@ except ImportError:
 
 from fastapi import (
     FastAPI,
-    File,
     Request,
-    Response,
-    status,
 )
 from fastapi.staticfiles import StaticFiles
 
@@ -60,118 +48,18 @@ except ImportError:
 
 
 
+# `main` imports only what `main` uses. The shared runtime is not
+# re-exported here: a second name for one object is what let a mock
+# applied to this module miss the code actually under test, twice, while
+# the suite reported success. Reach it through `app.deps`.
 try:
-    from app import deps
-    from app.auth import (
-        create_jwt_token,
-        decode_jwt_token,
-        set_session_cookie,
-        verify_google_id_token,
-        GOOGLE_CLIENT_ID,
-    )
-    from app.deps import (
-        DATABASE_URL,
-        static_dir,
-        record_logs,
-        EBAY_CLIENT_AVAILABLE,
-        EbayClient,
-        EbayConfig,
-        EbayError,
-        FeedError,
-        InventoryApiAdapter,
-        ORDER_HISTORY_DAYS,
-        OrderPageError,
-        SIGNATURE_HEADER,
-        SignatureError,
-        TokenStore,
-        _ebay_clients,
-        challenge_response,
-        create_inventory_location,
-        download_active_inventory_report,
-        get_ebay_client,
-        get_inventory_locations,
-        get_orders,
-        get_policies,
-        payload_topic,
-        project_order_lines,
-        report_outline,
-        suggest_policy_ids,
-        verify_signature,
-        MAX_UPLOAD_BYTES,
-        USER_DATABASE_URL,
-        _inventories,
-        _owner_scope,
-        auth_manager,
-        db,
-        get_current_user,
-        inventory_for,
-        inventory_path_for,
-        owner_inventory,
-        read_upload_limited,
-        require_active_user,
-        require_admin_user,
-        user_db,
-    )
+    from app.deps import static_dir
 except ImportError:
-    from . import deps
-    from .auth import (
-        create_jwt_token,
-        decode_jwt_token,
-        set_session_cookie,
-        verify_google_id_token,
-        GOOGLE_CLIENT_ID,
-    )
-    from .deps import (
-        DATABASE_URL,
-        static_dir,
-        record_logs,
-        EBAY_CLIENT_AVAILABLE,
-        EbayClient,
-        EbayConfig,
-        EbayError,
-        FeedError,
-        InventoryApiAdapter,
-        ORDER_HISTORY_DAYS,
-        OrderPageError,
-        SIGNATURE_HEADER,
-        SignatureError,
-        TokenStore,
-        _ebay_clients,
-        challenge_response,
-        create_inventory_location,
-        download_active_inventory_report,
-        get_ebay_client,
-        get_inventory_locations,
-        get_orders,
-        get_policies,
-        payload_topic,
-        project_order_lines,
-        report_outline,
-        suggest_policy_ids,
-        verify_signature,
-        MAX_UPLOAD_BYTES,
-        USER_DATABASE_URL,
-        _inventories,
-        _owner_scope,
-        auth_manager,
-        db,
-        get_current_user,
-        inventory_for,
-        inventory_path_for,
-        owner_inventory,
-        read_upload_limited,
-        require_active_user,
-        require_admin_user,
-        user_db,
-    )
+    from .deps import static_dir
+
 
 PORT = int(os.environ.get("PORT", 8080))
 
-# The eBay integration is optional: with these unset the app is exactly the
-# CSV tool it has always been, and every eBay control is simply absent. The
-# client is built lazily and cached, because its PublicKeyCache must outlive a
-# single request -- refetching eBay's verification key per notification is
-# what their documentation warns will exhaust the call quota.
 # Read independently of the rest of the eBay configuration, because the
 # endpoint challenge needs only this and the endpoint URL. That ordering is
 # not hypothetical: eBay disables a new keyset until the deletion endpoint
@@ -252,11 +140,6 @@ app.include_router(system_routes.router)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
-# An upload is read into memory before parsing, so without a ceiling a single
-# request can exhaust the container's RAM. Generous enough for any real
-# SortSwift or eBay export; a 50,000-row dump is a few megabytes.
-
-
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     """
@@ -294,111 +177,6 @@ async def security_headers(request: Request, call_next):
     return response
 
 
-# Pydantic Schemas
-# The longest bin/remark accepted from the dashboard. A shelf label, not a
-# field for prose: an unbounded string here would reach the inventory table
-# and the packing-slip column and wreck both.
-# ---------------------------------------------------------
-# AUTHENTICATION ENDPOINTS
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# ADMIN USER MANAGEMENT ENDPOINTS
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# CORE BUSINESS LOGIC / PROCESSING ENDPOINTS
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# PRICING RULES API ENDPOINTS
-# ---------------------------------------------------------
-
-# How often the background refresh runs, and whether it runs at all. TCGCSV
-# publishes once a day and asks for at most one sync per 24 hours, so anything
-# under that is wasted requests against a service that asks us not to.
-# The console shows this many lines; the dialog pages back through the rest.
-# ---------------------------------------------------------
-# LISTING & VARIATION SETTINGS API ENDPOINTS
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# INVENTORY & CATALOG API ENDPOINTS
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# DATABASE BACKUP / RESTORE
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# HEALTH CHECK
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# FRONTEND HTML ROUTE
-# ---------------------------------------------------------
-
-# -------------------------------------------------------------------
-# Connecting the eBay account
-# -------------------------------------------------------------------
-#
-# One connection for the whole deployment, and an administrative one. There is
-# a single eBay store behind this application and the inventory it manages is
-# shared rather than per-user, so letting two users each connect a different
-# account would make it ambiguous which store a push targets. Pricing rules
-# are per-user because they are preferences; the store connection is
-# infrastructure, like backup and restore.
-
-# How long a consent attempt may sit unfinished. Long enough to read eBay's
-# screen, short enough that a stale link in someone's history is useless.
-
-
-# -------------------------------------------------------------------
-# eBay marketplace account deletion notifications
-# -------------------------------------------------------------------
-#
-# Required by eBay before a keyset will function at all: a developer must
-# either receive these notifications or hold an exemption. Two distinct
-# mechanisms live on the one URL, which is eBay's design, not ours.
-#
-#   GET  - a one-time challenge when eBay validates the endpoint. Answer with
-#          the SHA-256 of the challenge code, our verification token and the
-#          endpoint URL, in that order.
-#   POST - a real notification, signed. Verify it or answer 412.
-#
-# Both are necessarily unauthenticated: eBay has no session with us. The GET
-# discloses only a hash, and the POST is refused unless eBay signed it.
-
-
-# -------------------------------------------------------------------
-# Draft plans: staging for every eBay-bound change
-# -------------------------------------------------------------------
-
-
-# -------------------------------------------------------------------
-# Push jobs
-# -------------------------------------------------------------------
-#
-# A push is long: creating a hundred-card listing is a dozen eBay calls, and a
-# whole plan is several listings of that. Held open as one HTTP request it
-# outlasts the reverse proxy, which answers the browser with its own error page
-# while the push carries on regardless -- and the page, having lost its
-# request, also loses any idea that a push is happening. Switching tabs and
-# back showed nothing in progress.
-#
-# So the request starts a job and returns immediately, and the page follows it
-# by polling. That makes the two problems the same problem, and the fix is that
-# progress lives on the server rather than in one browser request.
-#
-# Deliberately in memory. A job is a few minutes of transient state, and the
-# durable record of what happened is the plan itself -- each card's status and
-# reason are written as eBay answers, which is what a restart or a closed
-# laptop has to be able to rely on. A vanished job is reported as unknown
-# rather than as a failure, because the push it described may well have
-# finished.
-# Finished jobs are kept long enough for a reload to collect the result.
-# Assets whose URLs get a content hash appended, so the browser is forced to
-# fetch the version that belongs with the HTML it just received.
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, reload=True)

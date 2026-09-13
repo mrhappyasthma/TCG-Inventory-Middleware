@@ -56,6 +56,9 @@ except ImportError:
         require_admin_user,
     )
 
+# The longest bin/remark accepted from the dashboard. A shelf label, not a
+# field for prose: an unbounded string here would reach the inventory table
+# and the packing-slip column and wreck both.
 REMARK_MAX_LENGTH = 60
 
 def _csv_safe(value: Any) -> Any:

@@ -66,9 +66,17 @@ router = APIRouter()
 EBAY_NOTIFICATION_ENDPOINT = os.environ.get(
     "EBAY_NOTIFICATION_ENDPOINT", ""
 ).strip()
+# Read independently of the rest of the eBay configuration, because the
+# endpoint challenge needs only this and the endpoint URL. That ordering is
+# not hypothetical: eBay disables a new keyset until the deletion endpoint
+# validates, and the RuName is registered later still -- so requiring a
+# complete credential set to answer the challenge would deadlock the very
+# bootstrap the challenge exists to unblock.
 EBAY_VERIFICATION_TOKEN = os.environ.get(
     "EBAY_VERIFICATION_TOKEN", ""
 ).strip()
+# How long a consent attempt may sit unfinished. Long enough to read eBay's
+# screen, short enough that a stale link in someone's history is useless.
 EBAY_OAUTH_STATE_TTL_SECONDS = 600
 
 
@@ -444,6 +452,16 @@ async def ebay_create_inventory_location(
     print(f"[ebay] inventory location {key} created", flush=True)
     return {"success": True, "merchant_location_key": key}
 
+# Two distinct mechanisms live on this one URL, which is eBay's design
+# rather than ours:
+#
+#   GET  - a one-time challenge when eBay validates the endpoint. Answer with
+#          the SHA-256 of the challenge code, our verification token and the
+#          endpoint URL, in that order.
+#   POST - a real notification, signed. Verify it or answer 412.
+#
+# Both are necessarily unauthenticated: eBay has no session with us. The GET
+# discloses only a hash, and the POST is refused unless eBay signed it.
 @router.get("/api/ebay/notifications")
 def ebay_notification_challenge(challenge_code: str = ""):
     """

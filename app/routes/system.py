@@ -51,6 +51,8 @@ except ImportError:
 router = APIRouter()
 
 
+# The console shows this many lines; the dialog pages back through the
+# rest.
 CONSOLE_RECENT_LINES = 200
 
 CONSOLE_PAGE_LINES = 500
@@ -123,6 +125,8 @@ def health_check():
             content={"status": "degraded", "database": "unreachable"},
         )
 
+# Assets whose URLs get a content hash appended, so the browser is forced to
+# fetch the version that belongs with the HTML it just received.
 VERSIONED_ASSETS = ("/static/app.js", "/static/style.css")
 
 def _asset_version(url_path: str) -> str:

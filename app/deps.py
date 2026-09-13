@@ -139,6 +139,18 @@ except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
     get_policies = None
     suggest_policy_ids = None
 
+# One eBay client per account, because each account links its own store.
+#
+# eBay's model is what makes this cheap: the **application** holds one set of
+# credentials -- App ID, Cert ID and RuName -- and each seller grants that
+# application access to their own account, which yields a refresh token per
+# seller. So there is nothing extra to register with eBay and no new keys to
+# obtain; the same `EbayConfig.from_env()` serves everybody. What differs per
+# account is only the token, and therefore only the store.
+#
+# Each is built lazily and then kept, because its PublicKeyCache must outlive
+# a single request -- refetching eBay's verification key per notification is
+# what their documentation warns will exhaust the call quota.
 _ebay_clients: Dict[int, Any] = {}
 
 _ebay_client_lock = threading.Lock()
@@ -204,8 +216,9 @@ USER_DATABASE_URL = os.environ.get("USER_DATABASE_URL", "data/users.db")
 # here rather than one each.
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 
-# Every CSV endpoint reads the body into memory, so an unbounded upload is a
-# way to exhaust the container's RAM.
+# An upload is read into memory before parsing, so without a ceiling a single
+# request can exhaust the container's RAM. Generous enough for any real
+# SortSwift or eBay export; a 50,000-row dump is a few megabytes.
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 
 # `db` is the **deployment owner's** inventory. It keeps the historic path,

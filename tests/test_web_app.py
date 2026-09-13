@@ -32,8 +32,10 @@ os.environ["EBAY_VERIFICATION_TOKEN"] = "t" * 40
 os.environ["EBAY_NOTIFICATION_ENDPOINT"] = "https://cards.example.com/api/ebay/notifications"
 
 from app import main  # noqa: E402
-from app.main import app, db, user_db  # noqa: E402
+from app.main import app  # noqa: E402
+from app.deps import db, user_db  # noqa: E402
 from tcg_engine.db import SHARED_SCOPE  # noqa: E402
+from app import auth  # noqa: E402
 from app import deps  # noqa: E402
 from app.routes import ebay as ebay_routes  # noqa: E402
 from app.routes import orders as orders_routes  # noqa: E402
@@ -674,7 +676,7 @@ class TestWebApp(unittest.TestCase):
         Every CSV endpoint reads the body into memory, so an unbounded upload
         is a one-request memory exhaustion.
         """
-        from app.main import MAX_UPLOAD_BYTES
+        from app.deps import MAX_UPLOAD_BYTES
 
         oversized = b"a,b,c" + b"x" * (MAX_UPLOAD_BYTES + 1024)
         for path in ("/api/process/batch", "/api/process/sync"):
@@ -713,7 +715,7 @@ class TestWebApp(unittest.TestCase):
         """
         from unittest.mock import patch
 
-        with patch("app.main.db.get_stats",
+        with patch("app.deps.db.get_stats",
                    side_effect=RuntimeError(
                        "unable to open database file /volume1/docker/secret.db")):
             res = self.client.get("/api/health")
@@ -1093,7 +1095,7 @@ class TestWebApp(unittest.TestCase):
             ).encode()
         ).decode()
 
-        client = deps.get_ebay_client(main._owner_scope())
+        client = deps.get_ebay_client(deps._owner_scope())
         self.assertIsNotNone(client, "eBay env vars should make a client available")
         original = client.public_keys
         client.public_keys = PublicKeyCache(lambda _kid: pem)
@@ -1417,7 +1419,7 @@ class TestWebApp(unittest.TestCase):
         believing it was their own.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        owner_id = main._owner_scope()
+        owner_id = deps._owner_scope()
         user_db.save_ebay_token(
             owner_id, {"refresh_token": "owner-rt"}, connected_by=owner_id
         )
@@ -1446,7 +1448,7 @@ class TestWebApp(unittest.TestCase):
                 "disconnecting one account cleared another's token",
             )
         finally:
-            user_db.save_ebay_token(main._owner_scope(), None)
+            user_db.save_ebay_token(deps._owner_scope(), None)
         # But a non-admin may still see whether eBay is connected.
         self.assertEqual(second.get("/api/ebay/status").status_code, 200)
 
@@ -1459,7 +1461,7 @@ class TestWebApp(unittest.TestCase):
         self.assertIn("client_id=test-ebay-client-id", url)
 
         state = url.split("state=")[1].split("&")[0]
-        claims = main.decode_jwt_token(state)
+        claims = auth.decode_jwt_token(state)
         self.assertEqual(claims["purpose"], "ebay_oauth")
         self.assertIsNotNone(claims.get("user_id"))
 
@@ -1477,7 +1479,7 @@ class TestWebApp(unittest.TestCase):
                 "wrong purpose",
                 {
                     "code": "abc",
-                    "state": main.create_jwt_token({"purpose": "session"}),
+                    "state": auth.create_jwt_token({"purpose": "session"}),
                 },
             ),
         ):
@@ -1507,7 +1509,7 @@ class TestWebApp(unittest.TestCase):
         url = self.client.post("/api/ebay/connect").json()["authorization_url"]
         state = url.split("state=")[1].split("&")[0]
 
-        client = deps.get_ebay_client(main._owner_scope())
+        client = deps.get_ebay_client(deps._owner_scope())
         original_opener = client.oauth._opener
 
         def fake_opener(method, target, headers, body, timeout):
@@ -1534,11 +1536,11 @@ class TestWebApp(unittest.TestCase):
             self.assertEqual(res.status_code, 200, res.text)
             self.assertIn("connected", res.text)
 
-            stored = user_db.get_ebay_token(main._owner_scope())
+            stored = user_db.get_ebay_token(deps._owner_scope())
             self.assertEqual(stored["refresh_token"], "rt-from-consent")
             # The connection records who authorised it: approval to write to a
             # live storefront should not be anonymous.
-            meta = user_db.get_ebay_connection_meta(main._owner_scope())
+            meta = user_db.get_ebay_connection_meta(deps._owner_scope())
             self.assertEqual(meta["username"], "Admin User")
 
             self.assertTrue(self.client.get("/api/ebay/status").json()["connected"])
@@ -1579,7 +1581,7 @@ class TestWebApp(unittest.TestCase):
         # rather than a hand-written CSV that might not match it.
         csv_text = records_to_csv(parse_active_inventory_report(report_xml))
 
-        user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
+        user_db.save_ebay_token(deps._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
         try:
             with mock.patch.object(
                 deps,
@@ -1604,7 +1606,7 @@ class TestWebApp(unittest.TestCase):
             self.assertEqual(variation["last_known_qty"], 5)
             self.assertAlmostEqual(variation["last_known_price"], 3.75)
         finally:
-            user_db.save_ebay_token(main._owner_scope(), None)
+            user_db.save_ebay_token(deps._owner_scope(), None)
             db.delete_manifest("ID4001")
 
     def test_45c_a_report_that_matches_nothing_never_zeroes_the_mirror(self):
@@ -1620,7 +1622,7 @@ class TestWebApp(unittest.TestCase):
         db.insert_manifest("ID4002", "Heracross", "Chilling Reign", "NM", "Normal")
         db.upsert_variation("ID4002", "227511361186", 3, custom_label="ID4002-Bin_B01")
 
-        user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
+        user_db.save_ebay_token(deps._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
         try:
             with mock.patch.object(
                 deps,
@@ -1643,7 +1645,7 @@ class TestWebApp(unittest.TestCase):
             # Untouched, which is the entire point.
             self.assertEqual(db.get_variation("ID4002")["last_known_qty"], 3)
         finally:
-            user_db.save_ebay_token(main._owner_scope(), None)
+            user_db.save_ebay_token(deps._owner_scope(), None)
             db.delete_manifest("ID4002")
 
     def test_46_disconnecting_forgets_the_token(self):
@@ -1651,7 +1653,7 @@ class TestWebApp(unittest.TestCase):
         res = self.client.post("/api/ebay/disconnect")
         self.assertEqual(res.status_code, 200)
         self.assertFalse(res.json()["connected"])
-        self.assertIsNone(user_db.get_ebay_token(main._owner_scope()))
+        self.assertIsNone(user_db.get_ebay_token(deps._owner_scope()))
         self.assertFalse(self.client.get("/api/ebay/status").json()["connected"])
 
     def test_47_the_token_survives_an_inventory_restore(self):
@@ -1663,7 +1665,7 @@ class TestWebApp(unittest.TestCase):
         the refresh token is the only credential here that cannot be recreated
         without an interactive re-consent.
         """
-        user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "survivor"}, connected_by=1)
+        user_db.save_ebay_token(deps._owner_scope(), {"refresh_token": "survivor"}, connected_by=1)
         try:
             with db.get_connection() as conn:
                 tables = {
@@ -1673,9 +1675,9 @@ class TestWebApp(unittest.TestCase):
                     )
                 }
             self.assertNotIn("ebay_connection", tables)
-            self.assertEqual(user_db.get_ebay_token(main._owner_scope())["refresh_token"], "survivor")
+            self.assertEqual(user_db.get_ebay_token(deps._owner_scope())["refresh_token"], "survivor")
         finally:
-            user_db.save_ebay_token(main._owner_scope(), None)
+            user_db.save_ebay_token(deps._owner_scope(), None)
 
     # -- orders -------------------------------------------------------------
 
@@ -2368,23 +2370,23 @@ class TestWebApp(unittest.TestCase):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         owner_id = user_db.get_owner_user_id()
         self.assertIsNotNone(owner_id)
-        self.assertEqual(main.inventory_path_for(owner_id), main.DATABASE_URL)
-        self.assertIs(main.inventory_for(owner_id), main.db)
-        self.assertIs(main.owner_inventory(), main.db)
+        self.assertEqual(deps.inventory_path_for(owner_id), deps.DATABASE_URL)
+        self.assertIs(deps.inventory_for(owner_id), deps.db)
+        self.assertIs(deps.owner_inventory(), deps.db)
 
     def test_58c_another_account_gets_a_sibling_file_not_the_owners(self):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         second = self.signed_in_second_user()
         second_id = user_db.get_user_by_google_sub("google-sub-second")["id"]
-        path = main.inventory_path_for(second_id)
-        self.assertNotEqual(path, main.DATABASE_URL)
+        path = deps.inventory_path_for(second_id)
+        self.assertNotEqual(path, deps.DATABASE_URL)
         self.assertIn(f"user-{second_id}", path)
         # Same directory, so the existing data volume and backup routine
         # keep working with no deployment change.
         self.assertEqual(
-            os.path.dirname(path), os.path.dirname(main.DATABASE_URL)
+            os.path.dirname(path), os.path.dirname(deps.DATABASE_URL)
         )
-        self.assertIsNot(main.inventory_for(second_id), main.db)
+        self.assertIsNot(deps.inventory_for(second_id), deps.db)
 
     def test_58d_stats_and_the_restock_summary_are_scoped_too(self):
         """
@@ -2466,14 +2468,32 @@ class TestWebApp(unittest.TestCase):
         reads.
         """
         from app import deps
+        from app.routes import (
+            accounts, database, ebay, inventory, listings, orders, plans,
+            pricing, settings, system,
+        )
 
-        self.assertIs(main.db, deps.db)
-        self.assertIs(main.user_db, deps.user_db)
-        self.assertIs(main.auth_manager, deps.auth_manager)
-        self.assertIs(main.inventory_for, deps.inventory_for)
-        self.assertIs(main.inventory_path_for, deps.inventory_path_for)
-        self.assertIs(main._inventories, deps._inventories)
-        self.assertEqual(main.DATABASE_URL, deps.DATABASE_URL)
+        shared = [
+            "db", "user_db", "auth_manager", "inventory_for",
+            "inventory_path_for", "_inventories", "_ebay_clients",
+            "get_ebay_client", "record_logs",
+        ]
+        modules = [
+            main, accounts, database, ebay, inventory, listings, orders,
+            plans, pricing, settings, system,
+        ]
+        for name in shared:
+            canonical = getattr(deps, name)
+            for module in modules:
+                held = getattr(module, name, None)
+                if held is None:
+                    continue
+                self.assertIs(
+                    held, canonical,
+                    f"{module.__name__} holds its own {name}; there must be "
+                    f"exactly one, or reads and writes can reach different "
+                    f"instances and a patched test can pass vacuously",
+                )
 
     def test_59b_the_database_routes_are_served_from_their_own_module(self):
         """
@@ -2614,7 +2634,7 @@ class TestWebApp(unittest.TestCase):
         printed to stdout, which a container restart takes with it.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        main.record_logs(db, [
+        deps.record_logs(db, [
             {"level": "INFO", "message": "reprice line one"},
             {"level": "WARN", "message": "HOLD ID9101 keeping $2.49"},
         ], "reprice")
@@ -2638,7 +2658,7 @@ class TestWebApp(unittest.TestCase):
         or skip one.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        main.record_logs(db,
+        deps.record_logs(db,
             [{"level": "INFO", "message": f"page line {i}"} for i in range(10)],
             "test",
         )
@@ -2656,9 +2676,9 @@ class TestWebApp(unittest.TestCase):
     def test_53c_a_failure_to_record_never_fails_the_work(self):
         """A log that can break the operation it describes is worse than none."""
         with mock.patch.object(
-            main.db, "record_log_entries", side_effect=RuntimeError("disk full")
+            deps.db, "record_log_entries", side_effect=RuntimeError("disk full")
         ):
-            main.record_logs(db, [{"level": "INFO", "message": "x"}], "test")
+            deps.record_logs(db, [{"level": "INFO", "message": "x"}], "test")
 
     def test_53d_clearing_the_stored_history_is_admin_only(self):
         """
@@ -2671,7 +2691,7 @@ class TestWebApp(unittest.TestCase):
         )
 
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        main.record_logs(db, [{"level": "INFO", "message": "to be deleted"}], "test")
+        deps.record_logs(db, [{"level": "INFO", "message": "to be deleted"}], "test")
         res = self.client.post("/api/logs/clear")
         self.assertEqual(res.status_code, 200)
         self.assertGreater(res.json()["removed"], 0)
@@ -2681,14 +2701,14 @@ class TestWebApp(unittest.TestCase):
         """
         An unbounded log on a NAS is a disk that fills up quietly.
         """
-        main.db.clear_log_entries()
-        main.db.record_log_entries(
+        deps.db.clear_log_entries()
+        deps.db.record_log_entries(
             [{"level": "INFO", "message": f"line {i}"} for i in range(30)],
             source="test", prune_to=10,
         )
-        self.assertLessEqual(main.db.count_log_entries(), 10)
+        self.assertLessEqual(deps.db.count_log_entries(), 10)
         # And it keeps the newest, not the first ten it happened to see.
-        newest = main.db.get_log_entries(limit=1)[0]
+        newest = deps.db.get_log_entries(limit=1)[0]
         self.assertEqual(newest["message"], "line 29")
 
     def test_52_the_owner_account_is_the_oldest_active_admin(self):

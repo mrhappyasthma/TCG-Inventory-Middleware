@@ -263,10 +263,28 @@ def approve_plan_endpoint(
         raise HTTPException(status_code=409, detail=str(exc))
     return {"success": True, **result}
 
+# A push is long: creating a hundred-card listing is a dozen eBay calls, and
+# a whole plan is several listings of that. Held open as one HTTP request it
+# outlasts the reverse proxy, which answers the browser with its own error
+# page while the push carries on regardless -- and the page, having lost its
+# request, also loses any idea that a push is happening. Switching tabs and
+# back showed nothing in progress.
+#
+# So the request starts a job and returns immediately, and the page follows
+# it by polling. That makes the two problems the same problem, and the fix is
+# that progress lives on the server rather than in one browser request.
+#
+# Deliberately in memory. A job is a few minutes of transient state, and the
+# durable record of what happened is the plan itself -- each card's status and
+# reason are written as eBay answers, which is what a restart or a closed
+# laptop has to be able to rely on. A vanished job is reported as unknown
+# rather than as a failure, because the push it described may well have
+# finished.
 _push_jobs: Dict[str, Dict[str, Any]] = {}
 
 _push_jobs_lock = threading.Lock()
 
+# Finished jobs are kept long enough for a reload to collect the result.
 PUSH_JOB_RETENTION_SECONDS = 3600
 
 def _prune_push_jobs() -> None:

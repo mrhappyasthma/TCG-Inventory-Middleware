@@ -145,6 +145,9 @@ def reset_pricing_rules_endpoint(user: Dict[str, Any] = Depends(require_active_u
         "is_own": inv.has_own_pricing_rules(user["id"]),
     }
 
+# How often the background refresh runs, and whether it runs at all. TCGCSV
+# publishes once a day and asks for at most one sync per 24 hours, so anything
+# under that is wasted requests against a service that asks us not to.
 PRICE_REFRESH_ENABLED = os.environ.get(
     "PRICE_REFRESH_ENABLED", "true"
 ).strip().lower() not in ("0", "false", "no", "off")

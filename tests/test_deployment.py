@@ -413,7 +413,8 @@ class ComposePassesConfigurationThroughTests(unittest.TestCase):
 BOOT_PROBE = """
 import json
 from fastapi.testclient import TestClient
-from app.main import app, EBAY_CLIENT_AVAILABLE
+from app.main import app
+from app.deps import EBAY_CLIENT_AVAILABLE
 
 
 def _walk_routes(routes):
