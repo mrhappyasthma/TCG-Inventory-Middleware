@@ -84,7 +84,7 @@
 
 ---
 
-* **The inventory is shared, not per-user.** There is no owner column on a card, so both backup and restore are administrative and live behind the admin-only Database panel. Enforce it on the endpoint, not just by hiding the control.
+* **Backup and restore stay administrative**, because they act on whole database files -- including other accounts' -- rather than on anything the caller owns. Enforce it on the endpoint, not just by hiding the control. (The inventory itself is *not* shared; see §5.)
 * **Market prices come from TCGCSV, joined on `(tcgplayer_id, printing)`.** Never on the product id alone -- Normal and Reverse Holofoil differ several-fold and the mistake underprices silently. Their limits are hard: gate every refresh on `last-updated.txt`, send a custom User-Agent, space requests 100 ms, and stay far below 10,000/24h or the application may be banned. A missing or failed price is *unknown*, never `0`, because the rules multiply against it. Keep every value in `price_history`.
 * **`build_reprice_csv` carries no `Quantity` column.** A reprice must not touch stock, and an absent column is how File Exchange is told to leave a field alone. Emit only rows whose price differs from `last_known_price`, and use the stored `custom_label`.
 * **A grade discount is policy, not data.** The obtainable market price is product-level -- TCGplayer's public data has no per-condition pricing and neither did the SortSwift export relaying it -- so `condition_multipliers` is a configurable table, per-user like the pricing rules. Apply it *before* the tiers via `apply_condition_multiplier`, so a played card lands in a cheaper band. Never default an unrecognised grade to 1.0: return None and report it, because quietly pricing a slab as mint looks normal and is wrong.
@@ -152,5 +152,16 @@
   must be additive and lossless.
 * **Background jobs act as the owner.** They have no signed-in user, so they
   resolve `user_db.get_owner_user_id()` -- the oldest active admin -- and use
-  that account's database and rules. A job that fell back to a shared
-  baseline would price from rules nobody can see on screen.
+  that account's database, rules **and eBay connection**. A job that fell back
+  to a shared baseline would price from rules nobody can see on screen.
+* **The eBay connection is per-account.** One application keyset, one refresh
+  token per seller: that is how eBay OAuth is designed, so no per-user
+  credentials are needed. `get_ebay_client(user_id)` and
+  `user_db.get_ebay_token(user_id)` take the account explicitly and have **no
+  default on purpose** -- a default here means writing to somebody else's live
+  store. The account a consent flow is for comes from the signed OAuth
+  `state`, never from a session or a query parameter.
+* **Two eBay things are legitimately app-level**: the account-deletion
+  notification endpoint, which eBay addresses to the application rather than
+  to a seller, and eBay's **call limits**, which are per-application and
+  therefore shared across accounts.

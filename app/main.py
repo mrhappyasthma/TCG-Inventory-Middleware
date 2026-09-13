@@ -214,45 +214,70 @@ EBAY_NOTIFICATION_ENDPOINT = os.environ.get("EBAY_NOTIFICATION_ENDPOINT", "").st
 # complete credential set to answer the challenge would deadlock the very
 # bootstrap the challenge exists to unblock.
 EBAY_VERIFICATION_TOKEN = os.environ.get("EBAY_VERIFICATION_TOKEN", "").strip()
-_ebay_client = None
+# One eBay client per account, because each account links its own store.
+#
+# eBay's model is what makes this cheap: the **application** holds one set of
+# credentials -- App ID, Cert ID and RuName -- and each seller grants that
+# application access to their own account, which yields a refresh token per
+# seller. So there is nothing extra to register with eBay and no new keys to
+# obtain; the same `EbayConfig.from_env()` serves everybody. What differs per
+# account is only the token, and therefore only the store.
+_ebay_clients: Dict[int, Any] = {}
+_ebay_client_lock = threading.Lock()
 
 
-def get_ebay_client():
+def get_ebay_client(user_id: int):
     """
-    The shared eBay client, or None when the integration is not configured.
+    One account's eBay client, or None when the integration is unconfigured.
 
     Returns None rather than raising so that an unconfigured deployment keeps
     working. Callers that genuinely need eBay must check and answer 503
     themselves, which reads better than a stack trace about a missing key.
+
+    Takes the account explicitly and has no default, deliberately. A default
+    would be the single most expensive mistake available here -- writing to
+    somebody else's live eBay store -- so every caller is made to say who it
+    is acting as.
     """
-    global _ebay_client
-    if not EBAY_CLIENT_AVAILABLE:
+    if not EBAY_CLIENT_AVAILABLE or not EbayConfig.is_configured():
         return None
-    if _ebay_client is None and EbayConfig.is_configured():
-        _ebay_client = EbayClient(
-            EbayConfig.from_env(), store=_UserDbTokenStore()
+    key = int(user_id)
+    with _ebay_client_lock:
+        existing = _ebay_clients.get(key)
+        if existing is not None:
+            return existing
+        client = EbayClient(
+            EbayConfig.from_env(), store=_UserDbTokenStore(key)
         )
-    return _ebay_client
+        _ebay_clients[key] = client
+        return client
 
 
 class _UserDbTokenStore(TokenStore):
     """
-    Persists the eBay refresh token in the users database.
+    Persists one account's eBay refresh token in the users database.
 
     The library takes a store rather than touching SQLite itself, which is what
     keeps it free of any opinion about where credentials live. ``actor`` is set
     by the OAuth callback just before the code exchange, so the connection can
     record who authorised it; a refresh does not write, so it never clears it.
+
+    The account is fixed when the store is built and never read from ambient
+    state, so a token refresh triggered by a background job cannot end up
+    written against whoever happens to be signed in.
     """
 
-    def __init__(self):
+    def __init__(self, user_id: int):
+        self.user_id = int(user_id)
         self.actor = None
 
     def load(self):
-        return user_db.get_ebay_token()
+        return user_db.get_ebay_token(self.user_id)
 
     def save(self, token):
-        user_db.save_ebay_token(token, connected_by=self.actor)
+        user_db.save_ebay_token(
+            self.user_id, token, connected_by=self.actor
+        )
 
 # Initialize databases & auth
 #
@@ -327,36 +352,6 @@ def inventory_for(user: Any) -> Database:
         instance = db if path == DATABASE_URL else Database(db_path=path)
         _inventories[user_id] = instance
         return instance
-
-
-def require_owner_for_ebay_writes(user: Dict[str, Any]) -> None:
-    """
-    Refuse an eBay write from any account but the deployment owner's.
-
-    The one thing still shared across accounts is the **eBay connection**:
-    `ebay_connection` holds a single token for the whole deployment. Now that
-    each account has its own catalogue, each also has its own `manifest_id`
-    sequence -- and a manifest id *is* the SKU. Two accounts pushing into one
-    eBay store would therefore both claim `ID1001`, and because a variation's
-    SKU cannot be renamed afterwards, the collision could not be undone.
-
-    So this is a lock, not a permission check: it holds the door shut until
-    the eBay connection is per-account too. Reads are untouched -- only
-    writes can collide.
-    """
-    owner = user_db.get_owner_user_id()
-    if owner is None or int(user["id"]) == int(owner):
-        return
-    raise HTTPException(
-        status_code=403,
-        detail=(
-            "eBay writes are limited to the deployment owner's account. "
-            "There is one eBay connection for the whole deployment, and "
-            "each account numbers its own cards, so two accounts pushing "
-            "into the same store would claim the same SKUs -- which cannot "
-            "be undone, because a variation's SKU cannot be renamed."
-        ),
-    )
 
 
 def owner_inventory() -> Database:
@@ -997,7 +992,7 @@ def _reprice_now(user_id: int, dry_run: bool = False) -> Dict[str, Any]:
     still leaves the account of how far it got.
     """
     inv = inventory_for(user_id)
-    client = get_ebay_client()
+    client = get_ebay_client(user_id)
     adapter = None
     if client is not None and client.oauth.is_connected():
         adapter = InventoryApiAdapter(client)
@@ -1200,7 +1195,9 @@ def _ebay_timestamp(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
-def _poll_orders_now(inv: Database, dry_run: bool = False) -> Dict[str, Any]:
+def _poll_orders_now(
+    inv: Database, user_id: int, dry_run: bool = False
+) -> Dict[str, Any]:
     """
     One round of reading orders and deducting what sold.
 
@@ -1212,7 +1209,7 @@ def _poll_orders_now(inv: Database, dry_run: bool = False) -> Dict[str, Any]:
     where it was, so the next attempt re-reads the same window rather than
     stepping over sales nobody has seen.
     """
-    client = get_ebay_client()
+    client = get_ebay_client(user_id)
     if client is None or not client.oauth.is_connected():
         raise OrderSyncError("Connect the eBay account first.")
 
@@ -1318,7 +1315,9 @@ async def poll_orders_endpoint(
     """
     inv = inventory_for(user)
     try:
-        return await run_in_threadpool(lambda: _poll_orders_now(inv, dry_run=dry_run))
+        return await run_in_threadpool(
+            lambda: _poll_orders_now(inv, user["id"], dry_run=dry_run)
+        )
     except OrderSyncError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except EbayError as exc:
@@ -1442,11 +1441,15 @@ async def _scheduled_order_poll() -> None:
     """
     inv = owner_inventory()
     try:
-        client = get_ebay_client()
+        client = get_ebay_client(_owner_scope())
         if client is None or not client.oauth.is_connected():
             print("[orders] eBay is not connected, skipping", flush=True)
             return
-        result = await run_in_threadpool(_poll_orders_now)
+        # Acts as the owner throughout: the same account whose store is
+        # read and whose stock is deducted.
+        result = await run_in_threadpool(
+            lambda: _poll_orders_now(inv, _owner_scope())
+        )
         print(
             f"[orders] {result.get('seen', 0)} line(s) seen, "
             f"{result.get('deducted', 0)} deducted, "
@@ -1528,7 +1531,7 @@ async def _nightly_reprice() -> None:
             skip("no admin account to act as")
             return
 
-        client = get_ebay_client()
+        client = get_ebay_client(_owner_scope())
         if client is None or not client.oauth.is_connected():
             skip("eBay is not connected")
             return
@@ -1955,7 +1958,7 @@ async def set_listing_cover(
             ),
         }
 
-    client = get_ebay_client()
+    client = get_ebay_client(user["id"])
     if client is None or not client.oauth.is_connected():
         return {
             "success": True,
@@ -2524,8 +2527,8 @@ def health_check():
 EBAY_OAUTH_STATE_TTL_SECONDS = 600
 
 
-def _require_ebay_client():
-    client = get_ebay_client()
+def _require_ebay_client(user_id: int):
+    client = get_ebay_client(user_id)
     if client is None:
         raise HTTPException(
             status_code=503,
@@ -2547,7 +2550,7 @@ def ebay_status(user: Dict[str, Any] = Depends(require_active_user)):
     interactive re-consent, so it is worth showing before it lapses rather
     than after.
     """
-    client = get_ebay_client()
+    client = get_ebay_client(user["id"])
     if client is None:
         return {
             "available": EBAY_CLIENT_AVAILABLE,
@@ -2556,16 +2559,21 @@ def ebay_status(user: Dict[str, Any] = Depends(require_active_user)):
         }
     status_payload = dict(client.status())
     status_payload["available"] = True
-    meta = user_db.get_ebay_connection_meta() or {}
+    meta = user_db.get_ebay_connection_meta(user["id"]) or {}
     status_payload["connected_by"] = meta.get("username")
     status_payload["connected_at"] = meta.get("updated_at")
     return status_payload
 
 
 @app.post("/api/ebay/connect")
-def ebay_connect(admin: Dict[str, Any] = Depends(require_admin_user)):
+def ebay_connect(user: Dict[str, Any] = Depends(require_active_user)):
     """
     Begin the consent flow: returns the eBay URL to send the seller to.
+
+    Any approved account may link **its own** eBay store. This was admin-only
+    while a single token served the whole deployment, when connecting was
+    infrastructure rather than a preference; now each account has its own
+    connection and can only ever affect its own.
 
     The ``state`` is a signed, short-lived token rather than a random string
     held in memory. Signing it makes the callback self-contained -- it survives
@@ -2573,9 +2581,9 @@ def ebay_connect(admin: Dict[str, Any] = Depends(require_admin_user)):
     an attacker delivering an authorization code of their choosing to the
     callback, which would connect *their* eBay account to this deployment.
     """
-    client = _require_ebay_client()
+    client = _require_ebay_client(user["id"])
     state = create_jwt_token(
-        {"purpose": "ebay_oauth", "user_id": admin["id"]},
+        {"purpose": "ebay_oauth", "user_id": user["id"]},
         expires_in_seconds=EBAY_OAUTH_STATE_TTL_SECONDS,
     )
     return {"authorization_url": client.oauth.authorization_url(state)}
@@ -2644,7 +2652,18 @@ def ebay_callback(
             False,
         )
 
-    client = get_ebay_client()
+    # The account comes from the signed state, never from a session or a
+    # query parameter. That is what stops somebody delivering an
+    # authorization code that links *their* eBay store to another account.
+    connecting_user = claims.get("user_id")
+    if not connecting_user:
+        return page(
+            "That link is no longer valid",
+            "Start the connection again from the dashboard.",
+            False,
+        )
+
+    client = get_ebay_client(connecting_user)
     if client is None:
         return page(
             "eBay is not configured",
@@ -2653,7 +2672,7 @@ def ebay_callback(
             False,
         )
 
-    client.oauth.store.actor = claims.get("user_id")
+    client.oauth.store.actor = connecting_user
     try:
         client.oauth.exchange_code(code)
     except EbayError as exc:
@@ -2699,7 +2718,7 @@ async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)
     store; if a column is missing, the headers in the response say which.
     """
     inv = inventory_for(user)
-    client = _require_ebay_client()
+    client = _require_ebay_client(user["id"])
     if not client.oauth.is_connected():
         raise HTTPException(
             status_code=409,
@@ -2763,7 +2782,7 @@ async def refresh_listing_endpoint(
     is already known to hold, and no price is sent at all.
     """
     inv = inventory_for(user)
-    client = get_ebay_client()
+    client = get_ebay_client(user["id"])
     if client is None or not client.oauth.is_connected():
         raise HTTPException(
             status_code=409, detail="Connect the eBay account first."
@@ -2788,7 +2807,7 @@ async def refresh_listing_endpoint(
 
 
 @app.post("/api/ebay/disconnect")
-def ebay_disconnect(admin: Dict[str, Any] = Depends(require_admin_user)):
+def ebay_disconnect(user: Dict[str, Any] = Depends(require_active_user)):
     """
     Forget the stored refresh token.
 
@@ -2796,19 +2815,19 @@ def ebay_disconnect(admin: Dict[str, Any] = Depends(require_admin_user)):
     flip idly -- but it is the correct response to a credential you no longer
     trust.
     """
-    client = get_ebay_client()
+    client = get_ebay_client(user["id"])
     if client is not None:
         client.oauth.disconnect()
     else:
         # Still clear the row: the token outlives a configuration change, and
         # leaving it behind would silently reconnect if the keys came back.
         user_db.save_ebay_token(None)
-    print(f"[ebay] account disconnected by user {admin['id']}", flush=True)
+    print(f"[ebay] account disconnected by user {user['id']}", flush=True)
     return {"success": True, "connected": False}
 
 
 @app.get("/api/ebay/account-setup")
-async def ebay_account_setup(admin: Dict[str, Any] = Depends(require_admin_user)):
+async def ebay_account_setup(user: Dict[str, Any] = Depends(require_active_user)):
     """
     The ids a push needs, read from the seller's own eBay account.
 
@@ -2823,8 +2842,8 @@ async def ebay_account_setup(admin: Dict[str, Any] = Depends(require_admin_user)
     an offer without one, so an empty list here is the normal state and a
     thing to fix rather than a fault.
     """
-    inv = inventory_for(admin)
-    client = get_ebay_client()
+    inv = inventory_for(user)
+    client = get_ebay_client(user["id"])
     if client is None:
         raise HTTPException(
             status_code=503, detail="eBay is not configured."
@@ -2835,7 +2854,7 @@ async def ebay_account_setup(admin: Dict[str, Any] = Depends(require_admin_user)
             detail="Connect the eBay account first: this reads its policies.",
         )
 
-    settings = inv.get_listing_settings(user_id=admin["id"])
+    settings = inv.get_listing_settings(user_id=user["id"])
     marketplace_id = str(settings.get("marketplace_id") or "EBAY_US")
 
     def run():
@@ -2883,7 +2902,7 @@ class InventoryLocationRequest(BaseModel):
 @app.post("/api/ebay/inventory-location")
 async def ebay_create_inventory_location(
     req: InventoryLocationRequest,
-    admin: Dict[str, Any] = Depends(require_admin_user),
+    user: Dict[str, Any] = Depends(require_active_user),
 ):
     """
     Create the inventory location eBay requires before publishing an offer.
@@ -2893,14 +2912,14 @@ async def ebay_create_inventory_location(
     without publishing an address. The key is permanent once set, so it is
     validated before the call rather than after.
     """
-    inv = inventory_for(admin)
-    client = get_ebay_client()
+    inv = inventory_for(user)
+    client = get_ebay_client(user["id"])
     if client is None or not client.oauth.is_connected():
         raise HTTPException(
             status_code=409, detail="Connect the eBay account first."
         )
 
-    settings = inv.get_listing_settings(user_id=admin["id"])
+    settings = inv.get_listing_settings(user_id=user["id"])
     postal = (req.postal_code or settings.get("seller_postal_code") or "").strip()
     if not postal:
         raise HTTPException(
@@ -2924,7 +2943,7 @@ async def ebay_create_inventory_location(
     # Recorded immediately: the key cannot be changed on eBay's side, so
     # losing track of it would mean a location nothing can reference.
     inv.set_listing_settings(
-        {"merchant_location_key": key}, user_id=admin["id"]
+        {"merchant_location_key": key}, user_id=user["id"]
     )
     print(f"[ebay] inventory location {key} created", flush=True)
     return {"success": True, "merchant_location_key": key}
@@ -3012,7 +3031,7 @@ async def ebay_notification_receive(request: Request):
     our own listings' item numbers, labels, quantities and prices. Should that
     ever change, this is the handler that has to grow a deletion path.
     """
-    client = get_ebay_client()
+    client = get_ebay_client(_owner_scope())
     if client is None:
         raise HTTPException(
             status_code=503, detail="eBay notifications are not configured."
@@ -3348,7 +3367,7 @@ def _run_push_job(job_id: str, plan_id: int, user_id: int, group_keys) -> None:
                 job["logs"].append({"level": level, "message": message})
         print(f"[push] {level}: {message}", flush=True)
 
-    client = get_ebay_client()
+    client = get_ebay_client(user_id)
     adapter = InventoryApiAdapter(client)
     try:
         with inv.session():
@@ -3418,12 +3437,6 @@ async def push_plan_endpoint(
     File Exchange is left for the CSV path and reported as deferred, since
     pushing it would create a duplicate rather than update the live one.
     """
-    # Before anything else: there is one eBay connection for the whole
-    # deployment but a manifest id sequence per account, and a manifest
-    # id is the SKU. Two accounts pushing into one store would collide
-    # irreversibly.
-    require_owner_for_ebay_writes(user)
-
     inv = inventory_for(user)
     plan = inv.get_plan(plan_id)
     if plan is None or plan["user_id"] != user["id"]:
@@ -3433,7 +3446,7 @@ async def push_plan_endpoint(
             status_code=409, detail="Approve the draft before pushing it."
         )
 
-    client = get_ebay_client()
+    client = get_ebay_client(user["id"])
     if client is None:
         raise HTTPException(
             status_code=503,

@@ -1102,7 +1102,7 @@ class TestWebApp(unittest.TestCase):
             ).encode()
         ).decode()
 
-        client = main.get_ebay_client()
+        client = main.get_ebay_client(main._owner_scope())
         self.assertIsNotNone(client, "eBay env vars should make a client available")
         original = client.public_keys
         client.public_keys = PublicKeyCache(lambda _kid: pem)
@@ -1154,8 +1154,8 @@ class TestWebApp(unittest.TestCase):
         this endpoint validates, and the RuName is registered later still. So
         the challenge must answer with only the token and the endpoint URL.
         """
-        saved = main._ebay_client
-        main._ebay_client = None
+        saved = dict(main._ebay_clients)
+        main._ebay_clients.clear()
         try:
             with mock.patch.object(
                 main.EbayConfig, "is_configured", return_value=False
@@ -1173,16 +1173,17 @@ class TestWebApp(unittest.TestCase):
                 ).hexdigest(),
             )
         finally:
-            main._ebay_client = saved
+            main._ebay_clients.clear()
+            main._ebay_clients.update(saved)
 
     def test_39_an_unconfigured_deployment_reports_503_not_a_crash(self):
         """
         The app must keep working as a CSV tool with no eBay credentials, and
         say so plainly rather than raising.
         """
-        saved_client = main._ebay_client
+        saved_client = dict(main._ebay_clients)
         saved_endpoint = main.EBAY_NOTIFICATION_ENDPOINT
-        main._ebay_client = None
+        main._ebay_clients.clear()
         main.EBAY_NOTIFICATION_ENDPOINT = ""
         try:
             with mock.patch.object(
@@ -1200,7 +1201,8 @@ class TestWebApp(unittest.TestCase):
                     503,
                 )
         finally:
-            main._ebay_client = saved_client
+            main._ebay_clients.clear()
+            main._ebay_clients.update(saved_client)
             main.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
 
     def test_39a_a_draft_cover_photo_is_staged_not_applied(self):
@@ -1395,12 +1397,65 @@ class TestWebApp(unittest.TestCase):
         self.assertNotIn("refresh_token", serialised)
         self.assertNotIn(os.environ["EBAY_CLIENT_SECRET"], serialised)
 
-    def test_41_connecting_is_admin_only(self):
-        # The inventory is shared and there is one eBay store behind it, so
-        # the connection is infrastructure rather than a user preference.
+    def test_41_any_approved_account_links_its_own_store(self):
+        """
+        This was admin-only, and the comment explaining why said: "the
+        inventory is shared and there is one eBay store behind it, so the
+        connection is infrastructure rather than a user preference."
+
+        Neither half is true any more. Each account has its own inventory and
+        its own eBay connection, so linking a store affects nobody else --
+        and keeping it administrative would only stop a friend setting up the
+        store they are the seller of.
+
+        eBay's model is what makes this possible with no new credentials: the
+        *application* holds one App ID, Cert ID and RuName, and each seller
+        grants that application access to their own account.
+        """
         second = self.signed_in_second_user()
-        self.assertEqual(second.post("/api/ebay/connect").status_code, 403)
-        self.assertEqual(second.post("/api/ebay/disconnect").status_code, 403)
+        started = second.post("/api/ebay/connect")
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertIn("authorization_url", started.json())
+        # And they may unlink their own, which cannot touch anybody else's.
+        self.assertEqual(second.post("/api/ebay/disconnect").status_code, 200)
+
+    def test_41b_a_connection_belongs_to_one_account_only(self):
+        """
+        The owner being connected must not make a second account look
+        connected -- that would have them pushing into the owner's store
+        believing it was their own.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        owner_id = main._owner_scope()
+        user_db.save_ebay_token(
+            owner_id, {"refresh_token": "owner-rt"}, connected_by=owner_id
+        )
+        try:
+            second = self.signed_in_second_user()
+            second_id = user_db.get_user_by_google_sub("google-sub-second")["id"]
+
+            self.assertIsNotNone(user_db.get_ebay_token(owner_id))
+            self.assertIsNone(
+                user_db.get_ebay_token(second_id),
+                "a second account inherited the owner's eBay token",
+            )
+            self.assertFalse(
+                second.get("/api/ebay/status").json()["connected"],
+                "a second account is reported as connected to eBay",
+            )
+            self.assertTrue(
+                self.client.get("/api/ebay/status").json()["connected"]
+            )
+
+            # One account disconnecting must not log the other out. This is
+            # the failure a single shared row made inevitable.
+            user_db.save_ebay_token(second_id, None)
+            self.assertIsNotNone(
+                user_db.get_ebay_token(owner_id),
+                "disconnecting one account cleared another's token",
+            )
+        finally:
+            user_db.save_ebay_token(main._owner_scope(), None)
         # But a non-admin may still see whether eBay is connected.
         self.assertEqual(second.get("/api/ebay/status").status_code, 200)
 
@@ -1461,7 +1516,7 @@ class TestWebApp(unittest.TestCase):
         url = self.client.post("/api/ebay/connect").json()["authorization_url"]
         state = url.split("state=")[1].split("&")[0]
 
-        client = main.get_ebay_client()
+        client = main.get_ebay_client(main._owner_scope())
         original_opener = client.oauth._opener
 
         def fake_opener(method, target, headers, body, timeout):
@@ -1488,11 +1543,11 @@ class TestWebApp(unittest.TestCase):
             self.assertEqual(res.status_code, 200, res.text)
             self.assertIn("connected", res.text)
 
-            stored = user_db.get_ebay_token()
+            stored = user_db.get_ebay_token(main._owner_scope())
             self.assertEqual(stored["refresh_token"], "rt-from-consent")
             # The connection records who authorised it: approval to write to a
             # live storefront should not be anonymous.
-            meta = user_db.get_ebay_connection_meta()
+            meta = user_db.get_ebay_connection_meta(main._owner_scope())
             self.assertEqual(meta["username"], "Admin User")
 
             self.assertTrue(self.client.get("/api/ebay/status").json()["connected"])
@@ -1533,7 +1588,7 @@ class TestWebApp(unittest.TestCase):
         # rather than a hand-written CSV that might not match it.
         csv_text = records_to_csv(parse_active_inventory_report(report_xml))
 
-        user_db.save_ebay_token({"refresh_token": "rt"}, connected_by=1)
+        user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
         try:
             with mock.patch.object(
                 main,
@@ -1558,7 +1613,7 @@ class TestWebApp(unittest.TestCase):
             self.assertEqual(variation["last_known_qty"], 5)
             self.assertAlmostEqual(variation["last_known_price"], 3.75)
         finally:
-            user_db.save_ebay_token(None)
+            user_db.save_ebay_token(main._owner_scope(), None)
             db.delete_manifest("ID4001")
 
     def test_45c_a_report_that_matches_nothing_never_zeroes_the_mirror(self):
@@ -1574,7 +1629,7 @@ class TestWebApp(unittest.TestCase):
         db.insert_manifest("ID4002", "Heracross", "Chilling Reign", "NM", "Normal")
         db.upsert_variation("ID4002", "227511361186", 3, custom_label="ID4002-Bin_B01")
 
-        user_db.save_ebay_token({"refresh_token": "rt"}, connected_by=1)
+        user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
         try:
             with mock.patch.object(
                 main,
@@ -1597,7 +1652,7 @@ class TestWebApp(unittest.TestCase):
             # Untouched, which is the entire point.
             self.assertEqual(db.get_variation("ID4002")["last_known_qty"], 3)
         finally:
-            user_db.save_ebay_token(None)
+            user_db.save_ebay_token(main._owner_scope(), None)
             db.delete_manifest("ID4002")
 
     def test_46_disconnecting_forgets_the_token(self):
@@ -1605,7 +1660,7 @@ class TestWebApp(unittest.TestCase):
         res = self.client.post("/api/ebay/disconnect")
         self.assertEqual(res.status_code, 200)
         self.assertFalse(res.json()["connected"])
-        self.assertIsNone(user_db.get_ebay_token())
+        self.assertIsNone(user_db.get_ebay_token(main._owner_scope()))
         self.assertFalse(self.client.get("/api/ebay/status").json()["connected"])
 
     def test_47_the_token_survives_an_inventory_restore(self):
@@ -1617,7 +1672,7 @@ class TestWebApp(unittest.TestCase):
         the refresh token is the only credential here that cannot be recreated
         without an interactive re-consent.
         """
-        user_db.save_ebay_token({"refresh_token": "survivor"}, connected_by=1)
+        user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "survivor"}, connected_by=1)
         try:
             with db.get_connection() as conn:
                 tables = {
@@ -1627,9 +1682,9 @@ class TestWebApp(unittest.TestCase):
                     )
                 }
             self.assertNotIn("ebay_connection", tables)
-            self.assertEqual(user_db.get_ebay_token()["refresh_token"], "survivor")
+            self.assertEqual(user_db.get_ebay_token(main._owner_scope())["refresh_token"], "survivor")
         finally:
-            user_db.save_ebay_token(None)
+            user_db.save_ebay_token(main._owner_scope(), None)
 
     # -- orders -------------------------------------------------------------
 
@@ -2382,22 +2437,27 @@ class TestWebApp(unittest.TestCase):
             "the seeded baseline is missing from a new account's database",
         )
 
-    def test_58f_only_the_owner_may_push_to_ebay_for_now(self):
+    def test_58f_a_second_account_is_no_longer_locked_out_of_ebay(self):
         """
-        The one thing still shared is the eBay connection: a single token for
-        the deployment. Each account now numbers its own cards, and a
-        manifest id *is* the SKU, so two accounts pushing into one store
-        would both claim ID1001 -- and a variation's SKU cannot be renamed,
-        so the collision could not be undone.
+        eBay writes used to be refused for anybody but the owner, because one
+        token served the deployment: two accounts pushing into a single store
+        would both claim ID1001, and a variation's SKU cannot be renamed, so
+        the collision could not be undone.
 
-        A lock rather than a permission: it comes off when the eBay
-        connection becomes per-account.
+        Each account now pushes into its own store, where its own SKUs are
+        the only ones there -- so the lock is gone. What stops this
+        particular push is the ordinary reasons: no plan of theirs, and no
+        eBay connection of their own.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         second = self.signed_in_second_user()
-        blocked = second.post("/api/plans/1/push")
-        self.assertEqual(blocked.status_code, 403, blocked.text)
-        self.assertIn("deployment owner", blocked.json()["detail"])
+        refused = second.post("/api/plans/1/push")
+        self.assertNotEqual(refused.status_code, 200)
+        detail = refused.json().get("detail", "")
+        self.assertNotIn(
+            "deployment owner", detail,
+            "the owner-only lock is still in force",
+        )
 
 
     # -- automatic repricing ----------------------------------------------

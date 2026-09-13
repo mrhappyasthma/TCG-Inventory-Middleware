@@ -1929,14 +1929,36 @@ would be the worst kind of failure, because it looks like it worked.
 same account whose pricing rules and listing settings they read. A job falling
 back to a shared baseline would price from rules nobody can see on screen.
 
-> **One thing is still shared: the eBay connection.** There is a single OAuth
-> token for the whole deployment. Since each account now numbers its own cards
-> and a manifest id *is* the SKU, two accounts pushing into one eBay store
-> would both claim `ID1001` — and that could not be undone, because a
-> variation's SKU cannot be renamed. So **eBay writes are locked to the
-> owner's account** until the connection is per-account too. Reads are
-> unaffected; only writes can collide. A second account can build a catalogue
-> and a draft plan, but not push it.
+**The eBay connection is per-account too.** Each account links its own eBay
+store and gets its own refresh token; nothing about one account's connection
+is visible to another, and one disconnecting cannot log another out.
+
+This needs **no new eBay credentials**, because of how eBay's OAuth works: the
+**application** holds one set of keys — App ID, Cert ID and the RuName /
+redirect URI — and each *seller* grants that application access to their own
+account, which yields a refresh token per seller. So the `EBAY_CLIENT_ID`,
+`EBAY_CLIENT_SECRET` and `EBAY_REDIRECT_URI` already configured serve every
+user. Nothing to re-register, no second keyset.
+
+* **Linking is no longer admin-only.** It was, while one token served the
+  deployment and connecting was infrastructure rather than a preference. Any
+  approved account now links, unlinks and configures **its own** store —
+  business policies and inventory location included — and can only ever
+  affect its own.
+* **Which account is connecting comes from the signed OAuth `state`**, never
+  from a session or a query parameter. That is what stops somebody delivering
+  an authorization code that links *their* store to another account.
+* **Unattended jobs act as the owner**, using the owner's connection, which
+  is the same account whose pricing rules they read.
+* **Two app-level things stay shared, correctly.** The
+  [account-deletion notification endpoint](#-ebay-keyset-and-the-account-deletion-endpoint)
+  is addressed to the *application* rather than to a seller, and eBay's API
+  **call limits are per-application**, so heavy use by one account counts
+  against the same daily quota as everybody else's.
+
+Making the connection per-account also removed the reason eBay writes were
+briefly locked to the owner: each account's SKUs now live in its own store, so
+two accounts can no longer collide on `ID1001`.
 
 ### Inheritance and reset
 

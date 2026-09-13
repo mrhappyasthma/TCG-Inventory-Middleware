@@ -89,22 +89,81 @@ class UserDatabase:
                 );
                 """
             )
+            # One eBay connection per account.
+            #
+            # eBay's model makes this straightforward: the *application*
+            # holds one set of keys, and each seller grants that application
+            # access to their own account, which yields a refresh token per
+            # seller. So no new eBay registration is needed -- the same App
+            # ID, Cert ID and RuName serve every user.
+            #
+            # A separate table from `ebay_connection` rather than an altered
+            # one. That table's primary key is `CHECK (id = 1)`, which SQLite
+            # cannot relax without rebuilding the table, and a rebuild is not
+            # something to do to the one credential in this database that
+            # cannot be recreated without an interactive re-consent. The old
+            # row is copied across below and then left alone forever.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ebay_account_connection (
+                    user_id      INTEGER PRIMARY KEY,
+                    token_json   TEXT NOT NULL,
+                    connected_by INTEGER,
+                    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+
+            # Adopt the deployment-wide connection as the owner's.
+            #
+            # Without this the owner would appear disconnected after the
+            # upgrade and would have to re-consent -- which is exactly the
+            # interactive step worth avoiding. Runs once: after the copy the
+            # target row exists, and INSERT OR IGNORE never touches it again.
+            # A fresh install has neither a token nor an admin, so there is
+            # nothing to do and nothing to get wrong.
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO ebay_account_connection
+                    (user_id, token_json, connected_by, updated_at)
+                SELECT (
+                           SELECT id FROM users
+                            WHERE role = 'admin' AND status = 'active'
+                            ORDER BY created_at ASC, id ASC
+                            LIMIT 1
+                       ),
+                       c.token_json, c.connected_by, c.updated_at
+                  FROM ebay_connection c
+                 WHERE c.id = 1
+                   AND EXISTS (
+                       SELECT 1 FROM users
+                        WHERE role = 'admin' AND status = 'active'
+                   )
+                """
+            )
+
             conn.commit()
 
     # -- eBay connection ---------------------------------------------------
 
-    def get_ebay_token(self) -> Optional[Dict[str, Any]]:
+    def get_ebay_token(self, user_id: int) -> Optional[Dict[str, Any]]:
         """
-        The stored eBay token record, or None when no account is connected.
+        One account's eBay token record, or None when they have not connected.
 
         Returns the decoded payload rather than the raw row: the caller is
         ebay_client's TokenStore, which is deliberately ignorant of SQLite.
+
+        Takes the account explicitly and has no default. A default would be
+        the one mistake that matters here -- silently acting as somebody else
+        against a live eBay store -- so the caller is made to say who.
         """
         import json
 
         with self.get_connection() as conn:
             row = conn.execute(
-                "SELECT token_json FROM ebay_connection WHERE id = 1"
+                "SELECT token_json FROM ebay_account_connection "
+                "WHERE user_id = ?",
+                (int(user_id),),
             ).fetchone()
         if row is None:
             return None
@@ -118,39 +177,51 @@ class UserDatabase:
         return token or None
 
     def save_ebay_token(
-        self, token: Optional[Dict[str, Any]], connected_by: Optional[int] = None
+        self,
+        user_id: int,
+        token: Optional[Dict[str, Any]],
+        connected_by: Optional[int] = None,
     ) -> None:
         """
-        Persist the eBay token record, replacing any previous connection.
+        Persist one account's eBay token, replacing their previous connection.
 
         An empty or falsy token clears the row, which is how disconnecting
         works: ebay_client's TokenStore.clear() saves an empty dict, and
         leaving a blank record behind would report a connection that cannot
         authenticate.
+
+        Only ever touches the named account's row, so one seller
+        disconnecting cannot log another out.
         """
         import json
 
         with self.get_connection() as conn:
             if not token:
-                conn.execute("DELETE FROM ebay_connection WHERE id = 1")
+                conn.execute(
+                    "DELETE FROM ebay_account_connection WHERE user_id = ?",
+                    (int(user_id),),
+                )
                 conn.commit()
                 return
             conn.execute(
                 """
-                INSERT INTO ebay_connection (id, token_json, connected_by, updated_at)
-                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(id) DO UPDATE SET
+                INSERT INTO ebay_account_connection
+                    (user_id, token_json, connected_by, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
                     token_json = excluded.token_json,
                     connected_by = excluded.connected_by,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (json.dumps(token), connected_by),
+                (int(user_id), json.dumps(token), connected_by),
             )
             conn.commit()
 
-    def get_ebay_connection_meta(self) -> Optional[Dict[str, Any]]:
+    def get_ebay_connection_meta(
+        self, user_id: int
+    ) -> Optional[Dict[str, Any]]:
         """
-        Who connected the eBay account and when, without the token itself.
+        Who connected this account's eBay store and when, without the token.
 
         Split from get_ebay_token so the dashboard can show the connection
         without the refresh token ever entering a response payload.
@@ -159,12 +230,21 @@ class UserDatabase:
             row = conn.execute(
                 """
                 SELECT c.connected_by, c.updated_at, u.username, u.email
-                FROM ebay_connection c
+                FROM ebay_account_connection c
                 LEFT JOIN users u ON u.id = c.connected_by
-                WHERE c.id = 1
-                """
+                WHERE c.user_id = ?
+                """,
+                (int(user_id),),
             ).fetchone()
         return dict(row) if row else None
+
+    def count_ebay_connections(self) -> int:
+        """How many accounts have linked an eBay store."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM ebay_account_connection"
+            ).fetchone()
+            return int(row["count"])
 
     def get_user_count(self) -> int:
         with self.get_connection() as conn:
