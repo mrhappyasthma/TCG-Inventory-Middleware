@@ -434,7 +434,15 @@ class TestWebApp(unittest.TestCase):
         listing = self.client.get("/api/database/files")
         self.assertEqual(listing.status_code, 200)
         names = {f["name"] for f in listing.json()["files"]}
-        self.assertEqual(names, {"inventory", "users"})
+        # The two fixed files, plus one inventory per additional account.
+        # A backup that silently covered only the owner would be the worst
+        # kind of failure: it looks like it worked.
+        self.assertIn("inventory", names)
+        self.assertIn("users", names)
+        self.assertTrue(
+            any(n.startswith("inventory-user-") for n in names),
+            f"no per-account inventory offered for backup: {sorted(names)}",
+        )
         for entry in listing.json()["files"]:
             for key in ("label", "description", "filename", "size_bytes",
                         "summary"):
@@ -451,6 +459,14 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(
             self.client.get("/api/database/download/nope").status_code, 404)
 
+        for name in names:
+            if name.startswith("inventory-user-"):
+                per_account = self.client.get(
+                    "/api/database/download/" + name
+                )
+                self.assertEqual(per_account.status_code, 200, name)
+                self.assertTrue(per_account.content.startswith(magic), name)
+
         bundle = self.client.get("/api/database/bundle")
         self.assertEqual(bundle.status_code, 200)
         self.assertEqual(bundle.headers["content-type"], "application/zip")
@@ -459,7 +475,13 @@ class TestWebApp(unittest.TestCase):
             members = archive.namelist()
             self.assertIn("README.txt", members)
             dbs = [m for m in members if m.endswith(".db")]
-            self.assertEqual(len(dbs), 2)
+            # One member per database the deployment owns, which now
+            # grows with the set of accounts rather than being fixed.
+            self.assertEqual(len(dbs), len(names))
+            self.assertTrue(
+                any("user-" in m for m in dbs),
+                f"a second account's inventory is missing: {dbs}",
+            )
             for member in dbs:
                 self.assertTrue(archive.read(member).startswith(magic), member)
 
@@ -913,13 +935,25 @@ class TestWebApp(unittest.TestCase):
         self.assertIn("may well have finished", detail)
 
     def test_30d_another_users_plan_cannot_be_pushed(self):
+        """
+        Refused, and now refused earlier than it used to be.
+
+        This once returned 404 -- not found *for you*, so that the plan's
+        existence was not leaked. The account-level lock on eBay writes
+        now answers first with 403, which is strictly stronger and leaks
+        less: it is a blanket statement about the account and says nothing
+        at all about whether this plan exists.
+        """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         plan_id = self.client.post(
             "/api/plans/build", json={"source": "manual"}
         ).json()["plan_id"]
         other = self.approved_non_admin_client()
-        self.assertEqual(
-            other.post(f"/api/plans/{plan_id}/push").status_code, 404
+        refused = other.post(f"/api/plans/{plan_id}/push")
+        self.assertIn(refused.status_code, (403, 404), refused.text)
+        self.assertNotEqual(
+            refused.status_code, 200,
+            "another account pushed a plan that is not theirs",
         )
 
     def test_31_plan_item_edits_are_validated(self):
@@ -2232,6 +2266,140 @@ class TestWebApp(unittest.TestCase):
             )
             self.clear_target_fixture()
 
+    # -- per-account isolation ---------------------------------------------
+    #
+    # The rest of the suite signs in as one admin, so it would pass just as
+    # happily with no scoping at all. These are the tests that actually hold
+    # the boundary, and they are worth more than the green tick elsewhere.
+
+    def test_58a_two_accounts_do_not_see_each_others_cards(self):
+        """
+        The whole point. A friend's scans must not land in the owner's
+        inventory, and the owner's catalogue must be invisible to them.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        mine = self.client.post("/api/inventory/add", json={
+            "product_name": "Owner Only Charizard",
+            "set_name": "Isolation Set",
+            "condition": "Near Mint",
+            "printing": "Normal",
+            "quantity": 3,
+        })
+        self.assertEqual(mine.status_code, 200, mine.text)
+
+        second = self.signed_in_second_user()
+        theirs = second.get("/api/inventory").json()["items"]
+        self.assertNotIn(
+            "Owner Only Charizard",
+            [row["product_name"] for row in theirs],
+            "the second account can see the owner's catalogue",
+        )
+
+        added = second.post("/api/inventory/add", json={
+            "product_name": "Friend Only Blastoise",
+            "set_name": "Isolation Set",
+            "condition": "Near Mint",
+            "printing": "Normal",
+            "quantity": 1,
+        })
+        self.assertEqual(added.status_code, 200, added.text)
+
+        ours = self.client.get("/api/inventory").json()["items"]
+        names = [row["product_name"] for row in ours]
+        self.assertIn("Owner Only Charizard", names, "we lost our own card")
+        self.assertNotIn(
+            "Friend Only Blastoise", names,
+            "a second account's card appeared in the owner's inventory",
+        )
+
+    def test_58b_the_owner_keeps_the_original_database_file(self):
+        """
+        `data/inventory.db` holds the catalogue whose manifest ids are the
+        SKUs of live eBay listings, and a variation's SKU cannot be renamed.
+        So the owner's file must keep its path: re-keying it would orphan
+        every live listing.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        owner_id = user_db.get_owner_user_id()
+        self.assertIsNotNone(owner_id)
+        self.assertEqual(main.inventory_path_for(owner_id), main.DATABASE_URL)
+        self.assertIs(main.inventory_for(owner_id), main.db)
+        self.assertIs(main.owner_inventory(), main.db)
+
+    def test_58c_another_account_gets_a_sibling_file_not_the_owners(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        second = self.signed_in_second_user()
+        second_id = user_db.get_user_by_google_sub("google-sub-second")["id"]
+        path = main.inventory_path_for(second_id)
+        self.assertNotEqual(path, main.DATABASE_URL)
+        self.assertIn(f"user-{second_id}", path)
+        # Same directory, so the existing data volume and backup routine
+        # keep working with no deployment change.
+        self.assertEqual(
+            os.path.dirname(path), os.path.dirname(main.DATABASE_URL)
+        )
+        self.assertIsNot(main.inventory_for(second_id), main.db)
+
+    def test_58d_stats_and_the_restock_summary_are_scoped_too(self):
+        """
+        The counts are read by a different query from the table, so they are
+        their own chance to leak. A friend seeing "812 cards" would be told
+        the size of somebody else's collection.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        mine = self.client.get("/api/stats").json()
+        self.assertGreater(mine["total_cards"], 0, "fixture sanity")
+
+        second = self.signed_in_second_user()
+        theirs = second.get("/api/stats").json()
+        self.assertLess(
+            theirs["total_cards"], mine["total_cards"],
+            "the second account is being shown the owner's totals",
+        )
+
+        restock = second.get("/api/inventory").json()["restock"]
+        self.assertLessEqual(
+            restock["cards_short"], theirs["total_cards"],
+            "the restock summary counts cards this account cannot see",
+        )
+
+    def test_58e_settings_stay_per_user_across_separate_databases(self):
+        """
+        Listing settings were already per-user, but they now live in
+        different files, so the inheritance has to keep working: a new
+        account still starts from the seeded defaults rather than from
+        nothing.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        second = self.signed_in_second_user()
+        body = second.get("/api/listing-settings").json()["settings"]
+        self.assertEqual(
+            body.get("target_quantity_default"), "4",
+            "a fresh account must inherit the factory default",
+        )
+        self.assertTrue(
+            body.get("default_game"),
+            "the seeded baseline is missing from a new account's database",
+        )
+
+    def test_58f_only_the_owner_may_push_to_ebay_for_now(self):
+        """
+        The one thing still shared is the eBay connection: a single token for
+        the deployment. Each account now numbers its own cards, and a
+        manifest id *is* the SKU, so two accounts pushing into one store
+        would both claim ID1001 -- and a variation's SKU cannot be renamed,
+        so the collision could not be undone.
+
+        A lock rather than a permission: it comes off when the eBay
+        connection becomes per-account.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        second = self.signed_in_second_user()
+        blocked = second.post("/api/plans/1/push")
+        self.assertEqual(blocked.status_code, 403, blocked.text)
+        self.assertIn("deployment owner", blocked.json()["detail"])
+
+
     # -- automatic repricing ----------------------------------------------
 
     def test_48_the_repricer_preview_needs_no_ebay_connection(self):
@@ -2346,7 +2514,7 @@ class TestWebApp(unittest.TestCase):
         printed to stdout, which a container restart takes with it.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        main.record_logs([
+        main.record_logs(db, [
             {"level": "INFO", "message": "reprice line one"},
             {"level": "WARN", "message": "HOLD ID9101 keeping $2.49"},
         ], "reprice")
@@ -2370,7 +2538,7 @@ class TestWebApp(unittest.TestCase):
         or skip one.
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        main.record_logs(
+        main.record_logs(db,
             [{"level": "INFO", "message": f"page line {i}"} for i in range(10)],
             "test",
         )
@@ -2390,7 +2558,7 @@ class TestWebApp(unittest.TestCase):
         with mock.patch.object(
             main.db, "record_log_entries", side_effect=RuntimeError("disk full")
         ):
-            main.record_logs([{"level": "INFO", "message": "x"}], "test")
+            main.record_logs(db, [{"level": "INFO", "message": "x"}], "test")
 
     def test_53d_clearing_the_stored_history_is_admin_only(self):
         """
@@ -2403,7 +2571,7 @@ class TestWebApp(unittest.TestCase):
         )
 
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
-        main.record_logs([{"level": "INFO", "message": "to be deleted"}], "test")
+        main.record_logs(db, [{"level": "INFO", "message": "to be deleted"}], "test")
         res = self.client.post("/api/logs/clear")
         self.assertEqual(res.status_code, 200)
         self.assertGreater(res.json()["removed"], 0)

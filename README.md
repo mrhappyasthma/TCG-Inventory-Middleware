@@ -1891,13 +1891,52 @@ than one person is listing. The
 [default stock depth](#stock-depth-what-to-restock) is per-user on the same
 basis — how deep *you* choose to stock is a policy, not a fact about a card.
 
-Two things are deliberately **not** per-user, because they describe the
-physical collection rather than the person looking at it: a card's
-[**bin**](#editing-a-bin-by-hand), and a card's own
-[**target**](#stock-depth-what-to-restock) where it overrides the default.
-There is one stack of each card on one shelf. Two users disagreeing about where
-it is, or how many of it to keep, would make the restock list and the pick
-sheet depend on who asked — which is a bug, not a preference.
+### Everything is per-user
+
+**Every account has its own inventory.** Its own cards, quantities, bins,
+stock targets, eBay listing mirror, orders, pick list, plans and logs. Nothing
+a user creates or accumulates is shared. The only shared things are the
+**factory defaults** a new account starts from — the seeded pricing tiers, the
+default stock depth, the listing-settings baseline — and the **TCGCSV set
+index**, which is a cache of public reference data identical for everybody.
+
+Isolation is **structural**: each account's inventory is its own SQLite file.
+
+| Account | File |
+|---|---|
+| The deployment owner (oldest active admin) | `data/inventory.db` |
+| Everybody else | `data/inventory-user-<id>.db` |
+
+Chosen over adding a `user_id` column to sixty-four query methods, because
+the two fail differently in kind. A forgotten scope filter silently shows one
+account another's cards — or pushes them to the wrong eBay store — while a
+mis-resolved database is loud and harmless. There is no legitimate view that
+spans accounts, so making the join impossible to write costs nothing.
+
+**The owner's file keeps its original path**, and must: it holds the catalogue
+whose manifest ids are the SKUs of live eBay listings, and
+[a variation's SKU cannot be renamed](#-a-variations-sku-cannot-be-renamed).
+Nothing about existing data changed when this came in — no migration, no
+re-keying, no downtime. Other accounts get an empty database created the first
+time they sign in.
+
+**Backups cover all of them.** The download list and the zip bundle are
+computed from the account list rather than fixed, so a new account's inventory
+is included the moment it exists. A backup that quietly covered only the owner
+would be the worst kind of failure, because it looks like it worked.
+
+**Unattended jobs act as the owner** — the oldest active admin — which is the
+same account whose pricing rules and listing settings they read. A job falling
+back to a shared baseline would price from rules nobody can see on screen.
+
+> **One thing is still shared: the eBay connection.** There is a single OAuth
+> token for the whole deployment. Since each account now numbers its own cards
+> and a manifest id *is* the SKU, two accounts pushing into one eBay store
+> would both claim `ID1001` — and that could not be undone, because a
+> variation's SKU cannot be renamed. So **eBay writes are locked to the
+> owner's account** until the connection is per-account too. Reads are
+> unaffected; only writes can collide. A second account can build a catalogue
+> and a draft plan, but not push it.
 
 ### Inheritance and reset
 

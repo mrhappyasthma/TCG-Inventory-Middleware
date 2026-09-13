@@ -255,9 +255,121 @@ class _UserDbTokenStore(TokenStore):
         user_db.save_ebay_token(token, connected_by=self.actor)
 
 # Initialize databases & auth
+#
+# `db` is the **deployment owner's** inventory. It keeps the historic path,
+# because that file holds the live catalogue whose manifest ids are the SKUs
+# of live eBay listings -- and a variation's SKU cannot be renamed, so the
+# file can never be rebuilt or re-keyed. Every other account gets its own
+# file beside it. See `inventory_for`.
 db = Database(db_path=DATABASE_URL)
 user_db = UserDatabase(db_path=USER_DATABASE_URL)
 auth_manager = AuthManager(user_db=user_db)
+
+# One inventory database per account, opened on demand and kept.
+#
+# Isolation by file rather than by a `user_id` column on sixty-four query
+# methods. The two differ in the kind of mistake they permit: a forgotten
+# scope filter silently shows one account another's cards -- or pushes them
+# to the wrong eBay store -- while a mis-resolved database is loud and
+# harmless. There is no legitimate view that spans accounts, so nothing is
+# lost by making the join impossible to write.
+#
+# Keyed by user id. The owner maps to the original path so their catalogue is
+# untouched by this change; nobody else has one until they sign in and it is
+# created empty.
+_inventories: Dict[int, Database] = {}
+_inventory_lock = threading.Lock()
+
+
+def inventory_path_for(user_id: int) -> str:
+    """
+    Where one account's inventory lives.
+
+    The owner keeps `data/inventory.db`. Anyone else gets a sibling named
+    after their user id, in the same directory, so the existing data volume,
+    backup routine and NAS bind mount all keep working untouched.
+    """
+    if int(user_id) == _owner_scope():
+        return DATABASE_URL
+    root, ext = os.path.splitext(DATABASE_URL)
+    return f"{root}-user-{int(user_id)}{ext or '.db'}"
+
+
+def _owner_scope() -> int:
+    """
+    The account whose inventory is the original file.
+
+    The oldest active admin, which is the same account background jobs act
+    as. Before anyone has signed up there is none, and the owner path is
+    reserved rather than handed to whoever arrives first -- the first admin
+    to be created inherits it.
+    """
+    owner = user_db.get_owner_user_id()
+    return int(owner) if owner is not None else 0
+
+
+def inventory_for(user: Any) -> Database:
+    """
+    The inventory database belonging to one account.
+
+    Accepts a user dict (as the endpoints hold) or a bare id (as background
+    jobs resolve). Instances are cached because `Database.__init__` runs the
+    schema migration, which should happen once per file and not per request.
+    """
+    user_id = int(user["id"] if isinstance(user, dict) else user)
+    with _inventory_lock:
+        existing = _inventories.get(user_id)
+        if existing is not None:
+            return existing
+        path = inventory_path_for(user_id)
+        # The owner's database is already open as `db`; reuse that instance
+        # rather than opening a second connection pool onto the same file.
+        instance = db if path == DATABASE_URL else Database(db_path=path)
+        _inventories[user_id] = instance
+        return instance
+
+
+def require_owner_for_ebay_writes(user: Dict[str, Any]) -> None:
+    """
+    Refuse an eBay write from any account but the deployment owner's.
+
+    The one thing still shared across accounts is the **eBay connection**:
+    `ebay_connection` holds a single token for the whole deployment. Now that
+    each account has its own catalogue, each also has its own `manifest_id`
+    sequence -- and a manifest id *is* the SKU. Two accounts pushing into one
+    eBay store would therefore both claim `ID1001`, and because a variation's
+    SKU cannot be renamed afterwards, the collision could not be undone.
+
+    So this is a lock, not a permission check: it holds the door shut until
+    the eBay connection is per-account too. Reads are untouched -- only
+    writes can collide.
+    """
+    owner = user_db.get_owner_user_id()
+    if owner is None or int(user["id"]) == int(owner):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "eBay writes are limited to the deployment owner's account. "
+            "There is one eBay connection for the whole deployment, and "
+            "each account numbers its own cards, so two accounts pushing "
+            "into the same store would claim the same SKUs -- which cannot "
+            "be undone, because a variation's SKU cannot be renamed."
+        ),
+    )
+
+
+def owner_inventory() -> Database:
+    """
+    The database an unattended job should act on.
+
+    Falls back to the owner's file when there is no admin yet, which is the
+    same thing it has always been: on a deployment with no users there is
+    nothing to reprice and nothing to poll, so the fallback only has to be
+    harmless.
+    """
+    owner = user_db.get_owner_user_id()
+    return db if owner is None else inventory_for(owner)
 
 app = FastAPI(
     title="TCG Card Inventory Middleware",
@@ -603,12 +715,13 @@ async def process_orders_endpoint(
     """
     Module C: Process raw eBay orders CSV & convert to SortSwift Orders Import CSV.
     """
+    inv = inventory_for(user)
     content_bytes = await read_upload_limited(file)
     csv_text = decode_csv_bytes(content_bytes)
 
     def run():
-        with db.session():
-            return process_orders_csv(csv_text, db)
+        with inv.session():
+            return process_orders_csv(csv_text, inv)
 
     return await run_in_threadpool(run)
 
@@ -641,6 +754,7 @@ async def process_batch_endpoint(
     two sellers processing the same export each get their own output.
 
     """
+    inv = inventory_for(user)
     content_bytes = await read_upload_limited(file)
     csv_text = decode_csv_bytes(content_bytes)
 
@@ -650,10 +764,10 @@ async def process_batch_endpoint(
     # session holds one connection open for the run instead of opening and
     # closing several per card.
     def run():
-        with db.session():
+        with inv.session():
             result = process_batch_csv(
                 csv_text,
-                db,
+                inv,
                 source_name=file.filename or "upload.csv",
                 force=force,
                 dry_run=dry_run,
@@ -671,7 +785,7 @@ async def process_batch_endpoint(
             if not dry_run and not result.get("duplicate"):
                 try:
                     result["plan"] = build_plan(
-                        db, user["id"], source="batch",
+                        inv, user["id"], source="batch",
                         source_ref=file.filename or None,
                     )
                 except PlanError as exc:
@@ -699,12 +813,13 @@ async def process_sync_endpoint(
     """
     Module B: Ingest eBay Active Listings report CSV & sync live store mirror state.
     """
+    inv = inventory_for(user)
     content_bytes = await read_upload_limited(file)
     csv_text = decode_csv_bytes(content_bytes)
 
     def run():
-        with db.session():
-            return sync_active_listings_csv(csv_text, db)
+        with inv.session():
+            return sync_active_listings_csv(csv_text, inv)
 
     return await run_in_threadpool(run)
 
@@ -751,9 +866,10 @@ def get_pricing_rules_endpoint(user: Dict[str, Any] = Depends(require_active_use
     one and the shared baseline otherwise. ``is_own`` lets the UI say which,
     since an inherited set looks identical but resetting it does nothing.
     """
+    inv = inventory_for(user)
     return {
-        "rules": db.get_pricing_rules(user_id=user["id"]),
-        "is_own": db.has_own_pricing_rules(user["id"]),
+        "rules": inv.get_pricing_rules(user_id=user["id"]),
+        "is_own": inv.has_own_pricing_rules(user["id"]),
     }
 
 
@@ -770,23 +886,25 @@ def update_pricing_rules_endpoint(
     editing theirs for the first time creates their own set rather than
     changing the baseline others still inherit.
     """
+    inv = inventory_for(user)
     rules_data = [r.model_dump() for r in req.rules]
-    db.set_pricing_rules(rules_data, user_id=user["id"])
+    inv.set_pricing_rules(rules_data, user_id=user["id"])
     return {
         "success": True,
-        "rules": db.get_pricing_rules(user_id=user["id"]),
-        "is_own": db.has_own_pricing_rules(user["id"]),
+        "rules": inv.get_pricing_rules(user_id=user["id"]),
+        "is_own": inv.has_own_pricing_rules(user["id"]),
     }
 
 
 @app.post("/api/pricing-rules/reset")
 def reset_pricing_rules_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
     """Discard the caller's own rules and inherit the shared defaults again."""
-    rules = db.reset_default_pricing_rules(user_id=user["id"])
+    inv = inventory_for(user)
+    rules = inv.reset_default_pricing_rules(user_id=user["id"])
     return {
         "success": True,
         "rules": rules,
-        "is_own": db.has_own_pricing_rules(user["id"]),
+        "is_own": inv.has_own_pricing_rules(user["id"]),
     }
 
 
@@ -819,16 +937,17 @@ async def refresh_prices_endpoint(
     spacing between them, and doing that on the event loop would freeze the
     dashboard exactly as the CSV pipelines used to.
     """
+    inv = inventory_for(user)
     def run():
-        with db.session():
-            return refresh_market_prices(db, force=force)
+        with inv.session():
+            return refresh_market_prices(inv, force=force)
 
     try:
         result = await run_in_threadpool(run)
     except PriceFeedError as exc:
-        record_logs([{"level": "ERROR", "message": str(exc)}], "prices")
+        record_logs(inv, [{"level": "ERROR", "message": str(exc)}], "prices")
         raise HTTPException(status_code=502, detail=str(exc))
-    record_logs(result.get("logs") or [], "prices")
+    record_logs(inv, result.get("logs") or [], "prices")
     return result
 
 
@@ -838,11 +957,14 @@ def price_history_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Recent market prices for one card, so a surprising reprice is traceable."""
+    inv = inventory_for(user)
     return {"manifest_id": manifest_id,
-            "history": db.get_price_history(manifest_id)}
+            "history": inv.get_price_history(manifest_id)}
 
 
-def record_logs(logs: Sequence[Dict[str, str]], source: str) -> None:
+def record_logs(
+    inv: Database, logs: Sequence[Dict[str, str]], source: str
+) -> None:
     """
     Persist a pipeline's console lines, never at the cost of the work.
 
@@ -854,8 +976,8 @@ def record_logs(logs: Sequence[Dict[str, str]], source: str) -> None:
     if not logs:
         return
     try:
-        with db.session():
-            db.record_log_entries(logs, source=source)
+        with inv.session():
+            inv.record_log_entries(logs, source=source)
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[log] could not record the {source} log: {exc}", flush=True)
 
@@ -874,6 +996,7 @@ def _reprice_now(user_id: int, dry_run: bool = False) -> Dict[str, Any]:
     at the end, from a ``finally`` so that a run which raises part-way through
     still leaves the account of how far it got.
     """
+    inv = inventory_for(user_id)
     client = get_ebay_client()
     adapter = None
     if client is not None and client.oauth.is_connected():
@@ -888,12 +1011,12 @@ def _reprice_now(user_id: int, dry_run: bool = False) -> Dict[str, Any]:
         collected.append({"level": level, "message": message})
 
     try:
-        with db.session():
+        with inv.session():
             return run_reprice(
-                db, adapter, user_id=user_id, dry_run=dry_run, log=log,
+                inv, adapter, user_id=user_id, dry_run=dry_run, log=log,
             )
     finally:
-        record_logs(collected, "reprice")
+        record_logs(inv, collected, "reprice")
 
 
 @app.post("/api/pricing/auto-reprice")
@@ -933,9 +1056,10 @@ def auto_reprice_preview_endpoint(
     changes and the yellow-flagged holds without a network call or the risk of
     a stray write.
     """
-    planned = plan_reprice(db, user_id=user["id"])
+    inv = inventory_for(user)
+    planned = plan_reprice(inv, user_id=user["id"])
     return {
-        "enabled": auto_reprice_enabled(db, user_id=user["id"]),
+        "enabled": auto_reprice_enabled(inv, user_id=user["id"]),
         "considered": planned["considered"],
         "eligible": planned["eligible"],
         "change_count": len(planned["changes"]),
@@ -981,7 +1105,8 @@ def reprice_log_endpoint(
     with it, and on a Synology nobody is watching the console anyway. This is
     the durable record of every verdict, including the holds.
     """
-    return {"entries": db.get_reprice_history(limit=max(1, min(1000, limit)))}
+    inv = inventory_for(user)
+    return {"entries": inv.get_reprice_history(limit=max(1, min(1000, limit)))}
 
 
 # The console shows this many lines; the dialog pages back through the rest.
@@ -1008,15 +1133,16 @@ def get_logs_endpoint(
     than by offset, so the window stays stable while new lines arrive at the
     other end.
     """
+    inv = inventory_for(user)
     levels = [part for part in (level or "").split(",") if part.strip()]
-    entries = db.get_log_entries(
+    entries = inv.get_log_entries(
         limit=max(1, min(2000, limit)),
         before_id=before_id,
         levels=levels or None,
     )
     return {
         "entries": entries,
-        "total": db.count_log_entries(),
+        "total": inv.count_log_entries(),
         "oldest_id": entries[-1]["id"] if entries else None,
     }
 
@@ -1031,7 +1157,8 @@ def clear_logs_endpoint(user: Dict[str, Any] = Depends(require_admin_user)):
     live listings, so throwing it away is a deliberate act rather than a side
     effect of tidying the screen.
     """
-    removed = db.clear_log_entries()
+    inv = inventory_for(user)
+    removed = inv.clear_log_entries()
     return {"success": True, "removed": removed}
 
 
@@ -1073,7 +1200,7 @@ def _ebay_timestamp(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
-def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
+def _poll_orders_now(inv: Database, dry_run: bool = False) -> Dict[str, Any]:
     """
     One round of reading orders and deducting what sold.
 
@@ -1096,7 +1223,7 @@ def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
         collected.append({"level": level, "message": message})
 
     now = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
-    stored = db.get_listing_setting(ORDER_WATERMARK_SETTING, "")
+    stored = inv.get_listing_setting(ORDER_WATERMARK_SETTING, "")
     watermark = parse_timestamp(stored)
 
     # No watermark means this deployment has never polled. eBay will hand
@@ -1122,8 +1249,8 @@ def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
         # A partial read looks like a quiet week, which is the one thing this
         # must never report. The watermark stays put.
         log("ERROR", f"Refusing a partial read of orders: {exc}")
-        record_logs(collected, "orders")
-        db.record_order_poll(outcome="failed", detail=str(exc)[:200])
+        record_logs(inv, collected, "orders")
+        inv.record_order_poll(outcome="failed", detail=str(exc)[:200])
         raise OrderSyncError(str(exc))
 
     lines = project_order_lines(raw)
@@ -1134,8 +1261,8 @@ def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
             f"since {_ebay_timestamp(since)}. Nothing was deducted and the "
             f"watermark was not moved."
         ))
-        record_logs(collected, "orders")
-        db.record_order_poll(
+        record_logs(inv, collected, "orders")
+        inv.record_order_poll(
             orders=len(raw), seen=len(lines),
             outcome="preview",
         )
@@ -1145,22 +1272,22 @@ def _poll_orders_now(dry_run: bool = False) -> Dict[str, Any]:
         }
 
     def run():
-        with db.session():
-            return sync_orders(db, lines, log=log, adopt=first_run)
+        with inv.session():
+            return sync_orders(inv, lines, log=log, adopt=first_run)
 
     try:
         result = run()
     finally:
-        record_logs(collected, "orders")
+        record_logs(inv, collected, "orders")
 
     # Only now, and only on success. Recorded as the moment the poll started
     # rather than finished: an order modified during the call belongs to the
     # next window, not to neither.
-    db.set_listing_settings(
+    inv.set_listing_settings(
         {ORDER_WATERMARK_SETTING: format_timestamp(now)}, user_id=SHARED_SCOPE
     )
 
-    db.record_order_poll(
+    inv.record_order_poll(
         orders=len(raw),
         seen=result.get("seen", 0),
         deducted=result.get("deducted", 0),
@@ -1189,8 +1316,9 @@ async def poll_orders_endpoint(
     first run can be inspected before being trusted, and so a sale can be
     accounted for without waiting.
     """
+    inv = inventory_for(user)
     try:
-        return await run_in_threadpool(lambda: _poll_orders_now(dry_run=dry_run))
+        return await run_in_threadpool(lambda: _poll_orders_now(inv, dry_run=dry_run))
     except OrderSyncError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except EbayError as exc:
@@ -1209,26 +1337,27 @@ def recent_orders_endpoint(
     cancellation after a deduction -- because those are the ones needing a
     person, and a list that showed only successes would hide them.
     """
+    inv = inventory_for(user)
     return {
-        "last_polled_at": db.get_listing_setting(ORDER_WATERMARK_SETTING, ""),
+        "last_polled_at": inv.get_listing_setting(ORDER_WATERMARK_SETTING, ""),
         "poll_interval_minutes": ORDER_POLL_INTERVAL_MINUTES,
         "enabled": ORDER_POLL_ENABLED,
         # The polls themselves. A row of quiet ones is how you know the
         # poller is alive, which nothing else on the page can tell you.
-        "polls": db.get_order_polls(limit=8),
+        "polls": inv.get_order_polls(limit=8),
         # Only sales that resolved to a catalogued card. The rest are
         # overwhelmingly ordinary business -- sales from listings this
         # application does not manage -- and listing them read like a page
         # of problems, which is exactly what it was not.
-        "lines": db.get_recent_order_lines(
+        "lines": inv.get_recent_order_lines(
             limit=max(1, min(500, limit)), matched_only=True
         ),
-        "unmatched_count": db.count_order_lines(matched=False),
+        "unmatched_count": inv.count_order_lines(matched=False),
         # How many cards are waiting to be pulled. Returned here as well as
         # from the pick endpoint so the To Pick badge is right without the
         # tab having been opened -- this is the call the dashboard already
         # makes on a timer, and a queue nobody knows about is not a queue.
-        "outstanding_cards": db.count_outstanding_pick_lines(),
+        "outstanding_cards": inv.count_outstanding_pick_lines(),
     }
 
 
@@ -1249,13 +1378,14 @@ def pick_list_endpoint(
     not an address, not a username. The address is eBay's to print. This
     answers the other half: which cards, and out of which box.
     """
+    inv = inventory_for(user)
     outstanding = str(scope or "outstanding").lower() != "all"
     return {
         "scope": "outstanding" if outstanding else "all",
-        "orders": db.get_pick_orders(
+        "orders": inv.get_pick_orders(
             outstanding_only=outstanding, limit=max(1, min(200, limit))
         ),
-        "outstanding_cards": db.count_outstanding_pick_lines(),
+        "outstanding_cards": inv.count_outstanding_pick_lines(),
     }
 
 
@@ -1273,8 +1403,9 @@ def set_pick_endpoint(
     when the sale was seen -- this is only the note that the physical card is
     now in an envelope rather than on a shelf.
     """
+    inv = inventory_for(user)
     if req.line_item_id:
-        moved = db.set_order_line_picked(
+        moved = inv.set_order_line_picked(
             order_id, req.line_item_id, req.picked
         )
         if not moved:
@@ -1283,7 +1414,7 @@ def set_pick_endpoint(
             )
         changed = 1
     else:
-        changed = db.set_order_picked(order_id, req.picked)
+        changed = inv.set_order_picked(order_id, req.picked)
         if not changed:
             raise HTTPException(
                 status_code=404,
@@ -1297,7 +1428,7 @@ def set_pick_endpoint(
         "order_id": order_id,
         "picked": req.picked,
         "lines_changed": changed,
-        "outstanding_cards": db.count_outstanding_pick_lines(),
+        "outstanding_cards": inv.count_outstanding_pick_lines(),
     }
 
 
@@ -1309,6 +1440,7 @@ async def _scheduled_order_poll() -> None:
     exception would end the loop and the symptom would be silence -- which is
     indistinguishable from a shop with no sales. So every path returns.
     """
+    inv = owner_inventory()
     try:
         client = get_ebay_client()
         if client is None or not client.oauth.is_connected():
@@ -1323,13 +1455,13 @@ async def _scheduled_order_poll() -> None:
         )
     except (OrderSyncError, EbayError) as exc:
         print(f"[orders] poll failed, no stock moved: {exc}", flush=True)
-        record_logs(
+        record_logs(inv, 
             [{"level": "WARN", "message": f"Order poll failed: {exc}"}],
             "orders",
         )
     except Exception as exc:
         print(f"[orders] unexpected error, no stock moved: {exc}", flush=True)
-        record_logs(
+        record_logs(inv, 
             [{"level": "ERROR",
               "message": f"Unexpected order poll error: {exc}"}],
             "orders",
@@ -1378,15 +1510,16 @@ async def _nightly_reprice() -> None:
     also keeps market prices current, and an exception would take that with
     it.
     """
+    inv = owner_inventory()
     def skip(reason: str) -> None:
         print(f"[reprice] {reason}, skipping", flush=True)
-        record_logs([{
+        record_logs(inv, [{
             "level": "INFO",
             "message": f"Nightly repricing skipped: {reason}.",
         }], "reprice")
 
     try:
-        if not auto_reprice_enabled(db):
+        if not auto_reprice_enabled(inv):
             skip("disabled in Listing Rules")
             return
 
@@ -1429,6 +1562,7 @@ async def start_price_refresh_loop():
     on TCGCSV's own last-updated timestamp, so a loop that wakes more often
     than they publish costs one request and changes nothing.
     """
+    inv = owner_inventory()
     if not PRICE_REFRESH_ENABLED:
         print("[prices] background refresh disabled", flush=True)
         return
@@ -1438,11 +1572,11 @@ async def start_price_refresh_loop():
         while True:
             try:
                 def run():
-                    with db.session():
-                        return refresh_market_prices(db)
+                    with inv.session():
+                        return refresh_market_prices(inv)
 
                 result = await run_in_threadpool(run)
-                record_logs(result.get("logs") or [], "prices")
+                record_logs(inv, result.get("logs") or [], "prices")
                 if result.get("skipped"):
                     print(f"[prices] already current ({result.get('snapshot')})",
                           flush=True)
@@ -1454,13 +1588,13 @@ async def start_price_refresh_loop():
                 # stored price exactly as it was.
                 print(f"[prices] refresh failed, prices unchanged: {exc}",
                       flush=True)
-                record_logs([{
+                record_logs(inv, [{
                     "level": "WARN",
                     "message": f"Price refresh failed, prices unchanged: {exc}",
                 }], "prices")
             except Exception as exc:
                 print(f"[prices] unexpected refresh error: {exc}", flush=True)
-                record_logs([{
+                record_logs(inv, [{
                     "level": "ERROR",
                     "message": f"Unexpected price refresh error: {exc}",
                 }], "prices")
@@ -1482,9 +1616,10 @@ def get_condition_multipliers_endpoint(
     public price data nor the SortSwift export it was relayed through breaks
     down by condition -- so the grade adjustment is policy, configured here.
     """
+    inv = inventory_for(user)
     return {
-        "multipliers": db.get_condition_multipliers(user_id=user["id"]),
-        "is_own": db.has_own_condition_multipliers(user["id"]),
+        "multipliers": inv.get_condition_multipliers(user_id=user["id"]),
+        "is_own": inv.has_own_condition_multipliers(user["id"]),
     }
 
 
@@ -1494,6 +1629,7 @@ def update_condition_multipliers_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Save the signed-in user's own grade discounts."""
+    inv = inventory_for(user)
     for item in req.multipliers:
         if item.multiplier < 0:
             raise HTTPException(
@@ -1512,13 +1648,13 @@ def update_condition_multipliers_endpoint(
                     f"Use a markup rule for that."
                 ),
             )
-    db.set_condition_multipliers(
+    inv.set_condition_multipliers(
         [m.model_dump() for m in req.multipliers], user_id=user["id"]
     )
     return {
         "success": True,
-        "multipliers": db.get_condition_multipliers(user_id=user["id"]),
-        "is_own": db.has_own_condition_multipliers(user["id"]),
+        "multipliers": inv.get_condition_multipliers(user_id=user["id"]),
+        "is_own": inv.has_own_condition_multipliers(user["id"]),
     }
 
 
@@ -1527,11 +1663,12 @@ def reset_condition_multipliers_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Discard the caller's own grade discounts and inherit the shared set."""
-    multipliers = db.reset_condition_multipliers(user_id=user["id"])
+    inv = inventory_for(user)
+    multipliers = inv.reset_condition_multipliers(user_id=user["id"])
     return {
         "success": True,
         "multipliers": multipliers,
-        "is_own": db.has_own_condition_multipliers(user["id"]),
+        "is_own": inv.has_own_condition_multipliers(user["id"]),
     }
 
 
@@ -1541,15 +1678,16 @@ def preview_pricing_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Test and preview what an eBay price would be for a given TCG price."""
+    inv = inventory_for(user)
     multipliers = {
         m["condition_key"]: m["multiplier"]
-        for m in db.get_condition_multipliers(user_id=user["id"])
+        for m in inv.get_condition_multipliers(user_id=user["id"])
     }
     adjusted, factor = apply_condition_multiplier(
         req.price, req.condition, multipliers
     )
     calculated_price, rule = apply_pricing_rules(
-        db.get_pricing_rules(user_id=user["id"]), adjusted
+        inv.get_pricing_rules(user_id=user["id"]), adjusted
     )
     return {
         "input_price": req.price,
@@ -1584,9 +1722,10 @@ def get_listing_settings_endpoint(user: Dict[str, Any] = Depends(require_active_
     on top. ``own_keys`` names the ones the caller has actually set, so the UI
     can distinguish an inherited value from a chosen one.
     """
+    inv = inventory_for(user)
     return {
-        "settings": db.get_listing_settings(user_id=user["id"]),
-        "own_keys": db.get_own_listing_setting_keys(user["id"]),
+        "settings": inv.get_listing_settings(user_id=user["id"]),
+        "own_keys": inv.get_own_listing_setting_keys(user["id"]),
     }
 
 
@@ -1602,22 +1741,24 @@ def update_listing_settings_endpoint(
     template, business policy names and postal code describe the caller's own
     eBay account, so they cannot sensibly be shared.
     """
-    db.set_listing_settings(req.settings, user_id=user["id"])
+    inv = inventory_for(user)
+    inv.set_listing_settings(req.settings, user_id=user["id"])
     return {
         "success": True,
-        "settings": db.get_listing_settings(user_id=user["id"]),
-        "own_keys": db.get_own_listing_setting_keys(user["id"]),
+        "settings": inv.get_listing_settings(user_id=user["id"]),
+        "own_keys": inv.get_own_listing_setting_keys(user["id"]),
     }
 
 
 @app.post("/api/listing-settings/reset")
 def reset_listing_settings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
     """Discard the caller's own settings and inherit the shared defaults again."""
-    settings = db.reset_listing_settings(user_id=user["id"])
+    inv = inventory_for(user)
+    settings = inv.reset_listing_settings(user_id=user["id"])
     return {
         "success": True,
         "settings": settings,
-        "own_keys": db.get_own_listing_setting_keys(user["id"]),
+        "own_keys": inv.get_own_listing_setting_keys(user["id"]),
     }
 
 
@@ -1669,8 +1810,9 @@ def get_inventory_endpoint(
     """
     # Read once and passed to both calls, so the rows and the total cannot
     # be computed against different targets.
-    target_default = db.get_target_quantity_default(user_id=user["id"])
-    items = db.get_inventory(
+    inv = inventory_for(user)
+    target_default = inv.get_target_quantity_default(user_id=user["id"])
+    items = inv.get_inventory(
         search=search,
         sort_by=sort_by,
         sort_dir=sort_dir,
@@ -1680,7 +1822,7 @@ def get_inventory_endpoint(
         below_target=below_target,
         target_default=target_default,
     )
-    total = db.get_inventory_count(
+    total = inv.get_inventory_count(
         search=search, set_name=set_name,
         below_target=below_target, target_default=target_default,
     )
@@ -1693,7 +1835,7 @@ def get_inventory_endpoint(
         # Always the full shortfall under the current search and set, not
         # just this page's. The question is how much there is left to buy,
         # which a page cannot answer.
-        "restock": db.get_restock_summary(
+        "restock": inv.get_restock_summary(
             set_name=set_name, search=search, target_default=target_default
         ),
     }
@@ -1715,10 +1857,11 @@ def set_card_target_quantity(
     Sending no value clears the override, so the card follows the account
     default again.
     """
-    result = db.set_manifest_target_quantity(manifest_id, req.target_quantity)
+    inv = inventory_for(user)
+    result = inv.set_manifest_target_quantity(manifest_id, req.target_quantity)
     if result is None:
         raise HTTPException(status_code=404, detail="Card not found.")
-    target_default = db.get_target_quantity_default(user_id=user["id"])
+    target_default = inv.get_target_quantity_default(user_id=user["id"])
     effective = (
         result["current"] if result["current"] is not None else target_default
     )
@@ -1746,15 +1889,16 @@ def get_ebay_listings_endpoint(user: Dict[str, Any] = Depends(require_active_use
     # Exchange one needs a Revise file uploaded, and the two are not
     # interchangeable -- offering the wrong one hands out a file that silently
     # does nothing, or an API call eBay refuses.
+    inv = inventory_for(user)
     managed = {
         row["ebay_parent_id"]
-        for row in db.get_managed_listings()
+        for row in inv.get_managed_listings()
         if row.get("ebay_parent_id")
     }
     return {
         "listings": [
             {**listing, "managed": listing["ebay_parent_id"] in managed}
-            for listing in db.get_ebay_listings()
+            for listing in inv.get_ebay_listings()
         ]
     }
 
@@ -1777,6 +1921,7 @@ async def set_listing_cover(
     A listing we created through the API is therefore updated immediately, and
     a legacy one still gets the Revise file to upload.
     """
+    inv = inventory_for(user)
     url = (req.cover_image_url or "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="A cover photo URL is required.")
@@ -1786,18 +1931,18 @@ async def set_listing_cover(
             detail="The cover photo must be a full http:// or https:// URL that eBay can fetch.",
         )
 
-    known = {l["ebay_parent_id"] for l in db.get_ebay_listings()}
+    known = {l["ebay_parent_id"] for l in inv.get_ebay_listings()}
     if item_id not in known:
         raise HTTPException(
             status_code=404,
             detail="No linked listing with that eBay item number.",
         )
 
-    saved = db.set_listing_cover_image(item_id, url)
+    saved = inv.set_listing_cover_image(item_id, url)
 
     # The choice is recorded first, so that a failure to apply it still leaves
     # it stored and retryable with the listing's Refresh button.
-    if db.get_managed_listing_by_parent(item_id) is None:
+    if inv.get_managed_listing_by_parent(item_id) is None:
         return {
             "success": True,
             "ebay_parent_id": item_id,
@@ -1826,8 +1971,8 @@ async def set_listing_cover(
     adapter = InventoryApiAdapter(client)
 
     def run():
-        with db.session():
-            return refresh_listing(db, adapter, item_id, user_id=user["id"])
+        with inv.session():
+            return refresh_listing(inv, adapter, item_id, user_id=user["id"])
 
     try:
         result = await run_in_threadpool(run)
@@ -1856,7 +2001,8 @@ def get_inventory_sets(user: Dict[str, Any] = Depends(require_active_user)):
     Derived from the catalog rather than a fixed list, so the filter can only
     ever offer a set that actually has cards behind it.
     """
-    return {"sets": db.get_distinct_set_names()}
+    inv = inventory_for(user)
+    return {"sets": inv.get_distinct_set_names()}
 
 
 @app.post("/api/inventory/{manifest_id}/quantity")
@@ -1873,14 +2019,15 @@ def set_card_quantity(
     and generate_deduction is set, a SortSwift deduction CSV for the difference
     is returned so the same correction can be applied there.
     """
+    inv = inventory_for(user)
     if req.quantity < 0:
         raise HTTPException(status_code=400, detail="Quantity cannot be negative.")
 
-    card = db.get_manifest_by_id(manifest_id)
+    card = inv.get_manifest_by_id(manifest_id)
     if not card:
         raise HTTPException(status_code=404, detail="Card not found.")
 
-    result = db.set_manifest_quantity(manifest_id, req.quantity)
+    result = inv.set_manifest_quantity(manifest_id, req.quantity)
     if not result:
         raise HTTPException(status_code=404, detail="Card not found.")
 
@@ -1921,7 +2068,8 @@ def set_card_remark(
     upload from overwriting it. Clearing it hands ownership back to the
     export.
     """
-    result = db.set_manifest_remarks(manifest_id, req.remarks)
+    inv = inventory_for(user)
+    result = inv.set_manifest_remarks(manifest_id, req.remarks)
     if result is None:
         raise HTTPException(status_code=404, detail="Card not found.")
     return {
@@ -1935,7 +2083,8 @@ def set_card_remark(
 @app.get("/api/stats")
 def get_stats_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
     """Get catalog and stock statistics."""
-    return db.get_stats()
+    inv = inventory_for(user)
+    return inv.get_stats()
 
 
 @app.post("/api/inventory/add")
@@ -1944,11 +2093,12 @@ def add_card_manually(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Manually add or update a card in the master catalog."""
-    manifest_id, is_new, card_data = db.get_or_create_manifest(
+    inv = inventory_for(user)
+    manifest_id, is_new, card_data = inv.get_or_create_manifest(
         req.product_name, req.set_name, req.condition, req.printing
     )
     if req.ebay_parent_id:
-        db.upsert_variation(manifest_id, req.ebay_parent_id, req.quantity)
+        inv.upsert_variation(manifest_id, req.ebay_parent_id, req.quantity)
     return {
         "success": True,
         "manifest_id": manifest_id,
@@ -1963,7 +2113,8 @@ def delete_card_endpoint(
     user: Dict[str, Any] = Depends(require_active_user),
 ):
     """Delete a card from the master catalog."""
-    success = db.delete_manifest(manifest_id)
+    inv = inventory_for(user)
+    success = inv.delete_manifest(manifest_id)
     if not success:
         raise HTTPException(status_code=404, detail="Card not found.")
     return {"success": True, "manifest_id": manifest_id}
@@ -1989,7 +2140,8 @@ def _csv_safe(value: Any) -> Any:
 @app.get("/api/export/manifest")
 def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
     """Export complete Master Catalog & Live Mirror as CSV download."""
-    items = db.export_all_manifest()
+    inv = inventory_for(user)
+    items = inv.export_all_manifest()
     fieldnames = [
         "manifest_id",
         "product_name",
@@ -2055,6 +2207,50 @@ DATABASE_FILES = {
 }
 
 
+def database_specs() -> Dict[str, Dict[str, Any]]:
+    """
+    Every database the deployment owns, including one per extra account.
+
+    `DATABASE_FILES` describes the two fixed files. Since each account now
+    keeps its own inventory, the rest are discovered from the user list --
+    and only the ones that exist on disk are offered, because an account that
+    has never signed in has no file yet and a zero-byte member in a backup is
+    worse than an absent one.
+
+    Computed per call rather than cached: a backup taken after a new account
+    joined has to include them, and nobody is going to restart the container
+    to make that true.
+    """
+    specs = dict(DATABASE_FILES)
+    owner = _owner_scope()
+    for account in user_db.list_all_users():
+        user_id = int(account["id"])
+        if user_id == owner:
+            continue
+        path = inventory_path_for(user_id)
+        if not os.path.exists(path):
+            continue
+        label = account.get("username") or account.get("email") or f"user {user_id}"
+        specs[f"inventory-user-{user_id}"] = {
+            "label": f"Inventory ({label})",
+            "stem": f"tcg-inventory-user-{user_id}",
+            "description": (
+                f"Card catalogue, eBay links, quantities, pricing rules and "
+                f"listing settings belonging to {label}."
+            ),
+            "path": (lambda p=path: p),
+            "export": (
+                lambda dest, uid=user_id: inventory_for(uid).export_snapshot(dest)
+            ),
+            "summary": (
+                lambda uid=user_id: {
+                    "cards": inventory_for(uid).get_stats()["total_cards"],
+                }
+            ),
+        }
+    return specs
+
+
 @app.get("/api/database/files")
 def list_database_files(admin: Dict[str, Any] = Depends(require_admin_user)):
     """
@@ -2063,7 +2259,7 @@ def list_database_files(admin: Dict[str, Any] = Depends(require_admin_user)):
     Admin only, matching the downloads themselves.
     """
     entries = []
-    for name, spec in DATABASE_FILES.items():
+    for name, spec in database_specs().items():
         path = os.path.abspath(spec["path"]())
         try:
             summary = spec["summary"]()
@@ -2090,7 +2286,7 @@ def download_database_file(
     admin: Dict[str, Any] = Depends(require_admin_user),
 ):
     """Download one database as a consistent snapshot. Admin only."""
-    spec = DATABASE_FILES.get(name)
+    spec = database_specs().get(name)
     if spec is None:
         raise HTTPException(status_code=404, detail=f"No such database: {name}")
 
@@ -2141,7 +2337,7 @@ def download_database_bundle(
 
     try:
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-            for name, spec in DATABASE_FILES.items():
+            for name, spec in database_specs().items():
                 member = f"{spec['stem']}-{stamp}.db"
                 staged = os.path.join(tmp_dir, member)
                 spec["export"](staged)
@@ -2182,12 +2378,13 @@ def download_inventory_database(
     Taken with VACUUM INTO so the write-ahead log is checkpointed into the file.
     A hand-copied .db can otherwise be missing its most recent commits.
     """
+    inv = inventory_for(admin)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     tmp_dir = tempfile.mkdtemp(prefix="tcg-snapshot-")
     dest = os.path.join(tmp_dir, f"tcg-inventory-{stamp}.db")
 
     try:
-        db.export_snapshot(dest)
+        inv.export_snapshot(dest)
     except Exception as exc:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(
@@ -2222,6 +2419,7 @@ async def import_inventory_database(
     current database is copied aside first either way, so a restore is
     reversible.
     """
+    inv = inventory_for(admin)
     tmp_dir = tempfile.mkdtemp(prefix="tcg-import-")
     staged = os.path.join(tmp_dir, "upload.db")
     try:
@@ -2240,11 +2438,11 @@ async def import_inventory_database(
                     )
                 out.write(chunk)
 
-        check = db.inspect_snapshot(staged)
+        check = inv.inspect_snapshot(staged)
         if not check["ok"]:
             raise HTTPException(status_code=400, detail=check["error"])
 
-        current = db.get_stats()
+        current = inv.get_stats()
 
         if not confirm:
             return {
@@ -2261,7 +2459,7 @@ async def import_inventory_database(
                 ),
             }
 
-        result = db.replace_with_snapshot(staged)
+        result = inv.replace_with_snapshot(staged)
         return {
             "applied": True,
             "filename": file.filename,
@@ -2291,8 +2489,9 @@ def health_check():
     Reports degraded rather than merely 'process is up' so that a container with
     an unreachable or unwritable data volume is surfaced as unhealthy.
     """
+    inv = db
     try:
-        db.get_stats()
+        inv.get_stats()
         return {"status": "ok", "database": "reachable"}
     except Exception as exc:
         # This endpoint is unauthenticated, so the exception text stays in the
@@ -2499,6 +2698,7 @@ async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)
     in the Feed report are not something this code has yet seen against a real
     store; if a column is missing, the headers in the response say which.
     """
+    inv = inventory_for(user)
     client = _require_ebay_client()
     if not client.oauth.is_connected():
         raise HTTPException(
@@ -2518,8 +2718,8 @@ async def ebay_sync_from_api(user: Dict[str, Any] = Depends(require_active_user)
         first_line = next(
             (line for line in csv_text.splitlines() if line.strip()), ""
         )
-        with db.session():
-            result = sync_active_listings_csv(csv_text, db)
+        with inv.session():
+            result = sync_active_listings_csv(csv_text, inv)
         result["report"] = {
             "task_id": report["task_id"],
             "status": report["status"],
@@ -2562,6 +2762,7 @@ async def refresh_listing_endpoint(
     Deliberately cannot move stock or money: quantity is re-sent as what eBay
     is already known to hold, and no price is sent at all.
     """
+    inv = inventory_for(user)
     client = get_ebay_client()
     if client is None or not client.oauth.is_connected():
         raise HTTPException(
@@ -2571,8 +2772,8 @@ async def refresh_listing_endpoint(
     adapter = InventoryApiAdapter(client)
 
     def run():
-        with db.session():
-            return refresh_listing(db, adapter, item_id, user_id=user["id"])
+        with inv.session():
+            return refresh_listing(inv, adapter, item_id, user_id=user["id"])
 
     try:
         result = await run_in_threadpool(run)
@@ -2622,6 +2823,7 @@ async def ebay_account_setup(admin: Dict[str, Any] = Depends(require_admin_user)
     an offer without one, so an empty list here is the normal state and a
     thing to fix rather than a fault.
     """
+    inv = inventory_for(admin)
     client = get_ebay_client()
     if client is None:
         raise HTTPException(
@@ -2633,7 +2835,7 @@ async def ebay_account_setup(admin: Dict[str, Any] = Depends(require_admin_user)
             detail="Connect the eBay account first: this reads its policies.",
         )
 
-    settings = db.get_listing_settings(user_id=admin["id"])
+    settings = inv.get_listing_settings(user_id=admin["id"])
     marketplace_id = str(settings.get("marketplace_id") or "EBAY_US")
 
     def run():
@@ -2691,13 +2893,14 @@ async def ebay_create_inventory_location(
     without publishing an address. The key is permanent once set, so it is
     validated before the call rather than after.
     """
+    inv = inventory_for(admin)
     client = get_ebay_client()
     if client is None or not client.oauth.is_connected():
         raise HTTPException(
             status_code=409, detail="Connect the eBay account first."
         )
 
-    settings = db.get_listing_settings(user_id=admin["id"])
+    settings = inv.get_listing_settings(user_id=admin["id"])
     postal = (req.postal_code or settings.get("seller_postal_code") or "").strip()
     if not postal:
         raise HTTPException(
@@ -2720,7 +2923,7 @@ async def ebay_create_inventory_location(
 
     # Recorded immediately: the key cannot be changed on eBay's side, so
     # losing track of it would mean a location nothing can reference.
-    db.set_listing_settings(
+    inv.set_listing_settings(
         {"merchant_location_key": key}, user_id=admin["id"]
     )
     print(f"[ebay] inventory location {key} created", flush=True)
@@ -2890,7 +3093,8 @@ def list_plans(user: Dict[str, Any] = Depends(require_active_user)):
     showing another user's drafts would let one person approve another's
     intent.
     """
-    return {"plans": db.get_plans(user_id=user["id"])}
+    inv = inventory_for(user)
+    return {"plans": inv.get_plans(user_id=user["id"])}
 
 
 @app.post("/api/plans/build")
@@ -2906,10 +3110,11 @@ async def build_draft_plan(
     longer applies. Runs in a threadpool because it walks the whole catalogue
     and would otherwise block the event loop and freeze the dashboard.
     """
+    inv = inventory_for(user)
     try:
         summary = await run_in_threadpool(
             build_plan,
-            db,
+            inv,
             user["id"],
             source=req.source,
             note=req.note,
@@ -2930,21 +3135,22 @@ def get_plan_detail(
     a meaningful row without all of them: an item's blockers decide how it is
     drawn.
     """
-    plan = db.get_plan(plan_id)
+    inv = inventory_for(user)
+    plan = inv.get_plan(plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Plan not found.")
     if plan["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Plan not found.")
 
     try:
-        blockers = plan_blockers(db, plan_id)
+        blockers = plan_blockers(inv, plan_id)
     except PlanError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
     return {
         "plan": plan,
-        "groups": db.get_plan_groups(plan_id),
-        "items": db.get_plan_items(plan_id),
+        "groups": inv.get_plan_groups(plan_id),
+        "items": inv.get_plan_items(plan_id),
         "blockers": blockers,
     }
 
@@ -2962,10 +3168,11 @@ def update_plan_item_endpoint(
     about to be pushed after the approval that authorised it, which makes the
     approval a record of something that never happened.
     """
-    item = db.get_plan_item(item_id)
+    inv = inventory_for(user)
+    item = inv.get_plan_item(item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Plan item not found.")
-    plan = db.get_plan(item["plan_id"])
+    plan = inv.get_plan(item["plan_id"])
     if plan is None or plan["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Plan item not found.")
     if plan["status"] != "draft":
@@ -2985,15 +3192,15 @@ def update_plan_item_endpoint(
             detail="Price must be above zero; eBay rejects a zero-price listing.",
         )
 
-    db.update_plan_item(item_id, **changes)
+    inv.update_plan_item(item_id, **changes)
     # Re-validate straight away so the page never shows a blocker for a
     # problem the user has just fixed.
-    problems = revalidate_item(db, item_id)
+    problems = revalidate_item(inv, item_id)
     return {
         "success": True,
-        "item": db.get_plan_item(item_id),
+        "item": inv.get_plan_item(item_id),
         "problems": problems,
-        "blockers": plan_blockers(db, item["plan_id"]),
+        "blockers": plan_blockers(inv, item["plan_id"]),
     }
 
 
@@ -3016,7 +3223,8 @@ def set_plan_cover(
     apply the change before it was approved. An empty URL clears the staged
     choice and the page falls back to showing the live listing's own picture.
     """
-    plan = db.get_plan(plan_id)
+    inv = inventory_for(user)
+    plan = inv.get_plan(plan_id)
     if plan is None or plan["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Plan not found.")
     if plan["status"] != "draft":
@@ -3032,10 +3240,10 @@ def set_plan_cover(
             detail="A cover photo must be an http:// or https:// URL that eBay can fetch.",
         )
 
-    db.set_plan_group_cover(plan_id, req.group_key, url)
+    inv.set_plan_group_cover(plan_id, req.group_key, url)
     return {
         "success": True,
-        "groups": db.get_plan_groups(plan_id),
+        "groups": inv.get_plan_groups(plan_id),
     }
 
 
@@ -3050,11 +3258,12 @@ def approve_plan_endpoint(
     worker's authorisation check is a stored fact rather than a claim made by
     whichever request happens to be running.
     """
-    plan = db.get_plan(plan_id)
+    inv = inventory_for(user)
+    plan = inv.get_plan(plan_id)
     if plan is None or plan["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Plan not found.")
     try:
-        result = approve_plan(db, plan_id, approved_by=user["id"])
+        result = approve_plan(inv, plan_id, approved_by=user["id"])
     except PlanError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return {"success": True, **result}
@@ -3131,6 +3340,7 @@ def _push_job_snapshot(job_id: str, since: int = 0) -> Optional[Dict[str, Any]]:
 
 def _run_push_job(job_id: str, plan_id: int, user_id: int, group_keys) -> None:
     """Run one push to completion, recording progress as it goes."""
+    inv = inventory_for(user_id)
     def note(level: str, message: str) -> None:
         with _push_jobs_lock:
             job = _push_jobs.get(job_id)
@@ -3141,9 +3351,9 @@ def _run_push_job(job_id: str, plan_id: int, user_id: int, group_keys) -> None:
     client = get_ebay_client()
     adapter = InventoryApiAdapter(client)
     try:
-        with db.session():
+        with inv.session():
             result = push_plan(
-                db, adapter, plan_id, user_id=user_id,
+                inv, adapter, plan_id, user_id=user_id,
                 group_keys=group_keys, log=note,
             )
         outcome, error = result, None
@@ -3169,7 +3379,7 @@ def _run_push_job(job_id: str, plan_id: int, user_id: int, group_keys) -> None:
     with _push_jobs_lock:
         job = _push_jobs.get(job_id)
         lines = list(job["logs"]) if job else []
-    record_logs(lines, "push")
+    record_logs(inv, lines, "push")
 
 
 class PlanPushRequest(BaseModel):
@@ -3208,7 +3418,14 @@ async def push_plan_endpoint(
     File Exchange is left for the CSV path and reported as deferred, since
     pushing it would create a duplicate rather than update the live one.
     """
-    plan = db.get_plan(plan_id)
+    # Before anything else: there is one eBay connection for the whole
+    # deployment but a manifest id sequence per account, and a manifest
+    # id is the SKU. Two accounts pushing into one store would collide
+    # irreversibly.
+    require_owner_for_ebay_writes(user)
+
+    inv = inventory_for(user)
+    plan = inv.get_plan(plan_id)
     if plan is None or plan["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Plan not found.")
     if plan["status"] == "draft":
@@ -3274,6 +3491,7 @@ def get_push_job(
     statuses are the durable answer to that, so the page sends the reader
     there rather than declaring a failure it cannot know about.
     """
+    inv = inventory_for(user)
     snapshot = _push_job_snapshot(job_id, since=max(0, since))
     if snapshot is None:
         raise HTTPException(
@@ -3285,7 +3503,7 @@ def get_push_job(
             ),
         )
     if snapshot["plan_id"] is not None:
-        plan = db.get_plan(snapshot["plan_id"])
+        plan = inv.get_plan(snapshot["plan_id"])
         if plan is not None and plan["user_id"] != user["id"]:
             raise HTTPException(status_code=404, detail="Job not found.")
     return snapshot
@@ -3304,7 +3522,8 @@ def discard_plan_endpoint(
     pushed is the only record of who authorised a live change and what it did,
     so it stays.
     """
-    plan = db.get_plan(plan_id)
+    inv = inventory_for(user)
+    plan = inv.get_plan(plan_id)
     if plan is None or plan["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Plan not found.")
     if plan["status"] not in ("draft", "approved"):
@@ -3315,7 +3534,7 @@ def discard_plan_endpoint(
                 f"is the record of that change and cannot be deleted."
             ),
         )
-    db.delete_plan(plan_id)
+    inv.delete_plan(plan_id)
     return {"success": True}
 
 

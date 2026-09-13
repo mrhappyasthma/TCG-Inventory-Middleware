@@ -117,3 +117,40 @@
 * **`GOOGLE_CLIENT_ID` is required configuration.** The app must fail fast at startup without it rather than booting into an unusable state, and the ID token audience check must always run.
 * **Never ship a default signing secret.** `JWT_SECRET` comes from the environment, or is randomly generated and persisted to the data volume.
 * **Google rejects raw-IP and plain-HTTP OAuth origins** (only `localhost` is exempt), so the NAS deployment requires an HTTPS hostname in front of the container. Keep this constraint documented in the README.
+
+## 5. 👤 Data Ownership: Everything Is Per-User
+
+* **Every feature is per-user. Only *defaults* are shared.** A user's cards,
+  quantities, bins, stock targets, eBay listing mirror, orders, plans, logs,
+  pricing rules and settings belong to that account alone. The only things
+  that may be shared are the **factory defaults** a new account starts from
+  (the seeded pricing tiers, the default stock-depth target, the seeded
+  listing-settings baseline at `SHARED_SCOPE`) and **caches of third-party
+  reference data** that are identical for everybody, such as the TCGCSV set
+  index. Nothing a user creates or accumulates is ever shared.
+* **Apply this to new work without being asked.** When adding a table, a
+  column, an endpoint or a background job, scope it to the owning account from
+  the outset. Do not ship a shared version intending to scope it later.
+* **Do not argue that something "describes the physical collection".** That
+  reasoning was used to justify keeping a card's bin and its stock target
+  shared across accounts, and it was overruled: another user's shelf is not
+  this user's shelf. If two accounts could ever disagree about a value, it is
+  per-user.
+* **Isolation is structural, not a `WHERE` clause.** Each account's inventory
+  lives in **its own SQLite file** (`data/inventory.db` for the deployment
+  owner, `data/inventory-user-<id>.db` for everyone else), resolved through
+  the registry in `app/main.py`. This was chosen over adding `user_id` to
+  sixty-four query methods precisely because the failure modes differ in
+  kind: a forgotten scope filter silently shows one account another's cards,
+  or pushes them to the wrong eBay store, whereas a mis-resolved database is
+  loud and harmless. Never reintroduce cross-account queries -- there is no
+  legitimate view that spans accounts.
+* **The owner's file keeps its name.** `data/inventory.db` is the deployment
+  owner's database and must not be renamed or rebuilt: it holds the live
+  catalogue whose `manifest_id`s are the SKUs of live eBay listings, and a
+  variation's SKU cannot be renamed (see §3). Migrations touching ownership
+  must be additive and lossless.
+* **Background jobs act as the owner.** They have no signed-in user, so they
+  resolve `user_db.get_owner_user_id()` -- the oldest active admin -- and use
+  that account's database and rules. A job that fell back to a shared
+  baseline would price from rules nobody can see on screen.
