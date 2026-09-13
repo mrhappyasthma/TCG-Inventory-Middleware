@@ -770,8 +770,10 @@ Module C's card shows three things, deliberately separated:
 * **Recent polls** — "13:00, no new orders" and so on. A row of quiet polls
   is the only thing that distinguishes a working poller from a stopped one,
   since both show zero sales.
-* **Cards sold** — only sales that matched a catalogued card. Empty until one
-  of your listings sells.
+* **Cards sold** — only sales that matched a catalogued card, **one block per
+  order**: the cards that go in that envelope, and where to get each one from.
+  See [Where to get the card from](#where-to-get-the-card-from). Empty until
+  one of your listings sells.
 * **A count** of sales from listings this app does not manage, stated as a
   fact rather than a warning.
 
@@ -818,9 +820,27 @@ be the only signal buys latency, not correctness.
 
 ### Where to get the card from
 
-Each row under **Cards sold** is a pick line, not a log entry. It carries the
-card, its number, set, condition and printing — enough to pick the right copy
-out of a box of near-identical ones — and, in green, **the bin**.
+**Cards sold** shows one block per order, not a flat list of cards. One block
+is one envelope: a flat list cannot tell you which two cards ship together,
+and two orders arriving in the same poll would be an undifferentiated pile.
+Each block is headed by the eBay order number and a count, and each line under
+it carries the card, its number, set, condition and printing — enough to pick
+the right copy out of a box of near-identical ones — and, in green, **the
+bin**.
+
+```
+26-60885                                    2 card(s), 3 copies
+  Charizard #004/102                                        −1
+  [Bin A-12]  Base Set · Near Mint · Holofoil           ID1074
+  2× Pikachu #025/102                                       −2
+  [no bin]    Base Set · Near Mint · Normal             ID1075
+```
+
+A quantity is shown only when it is more than one, since almost every line is
+a single and a `1×` on all of them is noise. A cancelled or refunded line is
+tinted amber and labelled, and tints its order's border, rather than being
+removed — money coming back does not put a card on the shelf, and it may
+already have shipped.
 
 | What you have | Where the bin comes from |
 |---|---|
@@ -829,8 +849,13 @@ out of a box of near-identical ones — and, in green, **the bin**.
 | eBay's **packing slip**, for a listing created through the API | Nothing. The SKU is the bare manifest id, e.g. `ID1074`. |
 
 So the packing slip alone is not enough, which is why the manifest id appears
-on each sold row: it is what the slip prints, and it is how a slip in your
-hand matches a row on screen.
+on each sold line: it is what the slip prints, and it is how a slip in your
+hand matches a line on screen.
+
+> **This is a panel, not a document.** It is the recent sold cards as the
+> dashboard shows them — there is no print view, and no record of which
+> orders you have already packed. Work from eBay's own slip for the address
+> and from this for the bins.
 
 A card with no bin recorded says **no bin** rather than showing a gap, because
 "go to A-12" and "you will have to hunt for this one" are different

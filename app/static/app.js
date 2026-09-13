@@ -660,44 +660,12 @@ async function loadOrderPoll() {
         // because it is almost all ordinary business and a list of it reads
         // like a page of problems.
         //
-        // Written as a pick list rather than a log, because the question this
-        // answers is "something sold, where do I go and get it". So the bin
-        // is the loud element, and the manifest id is shown because that is
-        // what eBay prints on the packing slip for anything listed through
-        // the API -- it is how a slip in your hand matches a row here.
-        const lines = data.lines || [];
-        box.innerHTML = lines.length
-            ? lines.map(l => {
-                const trouble = l.status !== "ACTIVE";
-                const moved = l.deducted_at
-                    ? `&minus;${l.deducted_qty}`
-                    : "pending";
-                const name = l.product_name || l.manifest_id || l.sku || "(unknown)";
-                const number = l.card_number ? ` #${l.card_number}` : "";
-                const detail = [l.set_name, l.condition, l.printing]
-                    .map(v => String(v || "").trim())
-                    .filter(Boolean)
-                    .join(" \u00b7 ");
-                const bin = String(l.remarks || "").trim();
-                // An absent bin is stated rather than left blank: it is the
-                // difference between "go to A-12" and "you will have to hunt
-                // for this one", and a gap says neither.
-                const binChip = bin
-                    ? `<span class="px-1.5 py-0.5 rounded font-mono text-[10px] bg-emerald-950/70 text-emerald-200 border border-emerald-800/60">${escapeHtml(bin)}</span>`
-                    : `<span class="px-1.5 py-0.5 rounded text-[10px] text-slate-500 border border-dashed border-slate-700">no bin</span>`;
-                return `<div class="px-2 py-1.5 rounded-lg bg-dark-900/50 border border-slate-800">
-                    <div class="flex items-baseline gap-2 text-[11px] ${trouble ? "text-amber-200" : "text-slate-200"}">
-                        <span class="truncate font-medium">${escapeHtml(name + number)}</span>
-                        <span class="ml-auto font-mono shrink-0">${trouble ? escapeHtml(String(l.status).toLowerCase()) : moved}</span>
-                    </div>
-                    <div class="flex items-center gap-2 mt-1 text-[10px] text-slate-500">
-                        ${binChip}
-                        <span class="truncate">${escapeHtml(detail)}</span>
-                        <span class="ml-auto font-mono shrink-0 text-slate-600">${escapeHtml(l.manifest_id || l.sku || "")}</span>
-                    </div>
-                </div>`;
-              }).join("")
-            : `<p class="text-[11px] text-slate-500">No catalogued card has sold yet.</p>`;
+        // Grouped by order, because the question this answers is "something
+        // sold, what goes in the envelope". A flat list of cards cannot
+        // answer it: two orders arriving in the same poll become an
+        // undifferentiated pile with no way to tell which cards ship
+        // together. One block is one envelope.
+        box.innerHTML = renderSoldOrders(data.lines || []);
 
         if (note) {
             const messages = [];
@@ -726,6 +694,83 @@ async function loadOrderPoll() {
         // Advisory: the poller runs on the server regardless.
         console.error("order poll status:", err);
     }
+}
+
+// One block per order: the cards to pull, and where each one is.
+//
+// eBay's packing slip is not a substitute. A card's bin reaches eBay only
+// inside the listing's SKU, which was done in the File Exchange era and
+// cannot be changed afterwards -- so a migrated listing's slip shows the bin
+// the card had on the day it was listed, and an API-created listing's slip
+// shows none at all. For most of the store this is the only place the
+// current one exists.
+function renderSoldOrders(lines) {
+    if (!lines.length) {
+        return `<p class="text-[11px] text-slate-500">No catalogued card has sold yet.</p>`;
+    }
+
+    // Keep the order the server sent -- newest sale first -- while gathering
+    // each order's lines together. Insertion order of a Map is stable, but
+    // the array is kept explicitly so the intent does not rest on that.
+    const orders = [];
+    const byId = new Map();
+    lines.forEach(line => {
+        const id = String(line.order_id || "");
+        if (!byId.has(id)) {
+            const group = { id: id, lines: [] };
+            byId.set(id, group);
+            orders.push(group);
+        }
+        byId.get(id).lines.push(line);
+    });
+
+    return orders.map(order => {
+        const copies = order.lines.reduce(
+            (sum, l) => sum + (Number(l.quantity) || 0), 0
+        );
+        const anyTrouble = order.lines.some(l => l.status !== "ACTIVE");
+        const cards = order.lines.map(l => {
+            const trouble = l.status !== "ACTIVE";
+            const moved = l.deducted_at ? `&minus;${l.deducted_qty}` : "pending";
+            const name = l.product_name || l.manifest_id || l.sku || "(unknown)";
+            const number = l.card_number ? ` #${l.card_number}` : "";
+            const detail = [l.set_name, l.condition, l.printing]
+                .map(v => String(v || "").trim())
+                .filter(Boolean)
+                .join(" \u00b7 ");
+            const bin = String(l.remarks || "").trim();
+            // An absent bin is stated rather than left blank: "go to A-12"
+            // and "you will have to hunt for this one" are different
+            // instructions, and a gap states neither.
+            const binChip = bin
+                ? `<span class="px-1.5 py-0.5 rounded font-mono text-[10px] bg-emerald-950/70 text-emerald-200 border border-emerald-800/60">${escapeHtml(bin)}</span>`
+                : `<span class="px-1.5 py-0.5 rounded text-[10px] text-slate-500 border border-dashed border-slate-700">no bin</span>`;
+            // How many copies of this one card. Silent at one, because that
+            // is almost every line and a "1x" on all of them is noise.
+            const qty = (Number(l.quantity) || 0) > 1
+                ? `<span class="font-mono text-amber-300">${Number(l.quantity)}&times;</span> `
+                : "";
+            return `<div class="pt-1.5 first:pt-0">
+                <div class="flex items-baseline gap-2 text-[11px] ${trouble ? "text-amber-200" : "text-slate-200"}">
+                    <span class="truncate font-medium">${qty}${escapeHtml(name + number)}</span>
+                    <span class="ml-auto font-mono shrink-0">${trouble ? escapeHtml(String(l.status).toLowerCase()) : moved}</span>
+                </div>
+                <div class="flex items-center gap-2 mt-0.5 text-[10px] text-slate-500">
+                    ${binChip}
+                    <span class="truncate">${escapeHtml(detail)}</span>
+                    <span class="ml-auto font-mono shrink-0 text-slate-600">${escapeHtml(l.manifest_id || l.sku || "")}</span>
+                </div>
+            </div>`;
+        }).join("");
+
+        return `<div class="px-2 py-1.5 rounded-lg bg-dark-900/50 border ${anyTrouble ? "border-amber-800/50" : "border-slate-800"}">
+            <div class="flex items-baseline gap-2 text-[10px] text-slate-500 pb-1 mb-0.5 border-b border-slate-800">
+                <span class="font-mono">${escapeHtml(order.id)}</span>
+                <span class="ml-auto shrink-0">${order.lines.length} card(s), ${copies} cop${copies === 1 ? "y" : "ies"}</span>
+            </div>
+            ${cards}
+        </div>`;
+    }).join("");
 }
 
 async function pollOrders(button) {
