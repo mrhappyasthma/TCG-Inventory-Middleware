@@ -1470,9 +1470,41 @@ Only one draft can be open per user, and rebuilding replaces it. Two drafts over
 the same cards would each be computed against state the other is about to
 change, and approving both would apply the older numbers second.
 
-> **Nothing on this page contacts eBay yet.** Approval is implemented; the push
-> that acts on it is the last step of the migration. See
-> [`docs/ebay-api-design.md`](docs/ebay-api-design.md).
+#### Deleting a plan, and purging the old ones
+
+A single plan can be thrown away from the page itself, but only if it never
+reached eBay. The line is drawn at **pushed**, not at approved: an approval
+nobody acted on is a decision that was changed, while a pushed plan is this
+application's only record of who authorised a live change and what it did.
+
+The page still fills up, because every upload builds one. To clear the back of
+the list:
+
+```bash
+python scripts/purge_old_plans.py --before 10          # dry run, lists what would go
+python scripts/purge_old_plans.py --before 10 --yes    # actually delete
+```
+
+On the NAS, where the databases live:
+
+```bash
+cd /volume1/docker/tcg-middleware
+docker compose exec tcg-middleware python scripts/purge_old_plans.py --before 10
+```
+
+* `--before` is **exclusive**: `--before 10` keeps plan 10.
+* A **dry run is the default** and writes nothing. It prints every plan it
+  would delete with its item count, and names the pushed ones separately,
+  because those are the only losses not recoverable from anywhere else.
+* A real run takes a **full snapshot** of the database beside it first and
+  prints the path. There is no undo.
+* `--keep-pushed` spares the plans that reached eBay and clears only drafts
+  and abandoned approvals.
+* Unlike the drafts page, the script is **not scoped to one account** — a
+  purge has to see everything it is about to delete.
+
+The listings themselves are untouched either way. They live on eBay and in our
+mirror of it; a plan is the record of how a change was decided, not the change.
 
 ### eBay Listings
 

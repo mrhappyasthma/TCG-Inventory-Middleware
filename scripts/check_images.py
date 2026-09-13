@@ -21,8 +21,10 @@ Two questions, and the second is the one that matters:
 
 Whose image it is decides the remedy, so the report says. A **cover photo** is
 stored against the listing by this application and changed on the eBay
-Listings tab. A **card image** comes from the export's ``CDN Image`` column
-and has to be corrected in SortSwift and the export re-uploaded. Fixing
+Listings tab. A **card image** comes from the export's ``CDN Image``
+column -- or, for a card with no scan, the ``Stock Image`` column it falls
+back to, labelled ``(stock)`` in the report -- and has to be corrected in
+SortSwift and the export re-uploaded. Fixing
 either on eBay alone lasts until the next push or Refresh, which sends ours
 straight back.
 
