@@ -1888,6 +1888,184 @@ class TestWebApp(unittest.TestCase):
         finally:
             db.delete_manifest("ID9200")
 
+    # -- the pick list -----------------------------------------------------
+
+    def pick_fixture(self):
+        """
+        One two-card order and one single, both of catalogued cards.
+
+        Returns the outstanding count from before it was added. The suite
+        shares one database, so an absolute count is whatever earlier
+        tests left behind -- only the delta is this test's own.
+        """
+        db.insert_manifest("ID9300", "Charizard", "Base Set", "Near Mint",
+                           "Holofoil", card_number="004/102",
+                           remarks="Bin A-12")
+        db.insert_manifest("ID9301", "Pikachu", "Base Set", "Near Mint",
+                           "Normal", card_number="025/102")
+        db.set_manifest_quantity("ID9300", 3)
+        db.set_manifest_quantity("ID9301", 3)
+        baseline = db.count_outstanding_pick_lines()
+        for order_id, line_id, manifest_id, qty in (
+            ("56-00001", "A1", "ID9300", 1),
+            ("56-00001", "A2", "ID9301", 2),
+            ("56-00002", "B1", "ID9300", 1),
+        ):
+            db.upsert_order_line(
+                order_id=order_id, line_item_id=line_id, sku=manifest_id,
+                legacy_item_id="1111", quantity=qty,
+                manifest_id=manifest_id, status="ACTIVE",
+                sold_at="2026-09-12 10:00:00",
+            )
+        return baseline
+
+    def clear_pick_fixture(self):
+        with db.get_connection() as conn:
+            conn.execute(
+                "DELETE FROM ebay_order_line WHERE order_id IN "
+                "('56-00001', '56-00002')"
+            )
+            conn.commit()
+        db.delete_manifest("ID9300")
+        db.delete_manifest("ID9301")
+
+    def test_56a_the_pick_list_groups_by_order_and_carries_the_bin(self):
+        """
+        One block is one envelope, and each line says which box to go to.
+
+        eBay's packing slip cannot answer the second part: the bin reaches
+        eBay only inside a listing's SKU, which cannot be renamed, so an
+        API-created listing's slip carries no bin at all.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        baseline = self.pick_fixture()
+        try:
+            res = self.client.get("/api/orders/pick")
+            self.assertEqual(res.status_code, 200, res.text)
+            body = res.json()
+            self.assertEqual(body["scope"], "outstanding")
+            self.assertEqual(body["outstanding_cards"] - baseline, 3)
+
+            orders = {o["order_id"]: o for o in body["orders"]}
+            self.assertIn("56-00001", orders)
+            self.assertEqual(orders["56-00001"]["card_count"], 2)
+            self.assertEqual(orders["56-00001"]["copy_count"], 3)
+            bins = {
+                l["product_name"]: l["remarks"]
+                for l in orders["56-00001"]["lines"]
+            }
+            self.assertEqual(bins, {"Charizard": "Bin A-12", "Pikachu": ""})
+        finally:
+            self.clear_pick_fixture()
+
+    def test_56b_the_pick_list_carries_no_buyer_information(self):
+        """
+        None is stored, which is what the account-deletion exemption rests
+        on. This asserts the response cannot leak what the database does not
+        hold -- a guard against somebody later joining a table that does.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.pick_fixture()
+        try:
+            body = self.client.get("/api/orders/pick").json()
+            keys = set()
+            for order in body["orders"]:
+                keys.update(order.keys())
+                for line in order["lines"]:
+                    keys.update(line.keys())
+            for forbidden in (
+                "buyer", "buyer_username", "name", "email", "phone",
+                "address", "ship_to", "postal_code",
+            ):
+                self.assertNotIn(forbidden, keys)
+        finally:
+            self.clear_pick_fixture()
+
+    def test_56c_ticking_the_last_card_packs_the_order_and_clears_the_queue(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        baseline = self.pick_fixture()
+        try:
+            one = self.client.post(
+                "/api/orders/pick/56-00001",
+                json={"picked": True, "line_item_id": "A1"},
+            )
+            self.assertEqual(one.status_code, 200, one.text)
+            self.assertEqual(one.json()["outstanding_cards"] - baseline, 2)
+
+            body = self.client.get("/api/orders/pick").json()
+            half = next(o for o in body["orders"]
+                        if o["order_id"] == "56-00001")
+            self.assertFalse(half["packed"])
+            self.assertEqual(half["picked_count"], 1)
+
+            rest = self.client.post(
+                "/api/orders/pick/56-00001", json={"picked": True}
+            )
+            self.assertEqual(rest.status_code, 200, rest.text)
+            self.assertEqual(rest.json()["outstanding_cards"] - baseline, 1)
+
+            # Gone from the queue, still visible under "all recent".
+            outstanding = self.client.get("/api/orders/pick").json()
+            self.assertNotIn(
+                "56-00001",
+                [o["order_id"] for o in outstanding["orders"]],
+            )
+            everything = self.client.get(
+                "/api/orders/pick?scope=all"
+            ).json()
+            packed = next(o for o in everything["orders"]
+                          if o["order_id"] == "56-00001")
+            self.assertTrue(packed["packed"])
+        finally:
+            self.clear_pick_fixture()
+
+    def test_56d_a_pick_can_be_undone_and_moves_no_stock(self):
+        """
+        Unticking is allowed because people put cards back. Either way the
+        catalogue is untouched: the poller already deducted the sale.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.pick_fixture()
+        try:
+            before = db.get_manifest_by_id("ID9300")["quantity"]
+            self.client.post("/api/orders/pick/56-00002", json={"picked": True})
+            self.assertEqual(
+                db.get_manifest_by_id("ID9300")["quantity"], before,
+                "picking must not move stock",
+            )
+
+            undo = self.client.post(
+                "/api/orders/pick/56-00002", json={"picked": False}
+            )
+            self.assertEqual(undo.status_code, 200, undo.text)
+            self.assertIn(
+                "56-00002",
+                [o["order_id"] for o in
+                 self.client.get("/api/orders/pick").json()["orders"]],
+            )
+        finally:
+            self.clear_pick_fixture()
+
+    def test_56e_an_unknown_order_or_line_is_refused(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.pick_fixture()
+        try:
+            self.assertEqual(
+                self.client.post(
+                    "/api/orders/pick/56-99999", json={"picked": True}
+                ).status_code,
+                404,
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/api/orders/pick/56-00001",
+                    json={"picked": True, "line_item_id": "NOPE"},
+                ).status_code,
+                404,
+            )
+        finally:
+            self.clear_pick_fixture()
+
     # -- automatic repricing ----------------------------------------------
 
     def test_48_the_repricer_preview_needs_no_ebay_connection(self):

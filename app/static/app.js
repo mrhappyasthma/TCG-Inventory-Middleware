@@ -608,6 +608,10 @@ async function loadOrderPoll() {
         const data = await res.json();
 
         when.innerText = describePollAge(data.last_polled_at);
+        // The To Pick badge rides along on this call, which already runs on
+        // arrival and after every poll, so a new sale shows up as work to do
+        // without the tab being opened.
+        updatePickBadge(data.outstanding_cards);
         // Stale is worth flagging: eBay serves ninety days of orders, so a
         // poller that stopped long enough leaves sales it can never read.
         const minutes = data.last_polled_at
@@ -2224,10 +2228,197 @@ function getConditionBadgeClass(condition) {
 // WORKSPACE TABS
 // -------------------------------------------------------------------
 
+// -------------------------------------------------------------------
+// TO PICK: the work queue, and a sheet to print
+// -------------------------------------------------------------------
+
+// "outstanding" is the queue; "all" includes packed orders so a finished one
+// can be checked or un-ticked.
+let pickScope = "outstanding";
+
+function setPickScope(scope) {
+    pickScope = scope === "all" ? "all" : "outstanding";
+    const on = "px-3 py-1.5 text-[11px] font-semibold bg-brand-600 text-white";
+    const off = "px-3 py-1.5 text-[11px] font-semibold bg-dark-800 text-slate-300 hover:bg-slate-700";
+    const a = document.getElementById("pickScopeOutstanding");
+    const b = document.getElementById("pickScopeAll");
+    if (a) a.className = pickScope === "outstanding" ? on : off;
+    if (b) b.className = pickScope === "all" ? on : off;
+    fetchPickList();
+}
+
+async function fetchPickList() {
+    const box = document.getElementById("pickList");
+    if (!box) return;
+    try {
+        const res = await fetch(`/api/orders/pick?scope=${encodeURIComponent(pickScope)}`);
+        if (!res.ok) throw new Error("Could not load the pick list");
+        const data = await res.json();
+        renderPickList(data);
+        updatePickBadge(data.outstanding_cards);
+    } catch (err) {
+        box.innerHTML = `<p class="text-xs text-rose-400">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+// The tab badge. Kept in step with every tick so the count never disagrees
+// with the list beside it.
+function updatePickBadge(count) {
+    const badge = document.getElementById("pickCountBadge");
+    if (!badge) return;
+    const n = Number(count) || 0;
+    badge.innerText = String(n);
+    badge.classList.toggle("hidden", n === 0);
+}
+
+function renderPickList(data) {
+    const box = document.getElementById("pickList");
+    const summary = document.getElementById("pickSummary");
+    const orders = data.orders || [];
+
+    if (summary) {
+        const cards = Number(data.outstanding_cards) || 0;
+        summary.innerText = cards
+            ? `${cards} card(s) to pull across ${orders.length} order(s).`
+            : (data.scope === "all"
+                ? `Nothing outstanding. Showing ${orders.length} recent order(s).`
+                : "Nothing to pull. Everything that sold has been picked.");
+    }
+
+    if (!orders.length) {
+        box.innerHTML = data.scope === "all"
+            ? `<p class="text-xs text-slate-500">No catalogued card has sold yet.</p>`
+            : `<p class="text-xs text-slate-500">Nothing to pull. Switch to <strong>All recent</strong> to see orders already packed.</p>`;
+        return;
+    }
+
+    box.innerHTML = orders.map(order => {
+        const done = order.packed;
+        const sold = formatPickDate(order.sold_at || order.first_seen_at);
+        const cards = (order.lines || []).map(line => pickLine(order, line)).join("");
+        return `<div class="pick-order rounded-xl border ${done ? "border-slate-800 bg-dark-900/40" : (order.needs_attention ? "border-amber-800/60 bg-dark-800/60" : "border-slate-700 bg-dark-800/60")} overflow-hidden">
+            <div class="flex items-center gap-3 px-3 py-2 border-b border-slate-800">
+                <div class="min-w-0">
+                    <p class="font-mono text-xs text-slate-200">${escapeHtml(order.order_id)}</p>
+                    <p class="text-[10px] text-slate-500">${escapeHtml(sold)} &middot; ${order.card_count} card(s), ${order.copy_count} cop${order.copy_count === 1 ? "y" : "ies"}</p>
+                </div>
+                <span class="ml-auto shrink-0 px-2 py-0.5 rounded-full text-[10px] font-bold ${done ? "bg-emerald-950 text-emerald-300 border border-emerald-800/60" : "bg-slate-800 text-slate-300 border border-slate-700"}">
+                    ${done ? "packed" : `${order.picked_count}/${order.live_count} picked`}
+                </span>
+                <button type="button" onclick="setOrderPicked('${escapeHtml(order.order_id)}', ${done ? "false" : "true"})"
+                    class="no-print shrink-0 px-2.5 py-1 rounded-lg text-[10px] font-semibold ${done ? "bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700" : "bg-emerald-700 hover:bg-emerald-600 text-white"}">
+                    ${done ? "Un-pack" : "Pack all"}
+                </button>
+            </div>
+            <div class="divide-y divide-slate-800">${cards}</div>
+        </div>`;
+    }).join("");
+}
+
+function pickLine(order, line) {
+    const dead = line.status !== "ACTIVE";
+    const picked = !!line.picked_at;
+    const name = line.product_name || line.manifest_id || line.sku || "(unknown)";
+    const number = line.card_number ? ` #${line.card_number}` : "";
+    const detail = [line.set_name, line.condition, line.printing]
+        .map(v => String(v || "").trim())
+        .filter(Boolean)
+        .join(" \u00b7 ");
+    const bin = String(line.remarks || "").trim();
+    const copies = Number(line.quantity) || 0;
+
+    // A cancelled line is shown and struck through rather than removed: it
+    // may already have shipped, and somebody holding this sheet needs to
+    // know the card was on the order and is not to be sent.
+    if (dead) {
+        return `<div class="flex items-center gap-3 px-3 py-2 opacity-60">
+            <span class="pick-box w-4 h-4 shrink-0 rounded border border-slate-700"></span>
+            <div class="min-w-0">
+                <p class="text-xs text-slate-400 line-through">${escapeHtml((copies > 1 ? copies + "x " : "") + name + number)}</p>
+                <p class="text-[10px] text-amber-300/90">${escapeHtml(String(line.status).toLowerCase())} &mdash; do not send</p>
+            </div>
+        </div>`;
+    }
+
+    const binChip = bin
+        ? `<span class="pick-bin px-1.5 py-0.5 rounded font-mono text-[10px] bg-emerald-950/70 text-emerald-200 border border-emerald-800/60">${escapeHtml(bin)}</span>`
+        : `<span class="px-1.5 py-0.5 rounded text-[10px] text-slate-500 border border-dashed border-slate-700">no bin</span>`;
+
+    return `<label class="flex items-center gap-3 px-3 py-2 cursor-pointer hover:bg-dark-900/40">
+        <input type="checkbox" ${picked ? "checked" : ""}
+            onchange="setLinePicked('${escapeHtml(order.order_id)}', '${escapeHtml(line.line_item_id)}', this.checked)"
+            class="pick-box w-4 h-4 shrink-0 rounded bg-dark-900 border-slate-600 text-emerald-600 focus:ring-emerald-500 focus:ring-offset-dark-900">
+        <div class="min-w-0 flex-1">
+            <p class="text-xs ${picked ? "text-slate-500 line-through" : "text-slate-100"}">
+                ${copies > 1 ? `<span class="font-mono text-amber-300">${copies}&times;</span> ` : ""}${escapeHtml(name + number)}
+            </p>
+            <p class="text-[10px] text-slate-500 truncate">${escapeHtml(detail)}</p>
+        </div>
+        ${binChip}
+        <span class="font-mono text-[10px] text-slate-600 shrink-0">${escapeHtml(line.manifest_id || line.sku || "")}</span>
+    </label>`;
+}
+
+// A sold date, or the moment we first saw the sale when eBay gave none.
+function formatPickDate(value) {
+    if (!value) return "date unknown";
+    const at = new Date(String(value).replace(" ", "T") + "Z");
+    if (isNaN(at.getTime())) return String(value);
+    return at.toLocaleString([], {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
+    });
+}
+
+async function setLinePicked(orderId, lineItemId, picked) {
+    await postPick(orderId, { picked: picked, line_item_id: lineItemId });
+}
+
+async function setOrderPicked(orderId, picked) {
+    await postPick(orderId, { picked: picked });
+}
+
+async function postPick(orderId, body) {
+    try {
+        const res = await fetch(`/api/orders/pick/${encodeURIComponent(orderId)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Could not record that");
+        updatePickBadge(data.outstanding_cards);
+        // Refetched rather than patched in place, because ticking a line can
+        // change the order's own state -- the last card makes it packed, and
+        // in the outstanding scope that removes it from the list entirely.
+        fetchPickList();
+    } catch (err) {
+        alert(err.message);
+        fetchPickList();
+    }
+}
+
+// Print just this panel. The scoping class is added for the duration of the
+// print and taken off afterwards, so Ctrl+P elsewhere on the dashboard still
+// prints the page normally.
+function printPickList() {
+    const stamp = document.getElementById("pickPrintedAt");
+    if (stamp) {
+        stamp.innerText = "Printed " + new Date().toLocaleString()
+            + (pickScope === "all" ? " (all recent orders)" : " (outstanding only)");
+    }
+    document.body.classList.add("printing-pick");
+    try {
+        window.print();
+    } finally {
+        document.body.classList.remove("printing-pick");
+    }
+}
+
 const WORKSPACE_TABS = {
     inventory: { panel: "panelInventory", button: "tabBtnInventory" },
     listings: { panel: "panelListings", button: "tabBtnListings" },
     drafts: { panel: "panelDrafts", button: "tabBtnDrafts" },
+    pick: { panel: "panelPick", button: "tabBtnPick" },
     console: { panel: "panelConsole", button: "tabBtnConsole" },
 };
 
@@ -2268,6 +2459,9 @@ function switchWorkspaceTab(key) {
     // Same for drafts: a plan is a diff against the catalogue, and the
     // catalogue may have moved since this page loaded.
     if (key === "drafts") fetchDraftPlan();
+    // And the pick list: cards get pulled between page loads, and a stale
+    // queue is the one thing this tab must not show.
+    if (key === "pick") fetchPickList();
 }
 
 function clearConsoleUnread() {

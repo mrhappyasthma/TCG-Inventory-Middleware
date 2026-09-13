@@ -374,6 +374,7 @@ class Database:
                     last_seen_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     deducted_at   TIMESTAMP,
                     deducted_qty  INTEGER,
+                    picked_at     TIMESTAMP,
                     PRIMARY KEY (order_id, line_item_id)
                 );
                 """,
@@ -389,6 +390,27 @@ class Database:
             # ordinary sales look like 46 problems.
             #
             # A public listing number, not personal data.
+            # When this card was physically pulled off the shelf.
+            #
+            # Per line rather than per order, because that is how picking
+            # actually goes: a three-card order is three trips, and an order
+            # half done is a real state that needs somewhere to live. An
+            # order is packed when every one of its live lines is ticked, so
+            # the per-order answer comes out of this for free -- whereas a
+            # per-order flag could not express the half.
+            #
+            # Deliberately separate from deducted_at. Deduction is what the
+            # poller did to the catalogue and is claimed exactly once by
+            # machine; this is what a person did in the room, and they can
+            # untick it because people put cards back.
+            cursor.execute("PRAGMA table_info(ebay_order_line)")
+            if "picked_at" not in {
+                row["name"] for row in cursor.fetchall()
+            }:
+                cursor.execute(
+                    "ALTER TABLE ebay_order_line ADD COLUMN picked_at TIMESTAMP"
+                )
+
             cursor.execute("PRAGMA table_info(ebay_order_line)")
             if "legacy_item_id" not in {
                 row["name"] for row in cursor.fetchall()
@@ -2564,6 +2586,175 @@ class Database:
             )
             conn.commit()
             return cursor.rowcount == 1
+
+    def set_order_line_picked(
+        self, order_id: str, line_item_id: str, picked: bool = True
+    ) -> bool:
+        """
+        Record that a card was pulled off the shelf, or that it was put back.
+
+        Unlike ``mark_order_line_deducted`` this is not claim-once. Deduction
+        is a machine acting on the catalogue and must happen exactly once; a
+        pick is a person acting on a shelf, and people put cards back.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE ebay_order_line
+                   SET picked_at = CASE WHEN ? THEN CURRENT_TIMESTAMP END
+                 WHERE order_id = ? AND line_item_id = ?
+                """,
+                (1 if picked else 0, str(order_id).strip(),
+                 str(line_item_id).strip()),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def set_order_picked(self, order_id: str, picked: bool = True) -> int:
+        """
+        Tick every line of an order at once, and report how many moved.
+
+        Most orders are a single card, where ticking the line and ticking the
+        order are the same action and asking for two clicks would be silly.
+
+        Only live lines are touched: a cancelled line is not something anybody
+        picks, and marking it packed would claim work that must not be done.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE ebay_order_line
+                   SET picked_at = CASE WHEN ? THEN CURRENT_TIMESTAMP END
+                 WHERE order_id = ?
+                   AND status = 'ACTIVE'
+                """,
+                (1 if picked else 0, str(order_id).strip()),
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def get_pick_orders(
+        self, outstanding_only: bool = True, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Orders to pack, newest first, each with the cards in it.
+
+        Grouped here rather than in the browser because this is the shape the
+        work has: one order is one envelope, and a flat list of cards cannot
+        say which of them ship together.
+
+        Only lines that resolved to a catalogued card appear. A sale from a
+        listing this application does not manage has no card of ours behind
+        it and nothing to pull; it is counted elsewhere, not listed here.
+
+        ``outstanding_only`` keeps orders with at least one live line still
+        unpicked -- the actual work queue. Without it, everything recent is
+        returned so a packed order can be checked or un-ticked.
+
+        Carries no buyer information of any kind, because none is stored. See
+        ``app/ebay_orders.py``: an address is eBay's to print, not ours to
+        keep.
+        """
+        clause = ""
+        if outstanding_only:
+            clause = """
+                AND EXISTS (
+                    SELECT 1 FROM ebay_order_line x
+                     WHERE x.order_id = o.order_id
+                       AND x.manifest_id IS NOT NULL
+                       AND x.status = 'ACTIVE'
+                       AND x.picked_at IS NULL
+                )
+            """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT o.order_id, o.line_item_id, o.sku, o.quantity,
+                       o.status, o.sold_at, o.first_seen_at,
+                       o.deducted_at, o.deducted_qty, o.picked_at,
+                       o.manifest_id,
+                       m.product_name, m.set_name, m.condition, m.printing,
+                       m.card_number,
+                       COALESCE(m.remarks, '') AS remarks,
+                       COALESCE(m.quantity, 0) AS catalogued_qty
+                  FROM ebay_order_line o
+                  JOIN manifest m ON m.manifest_id = o.manifest_id
+                 WHERE o.manifest_id IS NOT NULL
+                 {clause}
+                 ORDER BY o.first_seen_at DESC, o.order_id, o.rowid
+                """
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+        orders: List[Dict[str, Any]] = []
+        index: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            order_id = row["order_id"]
+            order = index.get(order_id)
+            if order is None:
+                order = {
+                    "order_id": order_id,
+                    "sold_at": row["sold_at"],
+                    "first_seen_at": row["first_seen_at"],
+                    "lines": [],
+                }
+                index[order_id] = order
+                orders.append(order)
+            order["lines"].append(row)
+
+        # The cap counts orders, not lines, and is applied after grouping.
+        # Capping the query's rows instead would cut a multi-card order in
+        # half and render a pick list missing a card -- worse than showing
+        # fewer orders, because it looks complete.
+        orders = orders[:max(1, int(limit))]
+
+        for order in orders:
+            live = [l for l in order["lines"] if l["status"] == "ACTIVE"]
+            order["card_count"] = len(order["lines"])
+            order["copy_count"] = sum(
+                int(l["quantity"] or 0) for l in order["lines"]
+            )
+            order["picked_count"] = sum(
+                1 for l in live if l["picked_at"]
+            )
+            order["live_count"] = len(live)
+            # Packed means every live line pulled. An order of nothing but
+            # cancellations counts as packed rather than as pending work:
+            # there is nothing left to do with it.
+            order["packed"] = all(l["picked_at"] for l in live)
+            order["needs_attention"] = any(
+                l["status"] != "ACTIVE" for l in order["lines"]
+            )
+        return orders
+
+    def count_outstanding_pick_lines(self) -> int:
+        """
+        How many cards are waiting to be pulled.
+
+        Drives the tab badge, so it has to be one cheap query rather than the
+        grouped view: the dashboard asks for it on a timer.
+
+        The manifest join is not decoration. ``manifest_id IS NOT NULL``
+        alone counts lines whose card has since been deleted from the
+        catalogue -- which the grouped view drops, since it has nothing to
+        show for them. The badge would then carry a number the list could
+        never account for and no amount of picking could clear.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                  FROM ebay_order_line o
+                  JOIN manifest m ON m.manifest_id = o.manifest_id
+                 WHERE o.status = 'ACTIVE'
+                   AND o.picked_at IS NULL
+                """
+            )
+            return int(cursor.fetchone()["count"])
 
     def get_recent_order_lines(
         self, limit: int = 200, matched_only: bool = False

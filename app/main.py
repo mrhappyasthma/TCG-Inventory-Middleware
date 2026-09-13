@@ -386,6 +386,17 @@ class QuantityUpdateRequest(BaseModel):
     order_number: Optional[str] = None
 
 
+class PickRequest(BaseModel):
+    # True when a card has been pulled off the shelf, False when it has been
+    # put back. Unticking is deliberately allowed: unlike a deduction, which
+    # a machine claims exactly once, this records what a person did in a room
+    # and people change their minds.
+    picked: bool = True
+    # One card, or the whole order when absent. Most orders are a single
+    # card, where those are the same action.
+    line_item_id: Optional[str] = None
+
+
 class RemarkUpdateRequest(BaseModel):
     # The bin or note a card is stored under. Capped because it is a shelf
     # label, not a field for prose, and an unbounded string here would end up
@@ -1206,6 +1217,80 @@ def recent_orders_endpoint(
             limit=max(1, min(500, limit)), matched_only=True
         ),
         "unmatched_count": db.count_order_lines(matched=False),
+        # How many cards are waiting to be pulled. Returned here as well as
+        # from the pick endpoint so the To Pick badge is right without the
+        # tab having been opened -- this is the call the dashboard already
+        # makes on a timer, and a queue nobody knows about is not a queue.
+        "outstanding_cards": db.count_outstanding_pick_lines(),
+    }
+
+
+@app.get("/api/orders/pick")
+def pick_list_endpoint(
+    scope: str = "outstanding",
+    limit: int = 50,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    The cards to pull, grouped by order.
+
+    ``scope=outstanding`` is the work queue: orders with at least one live
+    line not yet picked. ``scope=all`` includes the packed ones, so a
+    finished order can be checked or un-ticked.
+
+    Carries **no buyer information**, because none is stored -- not a name,
+    not an address, not a username. The address is eBay's to print. This
+    answers the other half: which cards, and out of which box.
+    """
+    outstanding = str(scope or "outstanding").lower() != "all"
+    return {
+        "scope": "outstanding" if outstanding else "all",
+        "orders": db.get_pick_orders(
+            outstanding_only=outstanding, limit=max(1, min(200, limit))
+        ),
+        "outstanding_cards": db.count_outstanding_pick_lines(),
+    }
+
+
+@app.post("/api/orders/pick/{order_id}")
+def set_pick_endpoint(
+    order_id: str,
+    req: PickRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Tick a card as pulled, or a whole order at once.
+
+    Touches nothing but this record: it does not move stock, and it does not
+    tell eBay anything. The poller already took the card off the catalogue
+    when the sale was seen -- this is only the note that the physical card is
+    now in an envelope rather than on a shelf.
+    """
+    if req.line_item_id:
+        moved = db.set_order_line_picked(
+            order_id, req.line_item_id, req.picked
+        )
+        if not moved:
+            raise HTTPException(
+                status_code=404, detail="That order line is not on record."
+            )
+        changed = 1
+    else:
+        changed = db.set_order_picked(order_id, req.picked)
+        if not changed:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Order {order_id} has no live lines on record, so there "
+                    f"is nothing to mark."
+                ),
+            )
+    return {
+        "success": True,
+        "order_id": order_id,
+        "picked": req.picked,
+        "lines_changed": changed,
+        "outstanding_cards": db.count_outstanding_pick_lines(),
     }
 
 

@@ -519,6 +519,7 @@
                 <button id="tabBtnInventory" onclick="switchWorkspaceTab('inventory')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">Live Store Inventory</button>
                 <button id="tabBtnListings" onclick="switchWorkspaceTab('listings')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">eBay Listings</button>
                 <button id="tabBtnDrafts" onclick="switchWorkspaceTab('drafts')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">Drafts<span id="draftsCountBadge" class="hidden ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-slate-700 text-slate-200 align-middle">0</span></button>
+                <button id="tabBtnPick" onclick="switchWorkspaceTab('pick')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">To Pick<span id="pickCountBadge" class="hidden ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-emerald-700 text-white align-middle">0</span></button>
                 <button id="tabBtnConsole" onclick="switchWorkspaceTab('console')" class="workspace-tab relative px-4 py-2.5 text-xs font-semibold rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors">Terminal Console<span id="consoleUnreadBadge" class="hidden ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-slate-700 text-slate-200 align-middle">0</span></button>
             </div>
 
@@ -757,6 +758,46 @@
 
                 <div id="draftHistory" class="space-y-2"></div>
 
+            </div>
+
+            <!--
+                TO PICK
+
+                A work queue and a printable pick sheet. Not eBay's packing
+                slip: there is no buyer name or address here and there never
+                will be, because none is stored -- that is what this
+                application's account-deletion exemption rests on. eBay
+                prints the address; this says which cards, and out of which
+                box.
+            -->
+            <div id="panelPick" class="hidden space-y-4">
+                <div class="no-print flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                        <h2 class="text-lg font-bold font-heading text-white tracking-tight">To Pick</h2>
+                        <p id="pickSummary" class="text-xs text-slate-400 mt-0.5">&nbsp;</p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <div class="flex items-center rounded-lg border border-slate-700 overflow-hidden">
+                            <button type="button" id="pickScopeOutstanding" onclick="setPickScope('outstanding')" class="px-3 py-1.5 text-[11px] font-semibold bg-brand-600 text-white">Outstanding</button>
+                            <button type="button" id="pickScopeAll" onclick="setPickScope('all')" class="px-3 py-1.5 text-[11px] font-semibold bg-dark-800 text-slate-300 hover:bg-slate-700">All recent</button>
+                        </div>
+                        <button type="button" onclick="fetchPickList()" class="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700">Refresh</button>
+                        <button type="button" onclick="printPickList()" class="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-brand-600 hover:bg-brand-500 text-white shadow-md shadow-brand-500/20">Print sheet</button>
+                    </div>
+                </div>
+
+                <!--
+                    Only on paper. A sheet that reaches the bench without
+                    saying what it is or when it was printed is one nobody
+                    can tell apart from yesterday's.
+                -->
+                <div class="print-only">
+                    <h1 class="pick-print-title">Pick sheet</h1>
+                    <p id="pickPrintedAt" class="pick-print-meta"></p>
+                    <p class="pick-print-meta">No buyer details are held by this application &mdash; print the address from eBay.</p>
+                </div>
+
+                <div id="pickList" class="space-y-3"></div>
             </div>
 
             <div id="panelConsole" class="hidden space-y-3">

@@ -466,5 +466,168 @@ class OrderSyncTests(unittest.TestCase):
             )
 
 
+class PickListTests(unittest.TestCase):
+    """
+    The queue of cards to pull, and the record of which have been pulled.
+
+    Picking is tracked per line rather than per order because that is how the
+    work goes: a three-card order is three trips to the shelves, and an order
+    half done is a real state. The per-order answer -- packed or not -- falls
+    out of the lines, which a single per-order flag could not express.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "pick.db"))
+        self.db.insert_manifest(
+            "ID1001", "Charizard", "Base Set", "Near Mint", "Holofoil",
+            card_number="004/102", remarks="Bin A-12",
+        )
+        self.db.insert_manifest(
+            "ID1002", "Pikachu", "Base Set", "Near Mint", "Normal",
+            card_number="025/102",
+        )
+        self.db.set_manifest_quantity("ID1001", 5)
+        self.db.set_manifest_quantity("ID1002", 5)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def sold(self, order, line, manifest_id, quantity=1, status="ACTIVE"):
+        self.db.upsert_order_line(
+            order_id=order, line_item_id=line, sku=manifest_id,
+            legacy_item_id="1111", quantity=quantity,
+            manifest_id=manifest_id, status=status,
+            sold_at="2026-09-12 10:00:00",
+        )
+
+    def order(self, order_id, outstanding_only=False):
+        return next(
+            o for o in self.db.get_pick_orders(outstanding_only=outstanding_only)
+            if o["order_id"] == order_id
+        )
+
+    def test_an_order_is_one_block_with_the_bin_for_each_card(self):
+        self.sold("26-60885", "1", "ID1001")
+        self.sold("26-60885", "2", "ID1002", quantity=2)
+
+        order = self.order("26-60885")
+        self.assertEqual(order["card_count"], 2)
+        self.assertEqual(order["copy_count"], 3, "two copies of one of them")
+        self.assertEqual(
+            [(l["product_name"], l["remarks"]) for l in order["lines"]],
+            [("Charizard", "Bin A-12"), ("Pikachu", "")],
+        )
+
+    def test_an_order_is_packed_only_when_every_live_line_is_picked(self):
+        self.sold("26-60885", "1", "ID1001")
+        self.sold("26-60885", "2", "ID1002")
+
+        self.assertFalse(self.order("26-60885")["packed"])
+        self.db.set_order_line_picked("26-60885", "1", True)
+        half = self.order("26-60885")
+        self.assertFalse(half["packed"], "one of two is not done")
+        self.assertEqual(half["picked_count"], 1)
+        self.assertEqual(half["live_count"], 2)
+
+        self.db.set_order_line_picked("26-60885", "2", True)
+        self.assertTrue(self.order("26-60885")["packed"])
+
+    def test_a_packed_order_leaves_the_queue(self):
+        """
+        The outstanding scope is the work queue, so a finished order has to
+        go -- otherwise the list only ever grows and the badge lies.
+        """
+        self.sold("26-60885", "1", "ID1001")
+        self.assertEqual(
+            [o["order_id"] for o in self.db.get_pick_orders()], ["26-60885"]
+        )
+
+        self.db.set_order_picked("26-60885", True)
+        self.assertEqual(self.db.get_pick_orders(), [])
+        # Still findable, because a packed order may need checking.
+        self.assertEqual(
+            [o["order_id"] for o in
+             self.db.get_pick_orders(outstanding_only=False)],
+            ["26-60885"],
+        )
+
+    def test_a_pick_can_be_undone(self):
+        """
+        Unlike a deduction, which a machine claims exactly once, this records
+        what a person did in a room -- and people put cards back.
+        """
+        self.sold("26-60885", "1", "ID1001")
+        self.db.set_order_picked("26-60885", True)
+        self.assertEqual(self.db.count_outstanding_pick_lines(), 0)
+
+        self.db.set_order_picked("26-60885", False)
+        self.assertEqual(self.db.count_outstanding_pick_lines(), 1)
+        self.assertFalse(self.order("26-60885")["packed"])
+
+    def test_packing_a_whole_order_leaves_a_cancelled_line_alone(self):
+        """
+        Nobody picks a cancelled card, and marking it packed would claim
+        work that must not be done. It still appears on the list, struck
+        through, because it may already have shipped.
+        """
+        self.sold("26-60885", "1", "ID1001")
+        self.sold("26-60885", "2", "ID1002", status="CANCELED")
+
+        self.assertEqual(self.db.set_order_picked("26-60885", True), 1)
+        order = self.order("26-60885")
+        self.assertTrue(order["packed"])
+        self.assertTrue(order["needs_attention"])
+        self.assertEqual(order["card_count"], 2, "the cancellation is shown")
+        dead = [l for l in order["lines"] if l["status"] == "CANCELED"][0]
+        self.assertIsNone(dead["picked_at"])
+
+    def test_an_order_of_nothing_but_cancellations_is_not_pending_work(self):
+        self.sold("26-60999", "1", "ID1001", status="CANCELED")
+        self.assertEqual(self.db.get_pick_orders(), [], "nothing to pull")
+        self.assertTrue(self.order("26-60999")["packed"])
+        self.assertEqual(self.db.count_outstanding_pick_lines(), 0)
+
+    def test_a_sale_from_a_listing_we_do_not_manage_is_not_pickable(self):
+        """
+        There is no card of ours behind it, so there is nothing to pull. It
+        is counted elsewhere rather than listed as work.
+        """
+        self.db.upsert_order_line(
+            order_id="26-70000", line_item_id="1", sku="",
+            legacy_item_id="9999", quantity=1, manifest_id=None,
+            status="ACTIVE", sold_at="2026-09-12 10:00:00",
+        )
+        self.assertEqual(self.db.get_pick_orders(outstanding_only=False), [])
+        self.assertEqual(self.db.count_outstanding_pick_lines(), 0)
+
+    def test_the_cap_counts_orders_so_no_order_is_shown_half(self):
+        """
+        Capping the query's rows instead would cut a multi-card order in two
+        and render a pick list missing a card -- worse than showing fewer
+        orders, because it looks complete.
+        """
+        self.sold("26-60885", "1", "ID1001")
+        self.sold("26-60885", "2", "ID1002")
+        self.sold("26-61000", "1", "ID1001")
+
+        orders = self.db.get_pick_orders(limit=1)
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(len(orders[0]["lines"]), 2, "not truncated")
+
+    def test_picking_does_not_touch_stock_or_the_deduction_record(self):
+        """
+        The poller already took the card off the catalogue when it saw the
+        sale. This is only the note that the card is now in an envelope.
+        """
+        self.sold("26-60885", "1", "ID1001")
+        before = self.db.get_manifest_by_id("ID1001")["quantity"]
+
+        self.db.set_order_picked("26-60885", True)
+        self.assertEqual(self.db.get_manifest_by_id("ID1001")["quantity"], before)
+        line = self.order("26-60885")["lines"][0]
+        self.assertIsNone(line["deducted_at"], "untouched by picking")
+
+
 if __name__ == "__main__":
     unittest.main()

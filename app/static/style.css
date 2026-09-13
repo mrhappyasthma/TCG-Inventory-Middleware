@@ -166,3 +166,102 @@ details[open] > summary .caret {
 [data-card-image] {
     cursor: zoom-in;
 }
+
+/* ------------------------------------------------------------------ *
+ * The printable pick sheet.
+ *
+ * Written by hand rather than with Tailwind's print: variants, because
+ * the Tailwind here is the in-browser JIT: a variant it failed to
+ * generate would be invisible until somebody actually printed, which is
+ * the one moment there is no chance to notice and fix it.
+ *
+ * Printing is scoped by a class on <body> so that Ctrl+P anywhere else
+ * on the dashboard still prints the page normally.
+ * ------------------------------------------------------------------ */
+
+.print-only {
+    display: none;
+}
+
+@media print {
+    /* Visibility rather than display, so the panel keeps its layout while
+     * everything around it goes. Setting display:none on ancestors would
+     * take the panel with them. */
+    body.printing-pick * {
+        visibility: hidden;
+    }
+
+    body.printing-pick #panelPick,
+    body.printing-pick #panelPick * {
+        visibility: visible;
+    }
+
+    body.printing-pick #panelPick {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        padding: 0;
+        margin: 0;
+    }
+
+    body.printing-pick .no-print,
+    body.printing-pick .no-print * {
+        visibility: hidden;
+        display: none;
+    }
+
+    body.printing-pick .print-only {
+        display: block;
+    }
+
+    /* Ink, and legibility on paper. The dashboard is a dark theme; printed
+     * as-is it is either a black page or, with backgrounds dropped, pale
+     * grey text on white. */
+    body.printing-pick #panelPick,
+    body.printing-pick #panelPick * {
+        color: #000 !important;
+        background: transparent !important;
+        border-color: #999 !important;
+        box-shadow: none !important;
+        text-shadow: none !important;
+    }
+
+    body.printing-pick .pick-print-title {
+        font-size: 16pt;
+        font-weight: 700;
+        margin: 0;
+    }
+
+    body.printing-pick .pick-print-meta {
+        font-size: 8pt;
+        margin: 0;
+    }
+
+    /* An order is one envelope, so it must not be split across a page
+     * break: half a pick list reads as a complete one. */
+    body.printing-pick .pick-order {
+        break-inside: avoid;
+        page-break-inside: avoid;
+        border: 1px solid #999 !important;
+        margin-bottom: 6pt;
+    }
+
+    /* The tick box has to survive losing its background colour, or there is
+     * nothing to tick on paper. */
+    body.printing-pick .pick-box {
+        border: 1.5px solid #000 !important;
+        width: 11pt;
+        height: 11pt;
+        display: inline-block;
+    }
+
+    body.printing-pick .pick-bin {
+        font-weight: 700;
+        border: 1px solid #000 !important;
+    }
+
+    @page {
+        margin: 12mm;
+    }
+}

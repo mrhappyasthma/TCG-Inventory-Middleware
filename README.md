@@ -852,10 +852,8 @@ So the packing slip alone is not enough, which is why the manifest id appears
 on each sold line: it is what the slip prints, and it is how a slip in your
 hand matches a line on screen.
 
-> **This is a panel, not a document.** It is the recent sold cards as the
-> dashboard shows them — there is no print view, and no record of which
-> orders you have already packed. Work from eBay's own slip for the address
-> and from this for the bins.
+The **Cards sold** panel is a glance. The work itself is the
+[To Pick tab](#to-pick).
 
 A card with no bin recorded says **no bin** rather than showing a gap, because
 "go to A-12" and "you will have to hunt for this one" are different
@@ -1429,6 +1427,7 @@ rather than growing with your catalog:
 | **Live Store Inventory** | The master catalog joined with live eBay links. Default view. |
 | **eBay Listings** | Your live listings as eBay sees them, rolled up per item number. |
 | **Drafts** | The listings and updates we plan to make, before anything reaches eBay. |
+| **To Pick** | Cards that have sold and where to get them from, with a printable sheet. Badged with the number waiting. |
 | **Terminal Console** | The operational log. |
 
 Because the console can now be hidden, its tab carries an **unread counter** of
@@ -1563,6 +1562,60 @@ docker compose exec tcg-middleware python scripts/purge_old_plans.py --before 10
 
 The listings themselves are untouched either way. They live on eBay and in our
 mirror of it; a plan is the record of how a change was decided, not the change.
+
+### To Pick
+
+The work queue: which cards have sold, which box each one is in, and which of
+them you have already pulled. The tab carries a badge with the number of cards
+waiting, kept in step by the same call that refreshes the poller's status —
+so a sale shows up as work without the tab being opened.
+
+* **One block per order.** One block is one envelope. A flat list of cards
+  cannot say which of them ship together, and two orders arriving in the same
+  poll would be an undifferentiated pile.
+* **Tick a card as you pull it.** The order shows `1/3 picked` until they are
+  all done, then **packed**. Ticking is per card because that is how the work
+  goes: a three-card order is three trips, and an order half done is a real
+  state that needs somewhere to live.
+* **Pack all** ticks a whole order in one click, which is the common case —
+  most orders are a single card.
+* **Un-ticking is allowed.** Unlike a deduction, which the poller claims
+  exactly once, this records what a person did in a room, and people put cards
+  back.
+* **Picking moves no stock and tells eBay nothing.** The poller already took
+  the card off the catalogue when it saw the sale; this is only the note that
+  the card is now in an envelope rather than on a shelf.
+* **Outstanding / All recent** switches between the queue and everything
+  recent, so a finished order can be checked or un-ticked.
+* **A cancelled line is shown struck through and marked _do not send_**,
+  rather than removed. It may already have shipped, and somebody holding the
+  sheet needs to know the card was on the order. **Pack all** leaves it alone:
+  marking it packed would claim work that must not be done.
+* A sale from a listing this application does not manage never appears — there
+  is no card of ours behind it and nothing to pull. Those are counted on
+  Module C's card.
+
+#### Print sheet
+
+**Print sheet** prints the panel alone, black on white, with a heading and the
+time it was printed — a sheet that reaches the bench without those is one
+nobody can tell apart from yesterday's. An order is kept off a page break,
+because half a pick list reads as a complete one, and the tick boxes are given
+real borders so they survive losing their background colour.
+
+> **It is not eBay's packing slip, and it carries no buyer details** — not a
+> name, not an address, not a username. None is stored, in either database,
+> which is what this application's
+> [account deletion exemption](#-no-buyer-data-is-kept-ever) rests on. eBay
+> prints the address; this answers the other half, which eBay cannot: which
+> cards, and out of which box.
+
+The print rules are hand-written CSS in `style.css` rather than Tailwind's
+`print:` variants, because the Tailwind here is the in-browser JIT — a variant
+it failed to generate would be invisible until somebody actually printed,
+which is the one moment there is no chance to notice. Printing is scoped by a
+class on `<body>` added only for the duration of the print, so `Ctrl+P`
+anywhere else on the dashboard still prints the page normally.
 
 ### eBay Listings
 
