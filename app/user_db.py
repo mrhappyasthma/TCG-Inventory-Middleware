@@ -238,14 +238,6 @@ class UserDatabase:
             ).fetchone()
         return dict(row) if row else None
 
-    def count_ebay_connections(self) -> int:
-        """How many accounts have linked an eBay store."""
-        with self.get_connection() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS count FROM ebay_account_connection"
-            ).fetchone()
-            return int(row["count"])
-
     def get_user_count(self) -> int:
         with self.get_connection() as conn:
             cursor = conn.cursor()

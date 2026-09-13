@@ -24,7 +24,7 @@ has walked away. Catching that on the drafts page is the page's real job.
 """
 
 import json
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 from .db import SHARED_SCOPE, Database
 

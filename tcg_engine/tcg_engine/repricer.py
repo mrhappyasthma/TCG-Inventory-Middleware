@@ -43,7 +43,7 @@ File Exchange listings are invisible to the Inventory API, so there is nothing
 here that could reach them even by accident.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .db import (

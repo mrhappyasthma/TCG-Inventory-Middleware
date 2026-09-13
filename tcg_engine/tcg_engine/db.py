@@ -314,7 +314,6 @@ class Database:
                     custom_label TEXT,
                     last_known_qty INTEGER DEFAULT 0,
                     last_known_price REAL,
-                    pending_qty INTEGER,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (manifest_id) REFERENCES manifest(manifest_id) ON DELETE CASCADE
                 );
@@ -724,10 +723,6 @@ class Database:
             # showed the pending one in amber. The API push confirms in the
             # same call, so that gap no longer exists.
             cursor.execute("PRAGMA table_info(ebay_variations)")
-            if "pending_qty" not in {row["name"] for row in cursor.fetchall()}:
-                cursor.execute(
-                    "ALTER TABLE ebay_variations ADD COLUMN pending_qty INTEGER"
-                )
 
             # The price eBay reports for a variation. Without it there is no way
             # to tell whether a Revise row would change anything, so a full
@@ -919,6 +914,23 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_order_poll_run_at
                 ON order_poll_run(id DESC);
+                """
+            )
+            # The pick list joins order lines to cards and filters on the
+            # card being present, on every poll and every render of the To
+            # Pick tab, with nothing behind it until now.
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_order_line_manifest
+                ON ebay_order_line(manifest_id);
+                """
+            )
+            # Looked up by eBay item number whenever a listing is repaired or
+            # a sale is traced back to the listing it came from.
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_managed_listing_parent
+                ON ebay_managed_listing(ebay_parent_id);
                 """
             )
             cursor.execute(
@@ -1439,7 +1451,7 @@ class Database:
             cursor.execute(
                 """
                 SELECT manifest_id, ebay_parent_id, custom_label,
-                       last_known_qty, last_known_price, pending_qty
+                       last_known_qty, last_known_price
                 FROM ebay_variations
                 WHERE manifest_id = ?
                 """,
@@ -1459,9 +1471,7 @@ class Database:
         """
         Insert or update an ebay_variations row.
 
-        This records what **eBay reports**, so it is Module B's to call. It
-        clears ``pending_qty``: a report from eBay supersedes whatever Module A
-        last asked for, whether or not the request was applied.
+        This records what **eBay reports**, so it is Module B's to call.
 
         ``custom_label`` is the SKU eBay knows this variation by. Passing None
         leaves any stored label alone rather than erasing it, because callers
@@ -1480,15 +1490,14 @@ class Database:
                 """
                 INSERT INTO ebay_variations
                     (manifest_id, ebay_parent_id, custom_label, last_known_qty,
-                     last_known_price, pending_qty, updated_at)
-                VALUES (?, ?, ?, ?, ?, NULL, CURRENT_TIMESTAMP)
+                     last_known_price, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(manifest_id) DO UPDATE SET
                     ebay_parent_id = excluded.ebay_parent_id,
                     custom_label = COALESCE(excluded.custom_label, ebay_variations.custom_label),
                     last_known_qty = excluded.last_known_qty,
                     last_known_price = COALESCE(excluded.last_known_price,
                                                 ebay_variations.last_known_price),
-                    pending_qty = NULL,
                     updated_at = CURRENT_TIMESTAMP;
                 """,
                 (m_id, p_id, label, qty, price),
@@ -1514,7 +1523,7 @@ class Database:
             cursor.execute(
                 """
                 SELECT v.manifest_id, v.ebay_parent_id, v.custom_label,
-                       v.last_known_qty, v.last_known_price, v.pending_qty,
+                       v.last_known_qty, v.last_known_price,
                        v.offer_id,
                        m.product_name, m.set_name, m.condition, m.remarks
                 FROM ebay_variations v
@@ -1967,8 +1976,7 @@ class Database:
                 COALESCE(m.stock_image, '') AS stock_image,
                 {CARD_IMAGE_SQL},
                 COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
-                COALESCE(v.last_known_qty, 0) AS last_known_qty,
-                v.pending_qty AS pending_qty
+                COALESCE(v.last_known_qty, 0) AS last_known_qty
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
@@ -2368,35 +2376,11 @@ class Database:
             )
             return [dict(r) for r in cursor.fetchall()]
 
-    def get_live_cards_for_repricing(self) -> List[Dict[str, Any]]:
-        """
-        Cards live on eBay, with everything a reprice row needs.
-
-        Includes last_known_price so an unchanged row can be dropped, and the
-        stored custom_label because that is the SKU eBay knows -- one rebuilt
-        from a card's identity would address a variation that does not exist.
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
-                       m.printing, m.market_price, m.price,
-                       v.ebay_parent_id, v.custom_label, v.last_known_price,
-                       v.last_known_qty
-                FROM manifest m
-                JOIN ebay_variations v ON v.manifest_id = m.manifest_id
-                WHERE TRIM(COALESCE(v.ebay_parent_id, '')) != ''
-                ORDER BY m.manifest_id
-                """
-            )
-            return [dict(r) for r in cursor.fetchall()]
-
     def get_managed_cards_for_repricing(self) -> List[Dict[str, Any]]:
         """
         Cards the Inventory API can reprice, with their hold clock.
 
-        Narrower than get_live_cards_for_repricing in two ways, and both are
+        Narrower than the whole catalogue in two ways, and both are
         the point. The card must have an ``offer_id``, because an offer id is
         the only handle bulkUpdatePriceQuantity accepts, and its listing must
         have a row in ebay_managed_listing, because that is the record of
@@ -2435,10 +2419,9 @@ class Database:
         Record a price eBay has accepted, and nothing else.
 
         Deliberately not upsert_variation, which would also write
-        last_known_qty and clear pending_qty. A price change must not disturb
-        either: the quantity would be rewritten from a figure that goes stale
-        the moment a card sells, and clearing pending_qty would discard a
-        quantity change a plan is still waiting to have confirmed.
+        last_known_qty. A price change must not disturb it: the quantity
+        would be rewritten from a figure that goes stale the moment a card
+        sells.
         """
         with self.get_connection() as conn:
             conn.execute(
@@ -3068,7 +3051,7 @@ class Database:
         """
         Every catalogued card with what eBay is known to hold for it.
 
-        A LEFT JOIN, unlike get_live_cards_for_repricing: a card that is not
+        A LEFT JOIN rather than an inner one: a card that is not
         on eBay yet is exactly the case that produces a create, so restricting
         to live rows would make it impossible to plan a new listing.
         """
@@ -3084,7 +3067,7 @@ class Database:
                        COALESCE(m.quantity, 0) AS quantity,
                        m.price, m.market_price,
                        v.ebay_parent_id, v.custom_label,
-                       v.last_known_qty, v.last_known_price, v.pending_qty
+                       v.last_known_qty, v.last_known_price
                 FROM manifest m
                 LEFT JOIN ebay_variations v ON v.manifest_id = m.manifest_id
                 ORDER BY m.manifest_id
@@ -3762,22 +3745,6 @@ class Database:
             )
             conn.commit()
 
-    def get_manifest_ebay_fields(self, manifest_id: str) -> Dict[str, Any]:
-        import json as _json
-
-        with self.get_connection() as conn:
-            row = conn.execute(
-                "SELECT ebay_fields_json FROM manifest WHERE manifest_id = ?",
-                (manifest_id,),
-            ).fetchone()
-        if row is None or not row["ebay_fields_json"]:
-            return {}
-        try:
-            parsed = _json.loads(row["ebay_fields_json"])
-        except (ValueError, TypeError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-
     def set_plan_group_cover(
         self, plan_id: int, group_key: str, cover_image_url: Optional[str]
     ) -> None:
@@ -4004,8 +3971,7 @@ class Database:
                     m.printing,
                     COALESCE(m.quantity, 0) AS quantity,
                     COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
-                    COALESCE(v.last_known_qty, 0) AS last_known_qty,
-                v.pending_qty AS pending_qty
+                    COALESCE(v.last_known_qty, 0) AS last_known_qty
                 FROM manifest m
                 LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
                 ORDER BY m.manifest_id ASC

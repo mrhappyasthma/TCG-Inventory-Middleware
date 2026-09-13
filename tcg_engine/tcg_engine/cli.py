@@ -1,11 +1,10 @@
 import argparse
 import csv
 import os
-import sys
 from .db import Database
 from .orders import process_orders_file
 from .batches import process_batch_file
-from .sync import sync_active_listings_file, sync_active_listings_csv
+from .sync import sync_active_listings_file
 from .relink import relink_from_file
 
 

@@ -10,7 +10,7 @@ from .db import (
     SHARED_SCOPE,
     apply_pricing_rules,
     apply_condition_multiplier,
-    normalize_condition_key,
+    
 )
 
 
@@ -403,9 +403,11 @@ def process_batch_csv(
 ) -> Dict[str, Any]:
     """
     Process fresh SortSwift inventory batch CSV.
-    Routes rows into:
-    1. ebay_inventory_updates.csv (REVISE - already live on eBay)
-    2. ebay_new_additions.csv (ADD - new to eBay)
+
+    Ingest only: it catalogues what the export contains and stages the
+    resulting drafts. It writes no files -- the two CSVs this once produced,
+    for revising and for adding listings, went with the File Exchange path.
+    eBay is reached through its API, from an approved plan.
 
     Automatically creates:
     - Multi-item Variation Listings (grouped by Set Name, for cards below the

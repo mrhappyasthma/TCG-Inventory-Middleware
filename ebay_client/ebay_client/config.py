@@ -91,10 +91,6 @@ class EbayConfig:
     def authorize_url(self) -> str:
         return _HOSTS[self.environment]["auth"]
 
-    @property
-    def is_sandbox(self) -> bool:
-        return self.environment == SANDBOX
-
     def app_id_environment(self) -> Optional[str]:
         """Which environment the App ID says it belongs to, if it says."""
         upper = (self.client_id or "").upper()

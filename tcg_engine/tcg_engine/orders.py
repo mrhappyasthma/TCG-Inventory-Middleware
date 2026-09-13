@@ -1,7 +1,7 @@
 import csv
 import io
 import re
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from .csvtools import find_column as _find_column, read_csv_text, strip_bom
 from .db import Database
 
