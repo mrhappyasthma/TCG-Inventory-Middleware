@@ -73,7 +73,7 @@ class TestWebApp(unittest.TestCase):
         network call is never made, while the endpoint's own logic still runs.
         """
         with mock.patch(
-            "app.main.verify_google_id_token",
+            "app.auth.verify_google_id_token",
             return_value=google_claims(sub, email, name),
         ):
             return self.client.post(
@@ -102,7 +102,7 @@ class TestWebApp(unittest.TestCase):
         self.assertNotIn("auth_method", body)
 
     def test_03_invalid_google_token_is_rejected(self):
-        with mock.patch("app.main.verify_google_id_token", return_value=None):
+        with mock.patch("app.auth.verify_google_id_token", return_value=None):
             res = self.client.post("/api/auth/google", json={"id_token": "bad"})
         self.assertEqual(res.status_code, 401)
         # The rejected attempt must not have disturbed the existing session.
@@ -341,7 +341,7 @@ class TestWebApp(unittest.TestCase):
         """
         other = TestClient(app)
         with mock.patch(
-            "app.main.verify_google_id_token",
+            "app.auth.verify_google_id_token",
             return_value=google_claims("google-sub-second", "second@example.com",
                                        "Second User"),
         ):
@@ -744,7 +744,7 @@ class TestWebApp(unittest.TestCase):
 
     def test_27_session_cookie_is_hardened(self):
         """HttpOnly stops script theft; SameSite blocks cross-site writes."""
-        with mock.patch("app.main.verify_google_id_token",
+        with mock.patch("app.auth.verify_google_id_token",
                         return_value=google_claims("google-sub-admin",
                                                    "admin@example.com",
                                                    "Admin User")):
@@ -984,7 +984,7 @@ class TestWebApp(unittest.TestCase):
         # The second user approved back in test 04, on their own session.
         other = TestClient(app)
         with mock.patch(
-            "app.main.verify_google_id_token",
+            "app.auth.verify_google_id_token",
             return_value=google_claims(
                 "google-sub-second", "second@example.com", "Second User"
             ),
@@ -1365,7 +1365,7 @@ class TestWebApp(unittest.TestCase):
         """A session for the non-admin account approved back in test 04."""
         other = TestClient(app)
         with mock.patch(
-            "app.main.verify_google_id_token",
+            "app.auth.verify_google_id_token",
             return_value=google_claims(
                 "google-sub-second", "second@example.com", "Second User"
             ),
