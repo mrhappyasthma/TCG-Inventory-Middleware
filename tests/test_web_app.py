@@ -37,6 +37,7 @@ from tcg_engine.db import SHARED_SCOPE  # noqa: E402
 from app import deps  # noqa: E402
 from app.routes import ebay as ebay_routes  # noqa: E402
 from app.routes import orders as orders_routes  # noqa: E402
+from app.routes import pricing as pricing_routes  # noqa: E402
 
 # A SortSwift export row, reused so the duplicate-batch guard can be exercised.
 BATCH_CSV = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
@@ -2575,12 +2576,13 @@ class TestWebApp(unittest.TestCase):
         """
         import asyncio
 
-        asyncio.run(main._nightly_reprice())
+        asyncio.run(pricing_routes._nightly_reprice())
 
         with mock.patch(
-            "app.main.auto_reprice_enabled", side_effect=RuntimeError("boom")
+            "app.routes.pricing.auto_reprice_enabled",
+            side_effect=RuntimeError("boom"),
         ):
-            asyncio.run(main._nightly_reprice())
+            asyncio.run(pricing_routes._nightly_reprice())
 
     def test_50_the_reprice_log_is_readable(self):
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
