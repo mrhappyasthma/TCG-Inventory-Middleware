@@ -199,6 +199,11 @@ class _UserDbTokenStore(TokenStore):
 DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
 USER_DATABASE_URL = os.environ.get("USER_DATABASE_URL", "data/users.db")
 
+# Where the dashboard's assets live. Needed by `main` to mount /static
+# and by the route that serves index.html, so it has one definition
+# here rather than one each.
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+
 # Every CSV endpoint reads the body into memory, so an unbounded upload is a
 # way to exhaust the container's RAM.
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "25")) * 1024 * 1024

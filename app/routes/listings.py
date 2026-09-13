@@ -15,7 +15,7 @@ the mirror: that shape is indistinguishable from a report for a different
 account, and acting on it would delist the whole store.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel

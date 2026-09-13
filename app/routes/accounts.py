@@ -17,7 +17,7 @@ account. That is not politeness -- it is what stops a deployment being left
 with no one able to approve anybody.
 """
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel

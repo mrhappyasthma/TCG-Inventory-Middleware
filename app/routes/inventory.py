@@ -19,7 +19,7 @@ stock target that drives the restock filter.
 
 import csv
 import io
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import (
     APIRouter,
@@ -27,7 +27,6 @@ from fastapi import (
     File,
     Form,
     HTTPException,
-    Query,
     UploadFile,
 )
 from fastapi.responses import StreamingResponse

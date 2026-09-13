@@ -26,7 +26,7 @@ Both background loops live here and are registered from `main`.
 
 import asyncio
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException
@@ -34,7 +34,6 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from tcg_engine.db import (
-    SHARED_SCOPE,
     apply_condition_multiplier,
     apply_pricing_rules,
 )

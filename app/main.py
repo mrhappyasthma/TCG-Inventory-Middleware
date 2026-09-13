@@ -1,16 +1,14 @@
-import asyncio
 import os
 import sys
 import io
 import csv
-import hashlib
 import mimetypes
 # The OAuth callback renders eBay's own error text into a small HTML page.
 # That text arrives in a query string, so it is attacker-controlled for anyone
 # who can get a person to click a link -- it must be escaped.
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Literal
+from typing import List
 
 # Importing app.deps first is load-bearing, not stylistic: it puts the
 # project root on sys.path and loads .env, and `auth` reads GOOGLE_CLIENT_ID
@@ -22,93 +20,45 @@ except ImportError:
 
 from fastapi import (
     FastAPI,
-    UploadFile,
     File,
-    Form,
     Request,
     Response,
-    HTTPException,
     status,
-    Depends,
-)
-from fastapi.responses import (
-    HTMLResponse,
-    StreamingResponse,
-    JSONResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
 
-from tcg_engine.csvtools import decode_csv_bytes
+# Every group of endpoints lives in its own router. Paths are unchanged
+# from when they all lived here, which is what let the existing tests
+# verify each move rather than be rewritten for it.
 try:
-    from app.routes import listings as listings_routes
+    from app.routes import (
+        accounts as accounts_routes,
+        database as database_routes,
+        ebay as ebay_routes,
+        inventory as inventory_routes,
+        listings as listings_routes,
+        orders as orders_routes,
+        plans as plans_routes,
+        pricing as pricing_routes,
+        settings as settings_routes,
+        system as system_routes,
+    )
 except ImportError:
-    from .routes import listings as listings_routes
-
-try:
-    from app.routes import inventory as inventory_routes
-except ImportError:
-    from .routes import inventory as inventory_routes
-
-try:
-    from app.routes import settings as settings_routes
-except ImportError:
-    from .routes import settings as settings_routes
-
-try:
-    from app.routes import pricing as pricing_routes
-except ImportError:
-    from .routes import pricing as pricing_routes
-
-try:
-    from app.routes import accounts as accounts_routes
-except ImportError:
-    from .routes import accounts as accounts_routes
-
-try:
-    from app.routes import plans as plans_routes
-except ImportError:
-    from .routes import plans as plans_routes
-
-try:
-    from app.routes import orders as orders_routes
-except ImportError:
-    from .routes import orders as orders_routes
-
-try:
-    from app.routes import ebay as ebay_routes
-except ImportError:
-    from .routes import ebay as ebay_routes
+    from .routes import (
+        accounts as accounts_routes,
+        database as database_routes,
+        ebay as ebay_routes,
+        inventory as inventory_routes,
+        listings as listings_routes,
+        orders as orders_routes,
+        plans as plans_routes,
+        pricing as pricing_routes,
+        settings as settings_routes,
+        system as system_routes,
+    )
 
 
-try:
-    from app.routes import database as database_routes
-except ImportError:
-    from .routes import database as database_routes
 
-from tcg_engine.db import (
-    apply_pricing_rules,
-    apply_condition_multiplier,
-)
-from tcg_engine.batches import (
-    process_batch_csv,
-)
-from tcg_engine.sync import sync_active_listings_csv
-from tcg_engine.pricing_feed import (
-    refresh_market_prices,
-    PriceFeedError,
-)
-from tcg_engine.push import PushError, refresh_listing
-from tcg_engine.repricer import (
-    RepriceError,
-    plan_reprice,
-    run_reprice,
-)
-from tcg_engine.plans import (
-    PlanError,
-    build_plan,
-)
 
 try:
     from app import deps
@@ -121,6 +71,7 @@ try:
     )
     from app.deps import (
         DATABASE_URL,
+        static_dir,
         record_logs,
         EBAY_CLIENT_AVAILABLE,
         EbayClient,
@@ -172,6 +123,7 @@ except ImportError:
     )
     from .deps import (
         DATABASE_URL,
+        static_dir,
         record_logs,
         EBAY_CLIENT_AVAILABLE,
         EbayClient,
@@ -246,7 +198,6 @@ mimetypes.add_type("font/woff2", ".woff2")
 mimetypes.add_type("image/svg+xml", ".svg")
 mimetypes.add_type("image/x-icon", ".ico")
 
-static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
 # Routes that act on whole databases rather than on cards: backup and
@@ -294,6 +245,9 @@ app.include_router(inventory_routes.router)
 
 # The eBay listings mirror, and the report that reconciles it.
 app.include_router(listings_routes.router)
+
+# The shell: the dashboard page, the health probe and the log.
+app.include_router(system_routes.router)
 
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -364,58 +318,6 @@ async def security_headers(request: Request, call_next):
 # publishes once a day and asks for at most one sync per 24 hours, so anything
 # under that is wasted requests against a service that asks us not to.
 # The console shows this many lines; the dialog pages back through the rest.
-CONSOLE_RECENT_LINES = 200
-CONSOLE_PAGE_LINES = 500
-
-
-@app.get("/api/logs")
-def get_logs_endpoint(
-    limit: int = CONSOLE_RECENT_LINES,
-    before_id: Optional[int] = None,
-    level: Optional[str] = None,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    The operational log, newest first.
-
-    The console used to be whatever this browser tab had seen since it was
-    opened, which meant everything that runs unattended -- the nightly price
-    refresh, the repricer, a push that outlived the page -- was invisible to
-    it, and a reload threw away the rest.
-
-    ``before_id`` pages backwards from a line the caller already holds, rather
-    than by offset, so the window stays stable while new lines arrive at the
-    other end.
-    """
-    inv = inventory_for(user)
-    levels = [part for part in (level or "").split(",") if part.strip()]
-    entries = inv.get_log_entries(
-        limit=max(1, min(2000, limit)),
-        before_id=before_id,
-        levels=levels or None,
-    )
-    return {
-        "entries": entries,
-        "total": inv.count_log_entries(),
-        "oldest_id": entries[-1]["id"] if entries else None,
-    }
-
-
-@app.post("/api/logs/clear")
-def clear_logs_endpoint(user: Dict[str, Any] = Depends(require_admin_user)):
-    """
-    Discard the stored console history.
-
-    Admin-only and separate from the console's own Clear button, which only
-    empties the view. This is the record of what the unattended jobs did to
-    live listings, so throwing it away is a deliberate act rather than a side
-    effect of tidying the screen.
-    """
-    inv = inventory_for(user)
-    removed = inv.clear_log_entries()
-    return {"success": True, "removed": removed}
-
-
 # ---------------------------------------------------------
 # LISTING & VARIATION SETTINGS API ENDPOINTS
 # ---------------------------------------------------------
@@ -431,29 +333,6 @@ def clear_logs_endpoint(user: Dict[str, Any] = Depends(require_admin_user)):
 # ---------------------------------------------------------
 # HEALTH CHECK
 # ---------------------------------------------------------
-
-@app.get("/api/health")
-def health_check():
-    """
-    Unauthenticated liveness/readiness probe for Docker and Container Manager.
-
-    Reports degraded rather than merely 'process is up' so that a container with
-    an unreachable or unwritable data volume is surfaced as unhealthy.
-    """
-    inv = db
-    try:
-        inv.get_stats()
-        return {"status": "ok", "database": "reachable"}
-    except Exception as exc:
-        # This endpoint is unauthenticated, so the exception text stays in the
-        # server log rather than going to whoever asked. A SQLite error
-        # discloses absolute paths, which is free reconnaissance.
-        print(f"[health] database unreachable: {exc}", flush=True)
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "degraded", "database": "unreachable"},
-        )
-
 
 # ---------------------------------------------------------
 # FRONTEND HTML ROUTE
@@ -472,7 +351,6 @@ def health_check():
 
 # How long a consent attempt may sit unfinished. Long enough to read eBay's
 # screen, short enough that a stale link in someone's history is useless.
-EBAY_OAUTH_STATE_TTL_SECONDS = 600
 
 
 # -------------------------------------------------------------------
@@ -521,62 +399,6 @@ EBAY_OAUTH_STATE_TTL_SECONDS = 600
 # Finished jobs are kept long enough for a reload to collect the result.
 # Assets whose URLs get a content hash appended, so the browser is forced to
 # fetch the version that belongs with the HTML it just received.
-VERSIONED_ASSETS = ("/static/app.js", "/static/style.css")
-
-
-def _asset_version(url_path: str) -> str:
-    """Short content hash for a static file, or an empty string if absent."""
-    relative = url_path.replace("/static/", "", 1)
-    path = os.path.join(static_dir, *relative.split("/"))
-    try:
-        with open(path, "rb") as handle:
-            return hashlib.sha256(handle.read()).hexdigest()[:12]
-    except OSError:
-        return ""
-
-
-def _version_asset_urls(html: str) -> str:
-    """
-    Append a content hash to the app's own asset URLs.
-
-    Without this a browser can hold a cached app.js from a previous deploy and
-    pair it with fresh HTML, or vice versa. That combination is not a slow
-    page, it is a broken one: renaming a single element id makes the old script
-    dereference null on an element the new markup no longer has.
-    """
-    for asset in VERSIONED_ASSETS:
-        version = _asset_version(asset)
-        if version:
-            html = html.replace(asset + '"', f'{asset}?v={version}"')
-    return html
-
-
-@app.get("/")
-def serve_dashboard():
-    """
-    Serve the single-page dashboard.
-
-    Sent with no-store: the HTML is the index of which asset versions belong
-    together, so a stale copy pairs old markup with a new script. It is a few
-    tens of kilobytes and the assets it points at are hashed, so there is
-    nothing to gain by caching it.
-    """
-    index_file = os.path.join(static_dir, "index.html")
-    headers = {
-        "Cache-Control": "no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "Expires": "0",
-    }
-    if os.path.exists(index_file):
-        with open(index_file, "r", encoding="utf-8") as f:
-            return HTMLResponse(
-                content=_version_asset_urls(f.read()), headers=headers
-            )
-    return HTMLResponse(
-        "<h1>TCG Inventory Middleware API is running.</h1>", headers=headers
-    )
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, reload=True)

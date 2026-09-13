@@ -180,11 +180,29 @@
   file means two connection pools and two per-account caches, so which one
   you get depends on which module you ask, and nothing fails loudly.
   `test_59a_the_shared_runtime_has_exactly_one_instance` pins this.
-* **Routes belong in `app/routes/<area>.py`**, one `APIRouter` per area,
-  included from `main`. Extracting a group must not change a single URL --
-  that is what lets the existing tests verify the move rather than needing to
-  be rewritten for it. `app/routes/database.py` (backup and restore) is the
-  worked example.
+* **Every route lives in `app/routes/<area>.py`**, one `APIRouter` per area,
+  included from `main`. `main` holds **no endpoints at all**: it builds the
+  app, sets the security headers, mounts `/static`, includes the routers and
+  registers the two background loops. Adding an endpoint means picking the
+  router it belongs to, or adding one.
+
+  | Router | What it owns |
+  |---|---|
+  | `accounts` | Google sign-in, sessions, admin user management |
+  | `inventory` | The catalogue, per-card edits, stats, export, Module A upload |
+  | `listings` | The eBay mirror, and Module B's reconcile |
+  | `pricing` | Tiered rules, condition multipliers, market feed, the repricer |
+  | `settings` | Listing rules -- the eBay-facing seller defaults |
+  | `plans` | Draft plans, the approval gate, and the push |
+  | `orders` | The order poller and the pick list |
+  | `ebay` | Consent, connection, seller setup, notifications |
+  | `database` | Backup and restore |
+  | `system` | The dashboard page, the health probe, the operational log |
+
+* **Extracting or moving a group must not change a single URL.** That is what
+  lets the existing tests verify the move rather than being rewritten for it,
+  and it is worth more than it sounds: across ten cuts, every test change was
+  about *where a name lives*, never about what the code does.
 * **Anything a test patches is reached as `deps.<name>(...)` at call time**,
   never imported into a second module. `from app.deps import get_ebay_client`
   gives the importing module its own reference, so a test patching one
@@ -202,13 +220,10 @@
   registered is a poller indistinguishable from a shop with no sales. So the
   `@app.on_event("startup")` handler stays beside `app` and does nothing but
   await the router's function.
-* **`main` still holds 41 endpoints**: authentication, users, the CSV
-  ingests, inventory and its per-card edits, pricing rules, the repricer, the
-  eBay listings mirror, health and the cached assets. Splitting further is
-  welcome and follows the same recipe -- move a cohesive group, swap `@app.`
-  for `@router.`, import from `deps`, include the router, change no URL.
-  Inventory (largest), pricing/repricing, and authentication/users are the
-  obvious next groups.
+* **Verify a move by calling the routes, not by reading the route table.**
+  FastAPI keeps an included router as one entry, so a naive walk of
+  `app.routes` reports served endpoints as missing. A 401 or 422 proves the
+  route exists; a 404 proves it was lost.
 * **The route walk in `tests/test_deployment.py` must descend into included
   routers.** FastAPI 0.141 keeps an included router as one `_IncludedRouter`
   entry exposing `original_router`, rather than flattening its children into

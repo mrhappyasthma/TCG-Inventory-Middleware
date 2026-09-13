@@ -608,7 +608,8 @@ class TestWebApp(unittest.TestCase):
     def test_21_asset_version_tracks_content(self):
         """A hash that does not change on edit would defeat the point."""
         import os
-        from app.main import _asset_version, static_dir
+        from app.deps import static_dir
+        from app.routes.system import _asset_version
 
         # Binary, deliberately. This test rewrites a real source file, and
         # reading as text translates CRLF to \n while writing back with

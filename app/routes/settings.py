@@ -16,11 +16,10 @@ defaults back as overrides -- which would freeze them.
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from tcg_engine.db import SHARED_SCOPE
-from tcg_engine.batches import build_variation_option_name, generate_variation_title
+from tcg_engine.batches import generate_variation_title
 
 try:
     from app.deps import inventory_for, require_active_user
