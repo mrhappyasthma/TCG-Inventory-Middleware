@@ -2514,5 +2514,120 @@ class StockImageFallbackTests(unittest.TestCase):
         )
 
 
+class HandEditedRemarkTests(unittest.TestCase):
+    """
+    Who owns a card's bin, and what happens when the two disagree.
+
+    Every other export field is a backfill -- written only when ours is empty
+    -- but remarks was an unconditional overwrite, on the reasoning that
+    SortSwift is where cards are scanned and binned. That made editing it on
+    the dashboard worse than useless: the edit would appear to work and then
+    silently revert on the next upload mentioning the card.
+    """
+
+    # "Bin B-3" in the export, so a hand edit to something else conflicts.
+    EXPORT = (
+        "Set,Card Number,Name,Condition,Language,Printing,Quantity,"
+        "Remarks,CDN Image,Stock Image,Price,*ConditionID\n"
+        "Base Set,025/102,Pikachu,NM,EN,Normal,1,Bin B-3,,,0.50,4000\n"
+    )
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "remarks.db"))
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def catalogue(self):
+        process_batch_csv(self.EXPORT, self.db)
+        return self.db.get_inventory()[0]["manifest_id"]
+
+    def test_the_export_owns_the_bin_until_somebody_edits_it(self):
+        manifest_id = self.catalogue()
+        card = self.db.get_manifest_by_id(manifest_id)
+        self.assertEqual(card["remarks"], "Bin B-3")
+        self.assertIsNone(card["remarks_edited_at"])
+
+        # A later export moving the card is still applied.
+        process_batch_csv(
+            self.EXPORT.replace("Bin B-3", "Bin C-9"), self.db
+        )
+        self.assertEqual(
+            self.db.get_manifest_by_id(manifest_id)["remarks"], "Bin C-9"
+        )
+
+    def test_a_hand_set_bin_survives_the_next_upload(self):
+        manifest_id = self.catalogue()
+        result = self.db.set_manifest_remarks(manifest_id, "Bin A-12")
+        self.assertEqual(result, {"previous": "Bin B-3", "current": "Bin A-12"})
+
+        process_batch_csv(self.EXPORT, self.db, force=True)
+        card = self.db.get_manifest_by_id(manifest_id)
+        self.assertEqual(card["remarks"], "Bin A-12")
+        self.assertIsNotNone(card["remarks_edited_at"])
+
+    def test_the_upload_says_which_value_it_kept(self):
+        """
+        Both values are plausible and dropping either silently is how
+        somebody ends up looking in the wrong box.
+        """
+        manifest_id = self.catalogue()
+        self.db.set_manifest_remarks(manifest_id, "Bin A-12")
+
+        result = process_batch_csv(self.EXPORT, self.db, force=True)
+        messages = [entry["message"] for entry in result["logs"]]
+        kept = [m for m in messages if "kept its bin" in m]
+        self.assertEqual(len(kept), 1, messages)
+        self.assertIn("Bin A-12", kept[0])
+        self.assertIn("Bin B-3", kept[0])
+
+    def test_an_agreeing_upload_says_nothing(self):
+        """A notice on every upload for a bin nobody is fighting over is noise."""
+        manifest_id = self.catalogue()
+        self.db.set_manifest_remarks(manifest_id, "Bin B-3")
+
+        result = process_batch_csv(self.EXPORT, self.db, force=True)
+        self.assertEqual(
+            [m for m in
+             (entry["message"] for entry in result["logs"])
+             if "kept its bin" in m],
+            [],
+        )
+
+    def test_clearing_the_bin_hands_it_back_to_the_export(self):
+        """
+        Otherwise a card cleared by hand would be stuck empty forever, with
+        no way to let SortSwift fill it in again.
+        """
+        manifest_id = self.catalogue()
+        self.db.set_manifest_remarks(manifest_id, "Bin A-12")
+        self.db.set_manifest_remarks(manifest_id, "")
+
+        card = self.db.get_manifest_by_id(manifest_id)
+        self.assertIsNone(card["remarks"])
+        self.assertIsNone(card["remarks_edited_at"])
+
+        process_batch_csv(self.EXPORT, self.db, force=True)
+        self.assertEqual(
+            self.db.get_manifest_by_id(manifest_id)["remarks"], "Bin B-3"
+        )
+
+    def test_sortswifts_own_word_for_empty_is_treated_as_empty(self):
+        """
+        The export writes "No Remark" for a card with none and the ingest
+        already reads that as blank. Typing it here has to mean the same, or
+        a card ends up binned in the literal words.
+        """
+        manifest_id = self.catalogue()
+        self.db.set_manifest_remarks(manifest_id, "No Remark")
+        card = self.db.get_manifest_by_id(manifest_id)
+        self.assertIsNone(card["remarks"])
+        self.assertIsNone(card["remarks_edited_at"])
+
+    def test_an_unknown_card_is_reported_rather_than_created(self):
+        self.assertIsNone(self.db.set_manifest_remarks("ID9999", "Bin A-12"))
+
+
 if __name__ == "__main__":
     unittest.main()

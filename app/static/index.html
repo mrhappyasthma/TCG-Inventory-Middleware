@@ -1182,6 +1182,55 @@
     </div>
 
     <!--
+        BIN / REMARK EDIT
+
+        Deliberately says what it cannot do. The bin reaches eBay only
+        encoded in a variation's SKU, which is fixed when the listing is
+        created: a rename returns Success and changes nothing. Someone
+        editing this and expecting the packing slip to follow would be wrong,
+        and there is no error anywhere to tell them so.
+    -->
+    <div id="remarkModal" data-modal class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-dark-900/80 backdrop-blur-sm">
+        <div class="w-full max-w-md bg-dark-800 border border-slate-700 rounded-2xl p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
+            <button onclick="closeRemarkModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+
+            <div class="mb-4">
+                <h3 class="text-lg font-bold font-heading text-white">Bin / Remark</h3>
+                <p class="text-xs text-slate-400 mt-1" id="remarkModalCard">&nbsp;</p>
+            </div>
+
+            <form id="remarkForm" onsubmit="saveRemark(event)" class="space-y-4 text-xs">
+                <div>
+                    <label class="block text-slate-300 mb-1" for="remarkInput">Where this card is stored</label>
+                    <input type="text" id="remarkInput" maxlength="60" placeholder="Bin A-12" autocomplete="off"
+                        class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white font-mono text-sm focus:outline-none focus:border-brand-500">
+                    <p class="text-[11px] text-slate-500 mt-1.5">Leave it empty to clear the bin.</p>
+                </div>
+
+                <p id="remarkOwner" class="p-2.5 rounded-lg bg-dark-900/70 border border-slate-700/80 text-[11px] text-slate-400 leading-snug">&nbsp;</p>
+
+                <div class="p-3 rounded-xl bg-amber-950/40 border border-amber-800/50 text-[11px] text-amber-200/90 leading-snug">
+                    <strong class="text-amber-200">eBay will not see this.</strong> A card&rsquo;s bin reaches eBay
+                    only inside the listing&rsquo;s SKU, which is fixed when the
+                    listing is created &mdash; eBay accepts a rename and then
+                    changes nothing. So the bin printed on the packing slip of an
+                    older listing stays as it was, and newer listings never carried
+                    one. This label is for searching and sorting here.
+                </div>
+
+                <div class="flex items-center justify-end gap-2 pt-2 border-t border-slate-700">
+                    <button type="button" onclick="closeRemarkModal()" class="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">Cancel</button>
+                    <button type="submit" class="px-4 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-semibold shadow-md shadow-brand-500/20">Save Bin</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!--
         FULL OPERATIONAL LOG
 
         The console panel shows the most recent lines; this is the rest. It

@@ -1279,6 +1279,61 @@ class TestWebApp(unittest.TestCase):
             rows[0]["image_url"], "https://cdn.example.com/deerling.jpg"
         )
 
+    def test_39e_the_bin_can_be_edited_by_hand(self):
+        """
+        A local label, and the endpoint that sets it.
+
+        Editing it marks the value as owned here so the next SortSwift upload
+        leaves it alone; clearing it hands ownership back. Both states have to
+        reach the dashboard, because the tint and the tooltip on the cell say
+        which of the two you are looking at.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        rows = self.client.get("/api/inventory").json()["items"]
+        manifest_id = rows[0]["manifest_id"]
+
+        res = self.client.post(
+            f"/api/inventory/{manifest_id}/remark",
+            json={"remarks": "Bin A-12"},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["current"], "Bin A-12")
+
+        row = next(
+            r for r in self.client.get("/api/inventory").json()["items"]
+            if r["manifest_id"] == manifest_id
+        )
+        self.assertEqual(row["remarks"], "Bin A-12")
+        self.assertTrue(row["remarks_edited_at"])
+
+        # Cleared, and the stamp goes with it.
+        self.client.post(
+            f"/api/inventory/{manifest_id}/remark", json={"remarks": ""}
+        )
+        row = next(
+            r for r in self.client.get("/api/inventory").json()["items"]
+            if r["manifest_id"] == manifest_id
+        )
+        self.assertEqual(row["remarks"], "")
+        self.assertFalse(row["remarks_edited_at"])
+
+    def test_39f_an_unknown_card_and_an_overlong_bin_are_refused(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        missing = self.client.post(
+            "/api/inventory/ID999999/remark", json={"remarks": "Bin A-12"}
+        )
+        self.assertEqual(missing.status_code, 404)
+
+        # A shelf label, not a field for prose: unbounded, it would reach the
+        # inventory table and wreck the column.
+        rows = self.client.get("/api/inventory").json()["items"]
+        long_one = self.client.post(
+            f"/api/inventory/{rows[0]['manifest_id']}/remark",
+            json={"remarks": "B" * 200},
+        )
+        self.assertEqual(long_one.status_code, 422)
+
     # -- connecting the eBay account ---------------------------------------
 
     def signed_in_second_user(self):

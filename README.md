@@ -852,7 +852,8 @@ A change to a variation's SKU (`CustomLabel` in the File Exchange era) returns
 Listings report afterwards and finding every label unchanged.
 
 First, it means a card's bin/remark cannot be pushed onto a variation that
-already exists, so the bin is display-only once the listing is up. Second, and
+already exists, so the bin is display-only once the listing is up — it is
+still [editable here](#editing-a-bin-by-hand), it just stays here. Second, and
 more generally: **an eBay success response does not mean your change was
 applied.** That lesson outlived the mechanism it was learned on — it is the
 same trap the Inventory API's bulk calls set, where HTTP 200 carries per-SKU
@@ -1135,6 +1136,11 @@ download buttons on each module card.
 * **Input**: Fresh inventory CSV from SortSwift, or an eBay-style export with `*C:`-prefixed headers. Column matching is case-insensitive and accepts many aliases.
 * **Fields Read**: `Name`, `Set`, `Condition` (NM, LP, MP, HP, DM), `Printing`, `Quantity`, `SKU Id`, `TCGplayer Id`, `Card Number`, `Set Code`, `Language`, `Remarks`, `Price`, `Market Price`, `eBay Price`, `CDN Image`, `Card Back CDN Image`, `Stock Image`, `ConditionID`.
 * **Pricing**: see [How the base price is chosen](#how-the-base-price-is-chosen).
+* **`Remarks` is the one field an upload overwrites** rather than merely
+  backfilling, because SortSwift is where cards are scanned and binned. The
+  exception is a bin set by hand on the dashboard, which wins and is reported
+  rather than discarded — see
+  [Editing a bin by hand](#editing-a-bin-by-hand).
 * **Condition**: both the `Condition` string and the numeric `ConditionID` are taken **verbatim from your export**. There is no translation table — the value originates in SortSwift and is destined for eBay or back into SortSwift, so interposing our own vocabulary would only create a third one that can disagree with both.
   * A row missing either value is **skipped with a warning** rather than having a condition guessed for it. If you see those warnings, re-export from SortSwift with the `ConditionID` column included.
   * One consequence: the Module C deduction CSV carries whatever string your export used (e.g. `NM`), not a normalised `Near Mint`. Matching on import is driven by `skuId` regardless.
@@ -1560,6 +1566,7 @@ recorded and the dialog says why, so nothing is silently lost.
 | **Card Title** | Links to the card on TCGplayer, built from the `TCGplayer Id` in your export. Cards added manually have no ID, so they render as plain text. |
 | **Card #** | Sorted numerically (`4/198` before `133/198`), prefixed numbering after the plain numbers. |
 | **eBay Item #** | Links to the live listing. Only present once Module B has linked it. |
+| **Bin / Remark** | Click to edit it (see below). |
 | **Quantity** | Click to adjust it (see below). |
 
 An **expansion set filter** sits beside the search box, populated from the sets
@@ -1574,6 +1581,41 @@ silently filtering to nothing.
 > could not be verified automatically. If the links do not resolve, the pattern
 > is a single constant (`TCGPLAYER_PRODUCT_URL`) at the top of
 > `app/static/app.js`.
+
+### Editing a bin by hand
+
+Clicking a **Bin / Remark** value opens a dialog for it. A card that moved
+shelves, or one the export never carried a bin for, can be corrected here
+without re-exporting from SortSwift.
+
+**eBay is never told.** A card’s bin reaches eBay only encoded in the
+listing’s SKU, which is fixed when the listing is created — and
+[a variation’s SKU cannot be renamed](#-a-variations-sku-cannot-be-renamed):
+eBay accepts the change, returns **Success**, and leaves the label alone.
+So the bin printed on the packing slip of a File-Exchange-era listing stays
+whatever it was when the listing went up, and listings created through the API
+never carried one at all. This label is for finding and sorting cards here.
+
+**Who owns the field.** Normally your export does — SortSwift is where
+cards are scanned and binned, so `Remarks` is the one column an upload
+overwrites outright rather than only filling in when ours is blank. An edit
+made here takes ownership and **survives later uploads**, because an edit that
+silently reverted on the next upload would be worse than no edit at all. When
+the two then disagree, the upload says so:
+
+```
+[WARN] Row 41: [ID1074] kept its bin 'Bin A-12', which was set here by hand.
+       The export says 'Bin B-3'. Clear the bin on the dashboard to let the
+       export own it again.
+```
+
+Hand-set bins are tinted **amber** in the table and export-supplied ones
+**indigo**, so which is which is visible without opening anything. Clearing
+the field hands ownership back to the export, which then fills it in on the
+next upload — otherwise a card cleared by hand would be stuck empty
+forever.
+
+Capped at 60 characters: it is a shelf label, not a field for prose.
 
 ### Adjusting a quantity by hand
 

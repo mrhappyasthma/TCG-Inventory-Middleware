@@ -1729,6 +1729,30 @@ function cardThumbnailCell(item, cellClasses = "py-2 px-4") {
         </td>`;
 }
 
+// The bin / remark cell: click to edit.
+//
+// A hand-set bin is tinted differently from one the export supplied, because
+// the two are owned by different places. The export normally owns the field
+// -- SortSwift is where cards are scanned and binned -- but a value set here
+// wins and survives the next upload, so which one you are looking at decides
+// whether changing it in SortSwift will have any effect.
+function remarkCell(item) {
+    const value = String(item.remarks || "").trim();
+    const byHand = !!item.remarks_edited_at;
+    const tint = byHand
+        ? "bg-amber-950/70 text-amber-200 border-amber-800/60"
+        : "bg-indigo-950 text-indigo-300 border-indigo-800/60";
+    const hint = byHand
+        ? "Set here by hand, so a SortSwift upload will not overwrite it. Click to change."
+        : "From your SortSwift export. Click to set it by hand.";
+    const inner = value
+        ? `<span class="px-2 py-0.5 rounded text-[10px] border ${tint}">${escapeHtml(value)}</span>`
+        : `<span class="text-slate-600 italic text-[11px]">-</span>`;
+    return `<button type="button" onclick="openRemarkModal('${escapeHtml(item.manifest_id)}')"
+                class="text-left rounded hover:ring-1 hover:ring-brand-500 transition-all cursor-pointer"
+                title="${escapeHtml(hint)}">${inner}</button>`;
+}
+
 function positionCardPreview(event) {
     const box = document.getElementById("cardPreview");
     if (!box) return;
@@ -1887,7 +1911,7 @@ function renderInventoryTable(items, total, offset) {
                     </span>
                 </td>
                 <td class="py-3 px-4 font-mono text-slate-300">
-                    ${item.remarks ? `<span class="px-2 py-0.5 rounded text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800/60">${escapeHtml(item.remarks)}</span>` : '<span class="text-slate-600 italic text-[11px]">-</span>'}
+                    ${remarkCell(item)}
                 </td>
                 <td class="py-3 px-4 font-mono text-slate-300">${
                     item.ebay_parent_id
@@ -2041,6 +2065,75 @@ async function saveQuantity(e) {
         }
 
         fetchStats();
+        fetchInventory();
+    } catch (err) {
+        alert(err.message);
+    }
+}
+
+// -------------------------------------------------------------------
+// BIN / REMARK EDIT
+// -------------------------------------------------------------------
+
+let remarkEditManifestId = null;
+
+function openRemarkModal(manifestId) {
+    const row = (lastInventoryItems || []).find(i => i.manifest_id === manifestId);
+    remarkEditManifestId = manifestId;
+
+    document.getElementById("remarkModalCard").innerText = row
+        ? `[${row.manifest_id}] ${row.product_name}`
+          + `${row.card_number ? " #" + row.card_number : ""} - ${row.set_name}`
+        : `[${manifestId}]`;
+    document.getElementById("remarkInput").value = row ? (row.remarks || "") : "";
+
+    // Which of the two currently owns the field. Worth stating, because the
+    // answer changes what editing it in SortSwift will do.
+    const owner = document.getElementById("remarkOwner");
+    if (owner) {
+        owner.innerText = (row && row.remarks_edited_at)
+            ? "Set here by hand, so SortSwift uploads leave it alone. Clear the field to hand it back to the export."
+            : "Currently owned by your SortSwift export. Saving a value here takes ownership, and uploads will stop overwriting it.";
+    }
+
+    document.getElementById("remarkModal").classList.remove("hidden");
+    syncModalScrollLock();
+    document.getElementById("remarkInput").focus();
+    document.getElementById("remarkInput").select();
+}
+
+function closeRemarkModal() {
+    document.getElementById("remarkModal").classList.add("hidden");
+    syncModalScrollLock();
+    remarkEditManifestId = null;
+}
+
+async function saveRemark(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!remarkEditManifestId) return;
+
+    const remarks = document.getElementById("remarkInput").value || "";
+
+    try {
+        const res = await fetch(`/api/inventory/${encodeURIComponent(remarkEditManifestId)}/remark`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ remarks })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to update the bin");
+
+        const id = remarkEditManifestId;
+        closeRemarkModal();
+        if (data.current) {
+            logToTerminal("SUCCESS",
+                `Bin for [${id}] set to "${data.current}"`
+                + (data.previous ? ` (was "${data.previous}")` : "")
+                + ". This is a local label: eBay cannot be told about it.");
+        } else {
+            logToTerminal("INFO",
+                `Bin for [${id}] cleared. Your SortSwift export owns it again.`);
+        }
         fetchInventory();
     } catch (err) {
         alert(err.message);

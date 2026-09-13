@@ -61,7 +61,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from tcg_engine.csvtools import decode_csv_bytes
 from tcg_engine.db import (
@@ -372,12 +372,25 @@ class CoverImageRequest(BaseModel):
     cover_image_url: str
 
 
+# The longest bin/remark accepted from the dashboard. A shelf label, not a
+# field for prose: an unbounded string here would reach the inventory table
+# and the packing-slip column and wreck both.
+REMARK_MAX_LENGTH = 60
+
+
 class QuantityUpdateRequest(BaseModel):
     quantity: int
     # When the quantity drops, optionally emit a SortSwift deduction file for
     # the difference so the correction can be pushed back to SortSwift.
     generate_deduction: bool = False
     order_number: Optional[str] = None
+
+
+class RemarkUpdateRequest(BaseModel):
+    # The bin or note a card is stored under. Capped because it is a shelf
+    # label, not a field for prose, and an unbounded string here would end up
+    # in the inventory table and the packing-slip column.
+    remarks: str = Field(default="", max_length=REMARK_MAX_LENGTH)
 
 
 class ManualCardAddRequest(BaseModel):
@@ -1738,6 +1751,36 @@ def set_card_quantity(
         "current": result["current"],
         "deducted": delta if delta > 0 else 0,
         "csv_content": csv_content,
+    }
+
+
+@app.post("/api/inventory/{manifest_id}/remark")
+def set_card_remark(
+    manifest_id: str,
+    req: RemarkUpdateRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Set a card's bin/remark by hand.
+
+    A **local label only**. It cannot be pushed to eBay: the bin reaches eBay
+    only encoded in a variation's SKU, which is set when the listing is
+    created and cannot be renamed afterwards -- eBay returns Success and
+    changes nothing. So this changes where the dashboard says a card is, and
+    nothing else.
+
+    Editing it marks the value as owned here, which stops the next SortSwift
+    upload from overwriting it. Clearing it hands ownership back to the
+    export.
+    """
+    result = db.set_manifest_remarks(manifest_id, req.remarks)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Card not found.")
+    return {
+        "success": True,
+        "manifest_id": manifest_id,
+        "previous": result["previous"],
+        "current": result["current"],
     }
 
 

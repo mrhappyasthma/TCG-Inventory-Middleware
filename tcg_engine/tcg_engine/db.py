@@ -290,6 +290,7 @@ class Database:
                     cdn_image TEXT,
                     stock_image TEXT,
                     remarks TEXT,
+                    remarks_edited_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """
@@ -731,11 +732,29 @@ class Database:
             # so that "we have a scan of this card" stays answerable. It
             # decides whether a photo is worth taking.
             cursor.execute("PRAGMA table_info(manifest)")
-            if "stock_image" not in {
-                row["name"] for row in cursor.fetchall()
-            }:
+            manifest_columns = {row["name"] for row in cursor.fetchall()}
+            if "stock_image" not in manifest_columns:
                 cursor.execute(
                     "ALTER TABLE manifest ADD COLUMN stock_image TEXT"
+                )
+
+            # When a person last set this card's bin/remark by hand.
+            #
+            # It exists to settle who owns the value. Every other export
+            # field is a backfill -- written only when ours is empty -- but
+            # remarks was an unconditional overwrite, on the reasoning that
+            # SortSwift is where cards are scanned and binned. That makes a
+            # hand edit on the dashboard worse than useless: it would appear
+            # to work and then silently revert on the next upload that
+            # happened to mention the card.
+            #
+            # So a hand-set remark wins, and the ingest says so rather than
+            # discarding either value quietly. Clearing the field on the
+            # dashboard clears this stamp too, handing ownership back to the
+            # export.
+            if "remarks_edited_at" not in manifest_columns:
+                cursor.execute(
+                    "ALTER TABLE manifest ADD COLUMN remarks_edited_at TIMESTAMP"
                 )
 
             # When the automatic repricer first computed a price *below* what
@@ -1189,7 +1208,19 @@ class Database:
                     if market_price and not existing.get("market_price"):
                         updates.append("market_price = ?")
                         params.append(float(market_price))
-                    if remarks and str(remarks).strip().lower() != "no remark":
+                    # Unlike the fields above this is not a backfill: the
+                    # export normally owns the bin, because SortSwift is
+                    # where cards are scanned and binned. The exception is a
+                    # value set by hand here, which wins -- otherwise editing
+                    # it on the dashboard would appear to work and then
+                    # revert on the next upload mentioning the card. The
+                    # caller compares the two and logs the disagreement, so
+                    # neither value is dropped silently.
+                    if (
+                        remarks
+                        and str(remarks).strip().lower() != "no remark"
+                        and not existing.get("remarks_edited_at")
+                    ):
                         updates.append("remarks = ?")
                         params.append(str(remarks).strip())
 
@@ -1830,6 +1861,7 @@ class Database:
                 m.printing,
                 COALESCE(m.quantity, 0) AS quantity,
                 COALESCE(m.remarks, '') AS remarks,
+                m.remarks_edited_at,
                 COALESCE(m.sku_id, '') AS sku_id,
                 -- The card face, for the dashboard's hover preview. Comes
                 -- from the SortSwift export and is often the only picture of
@@ -3252,6 +3284,54 @@ class Database:
                 (int(plan_id),),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def set_manifest_remarks(
+        self, manifest_id: str, remarks: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Set a card's bin/remark by hand, and record that a person did.
+
+        Returns the previous and current values, or None when there is no
+        such card. The stamp is what protects the value from the next
+        SortSwift upload; clearing the remark clears the stamp with it, so
+        the export owns the field again rather than the card being stuck
+        empty forever.
+
+        Purely a local label. It cannot be pushed to eBay: the bin reaches
+        eBay only encoded in a variation's SKU, and a variation's SKU cannot
+        be renamed once the listing exists -- eBay returns Success and
+        changes nothing.
+        """
+        cleaned = str(remarks or "").strip()
+        # "No Remark" is SortSwift's own way of writing "none", and the
+        # ingest already treats it as empty. Typing it here means the same
+        # thing, rather than a card whose bin is literally the words.
+        if cleaned.lower() in ("no remark", "none", "-"):
+            cleaned = ""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT remarks FROM manifest WHERE manifest_id = ?",
+                (str(manifest_id).strip(),),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            previous = str(row["remarks"] or "")
+            cursor.execute(
+                """
+                UPDATE manifest
+                   SET remarks = ?,
+                       remarks_edited_at = CASE
+                           WHEN ? = '' THEN NULL
+                           ELSE CURRENT_TIMESTAMP
+                       END
+                 WHERE manifest_id = ?
+                """,
+                (cleaned or None, cleaned, str(manifest_id).strip()),
+            )
+            conn.commit()
+        return {"previous": previous, "current": cleaned}
 
     def set_manifest_ebay_fields(
         self, manifest_id: str, fields: Optional[Dict[str, Any]]

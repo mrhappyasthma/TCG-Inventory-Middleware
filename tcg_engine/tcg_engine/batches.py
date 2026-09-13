@@ -807,6 +807,31 @@ def process_batch_csv(
                 remarks=remarks,
             )
 
+        # The export normally owns the bin, but a value set by hand on
+        # the dashboard wins -- see remarks_edited_at in db.py. Say so
+        # when the two disagree, because both are plausible and dropping
+        # either silently is how someone ends up looking in the wrong
+        # box. Sampled like the rest: a re-upload of the same file would
+        # otherwise repeat it for every hand-edited card every time.
+        export_remark = str(remarks or "").strip()
+        stored_remark = str(card_data.get("remarks") or "").strip()
+        if (
+            card_data.get("remarks_edited_at")
+            and export_remark
+            and export_remark.lower() != "no remark"
+            and export_remark != stored_remark
+        ):
+            _log_once(
+                logs, log_tallies, "BIN KEPT",
+                (
+                    f"Row {row_idx}: [{manifest_id}] kept its bin "
+                    f"'{stored_remark}', which was set here by hand. "
+                    f"The export says '{export_remark}'. Clear the bin "
+                    f"on the dashboard to let the export own it again."
+                ),
+                level="WARN",
+            )
+
         # Forward this row's item specifics verbatim, defaulting Game because
         # eBay requires it for the card categories.
         row_specifics: Dict[str, str] = {}
