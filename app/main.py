@@ -42,6 +42,21 @@ from pydantic import BaseModel, Field
 
 from tcg_engine.csvtools import decode_csv_bytes
 try:
+    from app.routes import listings as listings_routes
+except ImportError:
+    from .routes import listings as listings_routes
+
+try:
+    from app.routes import inventory as inventory_routes
+except ImportError:
+    from .routes import inventory as inventory_routes
+
+try:
+    from app.routes import settings as settings_routes
+except ImportError:
+    from .routes import settings as settings_routes
+
+try:
     from app.routes import pricing as pricing_routes
 except ImportError:
     from .routes import pricing as pricing_routes
@@ -271,6 +286,15 @@ app.include_router(pricing_routes.router)
 async def start_price_refresh_loop():
     await pricing_routes.price_refresh_loop()
 
+# Listing rules: the eBay-facing defaults a push reads.
+app.include_router(settings_routes.router)
+
+# The catalogue: what we hold, and the upload that grows it.
+app.include_router(inventory_routes.router)
+
+# The eBay listings mirror, and the report that reconciles it.
+app.include_router(listings_routes.router)
+
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
@@ -317,43 +341,9 @@ async def security_headers(request: Request, call_next):
 
 
 # Pydantic Schemas
-class CoverImageRequest(BaseModel):
-    cover_image_url: str
-
-
 # The longest bin/remark accepted from the dashboard. A shelf label, not a
 # field for prose: an unbounded string here would reach the inventory table
 # and the packing-slip column and wreck both.
-REMARK_MAX_LENGTH = 60
-
-
-class QuantityUpdateRequest(BaseModel):
-    quantity: int
-
-
-class TargetQuantityRequest(BaseModel):
-    # How many copies of this card to aim to hold. None clears the override
-    # so the card follows the account default again -- which is not the same
-    # as zero, a deliberate "never restock this one".
-    target_quantity: Optional[int] = Field(default=None, ge=0, le=999)
-
-
-class RemarkUpdateRequest(BaseModel):
-    # The bin or note a card is stored under. Capped because it is a shelf
-    # label, not a field for prose, and an unbounded string here would end up
-    # in the inventory table and the packing-slip column.
-    remarks: str = Field(default="", max_length=REMARK_MAX_LENGTH)
-
-
-class ManualCardAddRequest(BaseModel):
-    product_name: str
-    set_name: str
-    condition: str = "Near Mint"
-    printing: str = "Normal"
-    quantity: int = 0
-    ebay_parent_id: Optional[str] = None
-
-
 # ---------------------------------------------------------
 # AUTHENTICATION ENDPOINTS
 # ---------------------------------------------------------
@@ -365,104 +355,6 @@ class ManualCardAddRequest(BaseModel):
 # ---------------------------------------------------------
 # CORE BUSINESS LOGIC / PROCESSING ENDPOINTS
 # ---------------------------------------------------------
-
-@app.post("/api/process/batch")
-async def process_batch_endpoint(
-    file: UploadFile = File(...),
-    force: bool = Form(False),
-    dry_run: bool = Form(False),
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Module A: ingest a SortSwift export, catalogue the cards, stage a draft.
-
-    It no longer produces anything to download. The catalogue is updated
-    from the file and a draft plan is staged from the catalogue, which the
-    drafts page reviews and the API push applies -- the only route to eBay
-    there is.
-
-    An upload is a **delta of newly scanned cards**: its quantities are added
-    to what is already held, and a card absent from it means nothing at all.
-    So re-processing the same file double-counts stock, which makes the
-    fingerprint load-bearing -- a repeat is refused unless the caller passes
-    force=true.
-
-    Pass dry_run=true to see what a file would change without writing
-    anything to the catalogue, the store mirror or a draft.
-
-    Prices and listing settings come from the signed-in user's own rules, so
-    two sellers processing the same export each get their own output.
-
-    """
-    inv = inventory_for(user)
-    content_bytes = await read_upload_limited(file)
-    csv_text = decode_csv_bytes(content_bytes)
-
-    # A few thousand card rows is seconds of synchronous SQLite work. Run it in
-    # a worker thread: doing it inline blocks uvicorn's event loop, which makes
-    # the whole dashboard unresponsive rather than just this request. The
-    # session holds one connection open for the run instead of opening and
-    # closing several per card.
-    def run():
-        with inv.session():
-            result = process_batch_csv(
-                csv_text,
-                inv,
-                source_name=file.filename or "upload.csv",
-                force=force,
-                dry_run=dry_run,
-                user_id=user["id"],
-            )
-            # Stage the draft in the same breath as the ingest. Module A used
-            # to finish by handing over two files; now it finishes by leaving
-            # a reviewable draft of what eBay needs, which is the only route
-            # to eBay there is. Doing it here rather than inside
-            # process_batch_csv keeps the engine's ingest free of any opinion
-            # about plans, and avoids an import cycle.
-            #
-            # Skipped for a dry run, which must write nothing, and for a
-            # refused duplicate, which changed nothing to re-plan against.
-            if not dry_run and not result.get("duplicate"):
-                try:
-                    result["plan"] = build_plan(
-                        inv, user["id"], source="batch",
-                        source_ref=file.filename or None,
-                    )
-                except PlanError as exc:
-                    # An ingest that succeeded must not report failure because
-                    # the draft could not be built; the Rebuild button is
-                    # still there.
-                    result["plan"] = None
-                    result["logs"].append({
-                        "level": "WARN",
-                        "message": (
-                            f"The catalogue was updated, but the draft could "
-                            f"not be staged: {exc}. Press Rebuild draft."
-                        ),
-                    })
-            return result
-
-    return await run_in_threadpool(run)
-
-
-@app.post("/api/process/sync")
-async def process_sync_endpoint(
-    file: UploadFile = File(...),
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Module B: Ingest eBay Active Listings report CSV & sync live store mirror state.
-    """
-    inv = inventory_for(user)
-    content_bytes = await read_upload_limited(file)
-    csv_text = decode_csv_bytes(content_bytes)
-
-    def run():
-        with inv.session():
-            return sync_active_listings_csv(csv_text, inv)
-
-    return await run_in_threadpool(run)
-
 
 # ---------------------------------------------------------
 # PRICING RULES API ENDPOINTS
@@ -528,463 +420,9 @@ def clear_logs_endpoint(user: Dict[str, Any] = Depends(require_admin_user)):
 # LISTING & VARIATION SETTINGS API ENDPOINTS
 # ---------------------------------------------------------
 
-class ListingSettingsUpdateRequest(BaseModel):
-    settings: Dict[str, str]
-
-
-class TitlePreviewRequest(BaseModel):
-    set_name: str
-    condition: str = ""
-    template: Optional[str] = "{set_name}: Pick Your Card - {condition} - Complete Your Set"
-
-
-@app.get("/api/listing-settings")
-def get_listing_settings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """
-    The listing settings that apply to the signed-in user.
-
-    These merge key by key: the shared baseline with the caller's own overrides
-    on top. ``own_keys`` names the ones the caller has actually set, so the UI
-    can distinguish an inherited value from a chosen one.
-    """
-    inv = inventory_for(user)
-    return {
-        "settings": inv.get_listing_settings(user_id=user["id"]),
-        "own_keys": inv.get_own_listing_setting_keys(user["id"]),
-    }
-
-
-@app.post("/api/listing-settings")
-def update_listing_settings_endpoint(
-    req: ListingSettingsUpdateRequest,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Save the signed-in user's own listing settings.
-
-    No longer admin-only, for the same reason as pricing rules: the title
-    template, business policy names and postal code describe the caller's own
-    eBay account, so they cannot sensibly be shared.
-    """
-    inv = inventory_for(user)
-    inv.set_listing_settings(req.settings, user_id=user["id"])
-    return {
-        "success": True,
-        "settings": inv.get_listing_settings(user_id=user["id"]),
-        "own_keys": inv.get_own_listing_setting_keys(user["id"]),
-    }
-
-
-@app.post("/api/listing-settings/reset")
-def reset_listing_settings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """Discard the caller's own settings and inherit the shared defaults again."""
-    inv = inventory_for(user)
-    settings = inv.reset_listing_settings(user_id=user["id"])
-    return {
-        "success": True,
-        "settings": settings,
-        "own_keys": inv.get_own_listing_setting_keys(user["id"]),
-    }
-
-
-@app.post("/api/listing-settings/preview-title")
-def preview_title_endpoint(
-    req: TitlePreviewRequest,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """Preview a variation title, including the 80-character fallback."""
-    from tcg_engine.batches import (
-        generate_variation_title,
-        DEFAULT_VARIATION_TITLE_TEMPLATE,
-    )
-    generated_title = generate_variation_title(
-        set_name=req.set_name,
-        condition=req.condition,
-        template=req.template or DEFAULT_VARIATION_TITLE_TEMPLATE,
-    )
-    return {
-        "set_name": req.set_name,
-        "condition": req.condition,
-        "generated_title": generated_title,
-        "char_count": len(generated_title),
-        "is_valid": len(generated_title) <= 80,
-    }
-
-
 # ---------------------------------------------------------
 # INVENTORY & CATALOG API ENDPOINTS
 # ---------------------------------------------------------
-
-@app.get("/api/inventory")
-def get_inventory_endpoint(
-    search: Optional[str] = None,
-    sort_by: str = "manifest_id",
-    sort_dir: str = "ASC",
-    limit: int = 50,
-    offset: int = 0,
-    set_name: Optional[str] = None,
-    below_target: bool = False,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Fetch paginated, filtered, and sorted inventory list.
-
-    ``below_target`` narrows it to cards held below the depth they aim for,
-    which is the restock list: combined with the set filter it answers "which
-    cards in this set do I still need".
-    """
-    # Read once and passed to both calls, so the rows and the total cannot
-    # be computed against different targets.
-    inv = inventory_for(user)
-    target_default = inv.get_target_quantity_default(user_id=user["id"])
-    items = inv.get_inventory(
-        search=search,
-        sort_by=sort_by,
-        sort_dir=sort_dir,
-        limit=limit,
-        offset=offset,
-        set_name=set_name,
-        below_target=below_target,
-        target_default=target_default,
-    )
-    total = inv.get_inventory_count(
-        search=search, set_name=set_name,
-        below_target=below_target, target_default=target_default,
-    )
-    return {
-        "items": items,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "target_default": target_default,
-        # Always the full shortfall under the current search and set, not
-        # just this page's. The question is how much there is left to buy,
-        # which a page cannot answer.
-        "restock": inv.get_restock_summary(
-            set_name=set_name, search=search, target_default=target_default
-        ),
-    }
-
-
-@app.post("/api/inventory/{manifest_id}/target-quantity")
-def set_card_target_quantity(
-    manifest_id: str,
-    req: TargetQuantityRequest,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Set how many copies of one card to aim to hold.
-
-    A target, not a ceiling: nothing refuses stock above it and no listing is
-    delisted down to it. Holding more than the target simply means nothing is
-    needed. Its whole purpose is the restock question.
-
-    Sending no value clears the override, so the card follows the account
-    default again.
-    """
-    inv = inventory_for(user)
-    result = inv.set_manifest_target_quantity(manifest_id, req.target_quantity)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Card not found.")
-    target_default = inv.get_target_quantity_default(user_id=user["id"])
-    effective = (
-        result["current"] if result["current"] is not None else target_default
-    )
-    return {
-        "success": True,
-        "manifest_id": manifest_id,
-        "previous": result["previous"],
-        "target_quantity": result["current"],
-        "effective_target": effective,
-        "quantity": result["quantity"],
-        "needed": max(0, effective - result["quantity"]),
-    }
-
-
-@app.get("/api/ebay-listings")
-def get_ebay_listings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """
-    Live eBay listings, rolled up from the store mirror.
-
-    Derived rather than stored: the mirror is keyed by card, so this groups by
-    eBay item number to show the store the way eBay presents it.
-    """
-    # Which path manages each listing, so the page can offer the right
-    # action. A listing created through this API is corrected in place; a File
-    # Exchange one needs a Revise file uploaded, and the two are not
-    # interchangeable -- offering the wrong one hands out a file that silently
-    # does nothing, or an API call eBay refuses.
-    inv = inventory_for(user)
-    managed = {
-        row["ebay_parent_id"]
-        for row in inv.get_managed_listings()
-        if row.get("ebay_parent_id")
-    }
-    return {
-        "listings": [
-            {**listing, "managed": listing["ebay_parent_id"] in managed}
-            for listing in inv.get_ebay_listings()
-        ]
-    }
-
-
-@app.post("/api/ebay-listings/{item_id}/cover")
-async def set_listing_cover(
-    item_id: str,
-    req: CoverImageRequest,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Record a listing's cover photo, and apply it however that listing allows.
-
-    Saving locally is never enough on its own: the listing lives on eBay. How
-    the change gets there depends on which path created the listing, and the
-    two are not interchangeable -- File Exchange cannot revise a listing the
-    Inventory API manages, so handing out a CSV for one of those would be
-    handing out something that silently does nothing.
-
-    A listing we created through the API is therefore updated immediately, and
-    a legacy one still gets the Revise file to upload.
-    """
-    inv = inventory_for(user)
-    url = (req.cover_image_url or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="A cover photo URL is required.")
-    if not url.lower().startswith(("http://", "https://")):
-        raise HTTPException(
-            status_code=400,
-            detail="The cover photo must be a full http:// or https:// URL that eBay can fetch.",
-        )
-
-    known = {l["ebay_parent_id"] for l in inv.get_ebay_listings()}
-    if item_id not in known:
-        raise HTTPException(
-            status_code=404,
-            detail="No linked listing with that eBay item number.",
-        )
-
-    saved = inv.set_listing_cover_image(item_id, url)
-
-    # The choice is recorded first, so that a failure to apply it still leaves
-    # it stored and retryable with the listing's Refresh button.
-    if inv.get_managed_listing_by_parent(item_id) is None:
-        return {
-            "success": True,
-            "ebay_parent_id": item_id,
-            "cover_image_url": saved,
-            "applied": False,
-            "reason": (
-                "Saved, but this listing is not managed through the eBay API, "
-                "so there is no way to apply it. Sync from eBay, then press "
-                "Refresh on the listing."
-            ),
-        }
-
-    client = deps.get_ebay_client(user["id"])
-    if client is None or not client.oauth.is_connected():
-        return {
-            "success": True,
-            "ebay_parent_id": item_id,
-            "cover_image_url": saved,
-            "applied": False,
-            "reason": (
-                "Saved, but eBay is not connected, so it has not been applied "
-                "yet. Connect the account and press Refresh on the listing."
-            ),
-        }
-
-    adapter = InventoryApiAdapter(client)
-
-    def run():
-        with inv.session():
-            return refresh_listing(inv, adapter, item_id, user_id=user["id"])
-
-    try:
-        result = await run_in_threadpool(run)
-    except (PushError, EbayError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"The cover was saved but eBay refused the update: {exc}. "
-                f"Press Refresh on the listing to try again."
-            ),
-        )
-    return {
-        "success": True,
-        "ebay_parent_id": item_id,
-        "cover_image_url": saved,
-        "applied": True,
-        "refreshed": result.get("refreshed", 0),
-    }
-
-
-@app.get("/api/inventory/sets")
-def get_inventory_sets(user: Dict[str, Any] = Depends(require_active_user)):
-    """
-    Expansion sets present in the catalog, for the dashboard filter.
-
-    Derived from the catalog rather than a fixed list, so the filter can only
-    ever offer a set that actually has cards behind it.
-    """
-    inv = inventory_for(user)
-    return {"sets": inv.get_distinct_set_names()}
-
-
-@app.post("/api/inventory/{manifest_id}/quantity")
-def set_card_quantity(
-    manifest_id: str,
-    req: QuantityUpdateRequest,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Set a card's catalogued quantity to an absolute value.
-
-    This is the manual correction path, so the figure supplied is the figure
-    stored -- unlike batch intake, which accumulates.
-
-    Nothing is written back to SortSwift. Its numbers drift upward from
-    reality by design; this catalogue is the authoritative one, and eBay's
-    orders API is the only other thing that moves a quantity.
-    """
-    inv = inventory_for(user)
-    if req.quantity < 0:
-        raise HTTPException(status_code=400, detail="Quantity cannot be negative.")
-
-    # One existence check, not two: set_manifest_quantity already reports
-    # a missing card. The card itself was only read to build the
-    # deduction row that no longer exists.
-    result = inv.set_manifest_quantity(manifest_id, req.quantity)
-    if not result:
-        raise HTTPException(status_code=404, detail="Card not found.")
-
-    return {
-        "success": True,
-        "manifest_id": manifest_id,
-        "previous": result["previous"],
-        "current": result["current"],
-    }
-
-
-@app.post("/api/inventory/{manifest_id}/remark")
-def set_card_remark(
-    manifest_id: str,
-    req: RemarkUpdateRequest,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Set a card's bin/remark by hand.
-
-    A **local label only**. It cannot be pushed to eBay: the bin reaches eBay
-    only encoded in a variation's SKU, which is set when the listing is
-    created and cannot be renamed afterwards -- eBay returns Success and
-    changes nothing. So this changes where the dashboard says a card is, and
-    nothing else.
-
-    Editing it marks the value as owned here, which stops the next SortSwift
-    upload from overwriting it. Clearing it hands ownership back to the
-    export.
-    """
-    inv = inventory_for(user)
-    result = inv.set_manifest_remarks(manifest_id, req.remarks)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Card not found.")
-    return {
-        "success": True,
-        "manifest_id": manifest_id,
-        "previous": result["previous"],
-        "current": result["current"],
-    }
-
-
-@app.get("/api/stats")
-def get_stats_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """Get catalog and stock statistics."""
-    inv = inventory_for(user)
-    return inv.get_stats()
-
-
-@app.post("/api/inventory/add")
-def add_card_manually(
-    req: ManualCardAddRequest,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """Manually add or update a card in the master catalog."""
-    inv = inventory_for(user)
-    manifest_id, is_new, card_data = inv.get_or_create_manifest(
-        req.product_name, req.set_name, req.condition, req.printing
-    )
-    if req.ebay_parent_id:
-        inv.upsert_variation(manifest_id, req.ebay_parent_id, req.quantity)
-    return {
-        "success": True,
-        "manifest_id": manifest_id,
-        "is_new": is_new,
-        "card": card_data,
-    }
-
-
-@app.delete("/api/inventory/{manifest_id}")
-def delete_card_endpoint(
-    manifest_id: str,
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """Delete a card from the master catalog."""
-    inv = inventory_for(user)
-    success = inv.delete_manifest(manifest_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Card not found.")
-    return {"success": True, "manifest_id": manifest_id}
-
-
-def _csv_safe(value: Any) -> Any:
-    """
-    Neutralise spreadsheet formula injection for a human-facing export.
-
-    A cell beginning =, +, - or @ is evaluated as a formula by Excel and
-    Sheets, so a card name or bin note carrying one becomes code in whoever
-    opens the file. Prefixing with an apostrophe makes it literal text.
-
-    Applied ONLY to this export, which exists to be opened in a spreadsheet.
-    The eBay Add/Revise files must never be touched this way: eBay parses them
-    as data, and an apostrophe would corrupt a title or a price.
-    """
-    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
-        return "'" + value
-    return value
-
-
-@app.get("/api/export/manifest")
-def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """Export complete Master Catalog & Live Mirror as CSV download."""
-    inv = inventory_for(user)
-    items = inv.export_all_manifest()
-    fieldnames = [
-        "manifest_id",
-        "product_name",
-        "card_number",
-        "set_name",
-        "condition",
-        "printing",
-        "quantity",
-        "ebay_parent_id",
-        "last_known_qty",
-    ]
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
-    writer.writeheader()
-    # This file is meant to be opened in a spreadsheet, so cells that would
-    # otherwise be read as formulas are made literal first.
-    writer.writerows(
-        {key: _csv_safe(row.get(key)) for key in fieldnames} for row in items
-    )
-    output.seek(0)
-
-    return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=master_catalog_export.csv"},
-    )
-
 
 # ---------------------------------------------------------
 # DATABASE BACKUP / RESTORE
@@ -1035,47 +473,6 @@ def health_check():
 # How long a consent attempt may sit unfinished. Long enough to read eBay's
 # screen, short enough that a stale link in someone's history is useless.
 EBAY_OAUTH_STATE_TTL_SECONDS = 600
-
-
-@app.post("/api/ebay-listings/{item_id}/refresh")
-async def refresh_listing_endpoint(
-    item_id: str, user: Dict[str, Any] = Depends(require_active_user)
-):
-    """
-    Re-send a live listing's pictures, specifics, title and description.
-
-    These live on the inventory items rather than on a plan, so once a listing
-    is up there is no route to them through the drafts page: a plan is a diff
-    of quantities and prices, and a picture change produces no diff at all.
-    The first listing this application created went live carrying the card
-    backs, and nothing could reach in to correct it.
-
-    Deliberately cannot move stock or money: quantity is re-sent as what eBay
-    is already known to hold, and no price is sent at all.
-    """
-    inv = inventory_for(user)
-    client = deps.get_ebay_client(user["id"])
-    if client is None or not client.oauth.is_connected():
-        raise HTTPException(
-            status_code=409, detail="Connect the eBay account first."
-        )
-
-    adapter = InventoryApiAdapter(client)
-
-    def run():
-        with inv.session():
-            return refresh_listing(inv, adapter, item_id, user_id=user["id"])
-
-    try:
-        result = await run_in_threadpool(run)
-    except PushError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except EbayError as exc:
-        raise HTTPException(status_code=502, detail=f"eBay refused: {exc}")
-
-    for entry in result.get("logs", []):
-        print(f"[refresh] {entry['level']}: {entry['message']}", flush=True)
-    return {"success": True, **result}
 
 
 # -------------------------------------------------------------------

@@ -728,7 +728,7 @@ class TestWebApp(unittest.TestCase):
         is evaluated. The eBay files must NOT get this treatment, since eBay
         parses them as data.
         """
-        from app.main import _csv_safe
+        from app.routes.inventory import _csv_safe
 
         for dangerous in ("=1+1", "+1", "-1", "@SUM(A1)"):
             self.assertTrue(_csv_safe(dangerous).startswith("'"), dangerous)
