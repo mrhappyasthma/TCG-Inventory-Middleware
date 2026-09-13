@@ -7,7 +7,6 @@ import unittest
 from tcg_engine.db import (SHARED_SCOPE, Database, apply_pricing_rules,
                           apply_condition_multiplier,
                           normalize_condition_key)
-from tcg_engine.orders import process_orders_csv
 from tcg_engine.batches import (
     build_variation_option_name,
     process_batch_csv,
@@ -71,28 +70,6 @@ class TestTCGEngine(unittest.TestCase):
         self.assertEqual(stats["active_listings"], 1)
         self.assertEqual(stats["total_stock"], 5)
 
-    def test_module_a_orders_conversion(self):
-        # Populate master catalog
-        self.db.insert_manifest("ID1001", "Pikachu", "Jungle", "Near Mint", "Foil")
-        self.db.insert_manifest("ID1002", "Mewtwo", "Base Set", "Near Mint", "Holofoil")
-
-        # Sample eBay orders CSV (including non-TCG item and multi-quantity)
-        sample_ebay_orders = """Sales Record Number,Order Number,Item Number,Item Title,Custom Label,Quantity,Sale Price
-101,ORD-9901,123456789012,Pokemon Jungle Pikachu Foil,ID1001,3,$15.00
-102,ORD-9902,123456789013,Pokemon Base Mewtwo Holo,ID1002,1,$45.00
-103,ORD-9903,999999999999,Random Comic Book,,1,$5.00
-"""
-        res = process_orders_csv(sample_ebay_orders, self.db)
-        self.assertEqual(res["converted_count"], 4)  # 3 Pikachus + 1 Mewtwo
-        self.assertEqual(res["skipped_count"], 1)  # 1 comic book skipped
-        self.assertEqual(len(res["output_rows"]), 2)
-
-        # Verify output CSV headers and contents
-        csv_lines = res["csv_content"].strip().splitlines()
-        self.assertEqual(csv_lines[0], "skuId,productId,Order Number,Product Name,Set Name,Condition,Printing,Quantity")
-        self.assertTrue(any("ORD-9901" in line and "Pikachu" in line and "3" in line for line in csv_lines))
-        self.assertTrue(any("ORD-9902" in line and "Mewtwo" in line and "1" in line for line in csv_lines))
-
     def test_variation_title_generation(self):
         from tcg_engine.batches import generate_variation_title
 
@@ -144,21 +121,6 @@ class TestTCGEngine(unittest.TestCase):
         self.assertEqual(card1["market_price"], 0.17)
         self.assertEqual(card1["cdn_image"], "https://cdn.example.com/deerling.jpg")
 
-        # Now test orders conversion using the cataloged card
-        sample_ebay_order = """Sales Record Number,Order Number,Item Title,Custom Label,Quantity
-501,ORD-501,Pokemon Temporal Forces Deerling,ID1001,1
-"""
-        order_res = process_orders_csv(sample_ebay_order, self.db)
-        self.assertEqual(order_res["converted_count"], 1)
-        csv_lines = order_res["csv_content"].strip().splitlines()
-        # Verify skuId 7805758 is present in SortSwift deduction output
-        # Two things are pinned here. The condition round-trips verbatim: the
-        # source export said "NM", so the deduction file says "NM" rather than a
-        # normalised "Near Mint". And the quantity is NEGATIVE: SortSwift's
-        # import adds the quantity column to existing stock, so a deduction has
-        # to be expressed as a negative number or it increases inventory.
-        self.assertIn("7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,NM,Normal,-1", csv_lines)
-
     def test_bin_remark_encoding_and_reexport(self):
         # Initial export with Remarks "Bin A-12"
         batch_1 = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
@@ -194,12 +156,6 @@ class TestTCGEngine(unittest.TestCase):
         # Deerling is live on eBay already, so only Pikachu is newly staged.
         self.assertEqual(res2["staged_card_count"], 1)
         self.assertEqual(res2["new_catalog_count"], 1)
-
-        # Test eBay order with custom label ID1001-Bin_A-12
-        order_csv = "Sales Record Number,Order Number,Item Title,Custom Label,Quantity\n101,ORD-101,Deerling,ID1001-Bin_A-12,1\n"
-        order_res = process_orders_csv(order_csv, self.db)
-        self.assertEqual(order_res["converted_count"], 1)
-        self.assertIn("7805758", order_res["csv_content"])
 
 
     def test_pricing_rules_engine(self):
@@ -1089,24 +1045,18 @@ class TestTCGEngine(unittest.TestCase):
         self.assertEqual(item_ids, {"227511361186"})
         self.assertNotIn("UNKNOWN", item_ids)
 
-    def test_bom_is_tolerated_by_every_module(self):
-        # Module A
+    def test_bom_is_tolerated_by_the_ingest(self):
+        """
+        Excel writes a byte-order mark and the ingest must not choke on it.
+
+        This covered Module C as well until the deduction path was removed.
+        """
         db_b = Database(self.db_path + ".b")
         plain = process_batch_csv(self.NUMBERED_BATCH, db_b)
         db_b2 = Database(self.db_path + ".b2")
         with_bom = process_batch_csv(self.BOM + self.NUMBERED_BATCH, db_b2)
         self.assertEqual(plain["staged_card_count"], with_bom["staged_card_count"])
         self.assertEqual(with_bom["skipped_count"], 0)
-
-        # Module C
-        self._seed_live_catalog()
-        orders = (
-            "Sales Record Number,Order Number,Item Title,Custom Label,Quantity" + chr(10)
-            + "901,ORD-901,Ledyba,ID1050-C-1,2" + chr(10)
-        )
-        res = process_orders_csv(self.BOM + orders, self.db)
-        self.assertEqual(res["converted_count"], 2)
-        self.assertEqual(res["skipped_count"], 0)
 
     def test_find_column_tolerates_bom_asterisk_and_case(self):
         from tcg_engine.csvtools import find_column
@@ -1195,26 +1145,6 @@ class TestTCGEngine(unittest.TestCase):
         self.assertEqual(self.db.set_manifest_quantity(card["manifest_id"], -5)["current"], 0)
         self.assertIsNone(self.db.set_manifest_quantity("ID9999", 1))
 
-    def test_deduction_row_matches_the_sortswift_shape(self):
-        from tcg_engine.orders import build_deduction_csv, deduction_row, SORTSWIFT_HEADERS
-
-        process_batch_csv(self.TWO_SET_BATCH, self.db)
-        card = next(c for c in self.db.get_inventory(limit=100)
-                    if c["product_name"] == "Ledyba")
-        full = self.db.get_manifest_by_id(card["manifest_id"])
-
-        csv_text = build_deduction_csv([deduction_row(full, 2, "MANUAL-TEST")])
-        lines = csv_text.strip().splitlines()
-        self.assertEqual(lines[0], ",".join(SORTSWIFT_HEADERS))
-
-        row = list(csv.DictReader(io.StringIO(csv_text)))[0]
-        self.assertEqual(row["skuId"], "111")
-        self.assertEqual(row["productId"], "542678")
-        self.assertEqual(row["Order Number"], "MANUAL-TEST")
-        self.assertEqual(row["Product Name"], "Ledyba")
-        # Negative, because SortSwift's import adds this column to stock.
-        self.assertEqual(row["Quantity"], "-2")
-
     # ------------------------------------------------------------------
     # eBay Listings roll-up
     # ------------------------------------------------------------------
@@ -1280,47 +1210,6 @@ class TestTCGEngine(unittest.TestCase):
     # ------------------------------------------------------------------
     # Deduction direction (SortSwift adds the quantity column)
     # ------------------------------------------------------------------
-
-    def test_every_deduction_quantity_is_negative(self):
-        """
-        SortSwift's inventory import ADDS the quantity column to existing stock.
-        A positive figure therefore increases inventory, which is the opposite
-        of a deduction -- importing one previously showed up as "+1". Every
-        quantity this engine writes into a deduction file must be negative.
-        """
-        self.db.insert_manifest(
-            "ID1001", "Ledyba", "Chilling Reign", "NM", "Normal",
-            sku_id="111", tcgplayer_id="542678")
-
-        orders = (
-            "Sales Record Number,Order Number,Item Title,Custom Label,Quantity" + chr(10)
-            + "901,ORD-901,Ledyba,ID1001,3" + chr(10)
-            + "902,ORD-902,Ledyba,ID1001,1" + chr(10)
-        )
-        res = process_orders_csv(orders, self.db)
-
-        rows = list(csv.DictReader(io.StringIO(res["csv_content"])))
-        self.assertEqual(len(rows), 2)
-        quantities = [int(r["Quantity"]) for r in rows]
-        self.assertEqual(quantities, [-3, -1])
-        self.assertTrue(all(q < 0 for q in quantities))
-
-        # The reported total stays positive: it is a count of cards sold, not a
-        # figure written into the file.
-        self.assertEqual(res["converted_count"], 4)
-
-    def test_deduction_row_negates_whatever_sign_it_is_given(self):
-        from tcg_engine.orders import deduction_row
-
-        card = {"sku_id": "111", "tcgplayer_id": "542678", "product_name": "Ledyba",
-                "set_name": "Chilling Reign", "condition": "NM", "printing": "Normal"}
-
-        # Callers pass a positive count of cards removed...
-        self.assertEqual(deduction_row(card, 2, "X")["Quantity"], -2)
-        # ...and a caller that already negated must not double-negate back to
-        # positive, which would silently re-add stock.
-        self.assertEqual(deduction_row(card, -2, "X")["Quantity"], -2)
-        self.assertEqual(deduction_row(card, 0, "X")["Quantity"], 0)
 
     # ------------------------------------------------------------------
     # Per-listing cover photo

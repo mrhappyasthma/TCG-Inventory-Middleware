@@ -1,5 +1,13 @@
 # Design: automating Module C (orders → stock deductions)
 
+> **Historical.** This design was implemented and has since gone further than
+> it proposed: the deduction CSV, the orders-CSV upload and the CLI
+> subcommand behind them have all been **removed**. eBay's orders API is now
+> the only thing that deducts stock. Sections below that describe
+> `build_deduction_csv`, `deduction_row` or a file for SortSwift to read back
+> describe code that no longer exists. Kept as the record of how the decision
+> was reached.
+
 **Status: built.** Shipped in `3d4cd70`. This file records why it is a poll
 rather than a webhook, why our catalogue owns the quantity, and the
 properties the implementation had to have -- all of which were decided

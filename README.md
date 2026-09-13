@@ -2,7 +2,7 @@
 
 A lightweight, containerized Python web application and standalone core library designed to run on a **Synology NAS** (via Docker / Container Manager) and developable directly on **Windows**.
 
-This middleware connects **SortSwift** (TCGplayer Inventory Schema) and **eBay Seller Hub Reports**. It automates stock deductions, synchronizes single/variation listings, and bypasses eBay's 50-character SKU limit using an atomic SQLite database and compact sequential manifest IDs (`ID1001`, `ID1002`, ...).
+This middleware connects **SortSwift** (TCGplayer Inventory Schema) and **eBay Seller Hub Reports**. It reads SortSwift's export to keep a catalogue, manages eBay listings through eBay's APIs, deducts sales automatically from eBay's orders API, and bypasses eBay's 50-character SKU limit using an atomic SQLite database with compact sequential manifest IDs (`ID1001`, `ID1002`, ...). CSV goes one way: in.
 
 ---
 
@@ -23,9 +23,9 @@ graph TD
     C -->|Nightly, price only| T(Automatic Repricer)
     T --> R
 
-    G[eBay Orders CSV] -->|Upload Sales| H(Module C: Orders Converter)
-    H -->|Custom Label Lookup| C
-    H -->|Match skuId / Attributes| I[sortswift_orders_import.csv - Deductions]
+    G[eBay Orders API] -->|Polled every 15 min| H(Module C: Orders Poller)
+    H -->|SKU lookup| C
+    H -->|Deduct sold cards| D
 
     J[eBay Active Listings] -->|Feed API or upload| K(Module B: Store State Sync)
     K -->|UPSERT ItemID & Live Qty| D
@@ -399,9 +399,6 @@ python -m tcg_engine.cli batch sortswift_batch.csv --out-dir ./output --dry-run 
 
 # Module B: Sync Active eBay Listings Report into Store State Mirror
 python -m tcg_engine.cli sync active_listings.csv --db data/inventory.db
-
-# Module C: Convert eBay Orders CSV to SortSwift Deduction CSV
-python -m tcg_engine.cli orders sample_ebay_orders.csv -o sortswift_orders.csv --db data/inventory.db
 
 # Export Master Catalog
 python -m tcg_engine.cli export-manifest -o master_manifest.csv --db data/inventory.db
@@ -1193,7 +1190,7 @@ download buttons on each module card.
   [Editing a bin by hand](#editing-a-bin-by-hand).
 * **Condition**: both the `Condition` string and the numeric `ConditionID` are taken **verbatim from your export**. There is no translation table — the value originates in SortSwift and is destined for eBay or back into SortSwift, so interposing our own vocabulary would only create a third one that can disagree with both.
   * A row missing either value is **skipped with a warning** rather than having a condition guessed for it. If you see those warnings, re-export from SortSwift with the `ConditionID` column included.
-  * One consequence: the Module C deduction CSV carries whatever string your export used (e.g. `NM`), not a normalised `Near Mint`. Matching on import is driven by `skuId` regardless.
+  * The condition string is therefore whatever your export used (e.g. `NM`), not a normalised `Near Mint`, everywhere it appears.
 * **A note on eBay's card ConditionIDs**: for the card categories (`183050`, `183454`, `261328`) eBay does *not* use its general used-goods scale. Ungraded cards use IDs extending **`4000`** and graded cards use IDs extending **`2750`**. So `4000` means "Ungraded", **not** "Lightly Played". The actual grade is expressed in a separate, required **Condition Descriptor** field limited to *Near Mint or Better*, *Excellent*, *Very Good* or *Poor* — which this generator does not yet emit. See the outstanding-work note below.
 
 ### 🃏 eBay Condition Descriptors (ungraded cards)
@@ -1397,24 +1394,21 @@ Renaming carries any existing store-mirror row with it, so a card that was
 already linked keeps its eBay item number and quantity.
 
 ---
-### 3. eBay Orders to SortSwift Deduction Ingestion (Module C)
-* **Input**: Raw eBay Orders report (`ebay_orders.csv`). Leading metadata lines are detected and skipped.
-* **Fields Read**: `Custom Label` (contains `manifest_id`), `Quantity`, `Order Number`.
-* **Output (`sortswift_orders_import.csv`)**:
-  ```csv
-  skuId,productId,Order Number,Product Name,Set Name,Condition,Printing,Quantity
-  7805758,542678,ORD-501,Deerling - 016/162,SV05: Temporal Forces,NM,Normal,-1
-  ```
+### 3. Orders (Module C) — no CSV at all
 
-* ⚠️ **Quantities are negative.** SortSwift's inventory import *adds* the
-  quantity column to your existing stock, so a positive number increases
-  inventory — the opposite of a deduction. Its documentation is explicit: *"if
-  you place a negative number in the quantity field, it will remove that amount
-  from your existing quantity."* Stock clamps at **0** rather than going
-  negative, so over-deducting silently floors instead of erroring.
-* **Matching is by `skuId`**, which uniquely identifies the card together with
-  its condition, language and printing. `productId` is the fallback. The
-  `Remark` column is not part of the match, and this file does not send one.
+Module C reads **eBay's Fulfillment API** every fifteen minutes and deducts
+what sold from this catalogue. There is no input file and no output file: the
+orders-CSV upload and the SortSwift deduction file it produced have both been
+removed, along with the `orders` CLI subcommand.
+
+See [Orders: what sold comes off your stock](#-orders-what-sold-comes-off-your-stock)
+for what it guarantees, and
+[Where to get the card from](#where-to-get-the-card-from) for the pick list it
+feeds. Stock clamps at **0** rather than going negative, so selling more than
+you hold floors instead of erroring — and says so.
+
+**Nothing is written back to SortSwift.** Its quantities drift upward from
+reality, which is expected: this catalogue is the authoritative one.
 
 
 ## 🗂️ Workspace tabs
@@ -1776,14 +1770,9 @@ miscount, a card pulled for a trade, damage found after scanning.
 
 * The figure you enter is **absolute**. Unlike batch intake, which accumulates,
   this replaces the stored value.
-* Optionally tick **Generate SortSwift deduction CSV** to get a deduction file
-  for the difference, in exactly the format a real order produces, so the same
-  correction can be applied in SortSwift. The quantity in that file is
-  **negative**, because SortSwift's import adds the column to existing stock.
-* A deduction is only produced when the quantity **decreases**; raising it has
-  nothing to deduct, and the dialog says so before you save.
-* The order number defaults to `MANUAL-<manifest id>` so hand corrections are
-  distinguishable from real orders in SortSwift.
+* **Nothing is written back to SortSwift.** Its numbers drift upward from
+  reality by design, because this catalogue is the authoritative one. There is
+  no deduction file to import and nothing to reconcile by hand.
 
 This adjusts the **catalog** quantity only. It does not revise the eBay
 listing — run Module A for that.

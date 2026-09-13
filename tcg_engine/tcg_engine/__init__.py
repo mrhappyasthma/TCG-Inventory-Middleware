@@ -1,17 +1,18 @@
 """
-TCG Engine: Lightweight middleware core for SortSwift <-> eBay CSV conversions.
+TCG Engine: the middleware core.
+
+Reads SortSwift's CSV exports and keeps the catalogue they describe. Writes
+no CSV of its own: eBay is reached through its APIs, and nothing is ever
+written back to SortSwift.
 """
 
 from .db import Database
-from .orders import process_orders_csv, process_orders_file
 from .batches import process_batch_csv, process_batch_file
 from .sync import sync_active_listings_csv, sync_active_listings_file
 from .plans import PlanError, approve_plan, build_plan, plan_blockers
 
 __all__ = [
     "Database",
-    "process_orders_csv",
-    "process_orders_file",
     "process_batch_csv",
     "process_batch_file",
     "sync_active_listings_csv",

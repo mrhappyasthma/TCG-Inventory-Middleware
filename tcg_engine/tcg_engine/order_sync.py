@@ -35,10 +35,32 @@ not persist them if it wanted to: the only fields it receives are the six in
 ``REQUIRED_LINE_FIELDS``.
 """
 
+import re
+
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .db import Database
-from .orders import base_manifest_id
+def base_manifest_id(label: str) -> str:
+    """
+    The card a SKU refers to, with any bin suffix stripped.
+
+    eBay knows a variation by a label like ``ID1001-Bin_A-12``: the manifest
+    id plus the physical bin it was in when the listing was created. The bin
+    is not part of a card's identity -- the same card can sit in two bins, and
+    a variation's SKU cannot be renamed once eBay has it -- so the id is what
+    identifies the card and the rest is a note to whoever picks it.
+
+    Falls back to the label itself when no id can be found, so the caller
+    reports "no card called X" against what eBay actually said rather than
+    against something this guessed at.
+
+    Lives here because this is its only caller. It used to sit in an
+    `orders` module beside the SortSwift deduction writer, which has been
+    deleted: nothing is written back to SortSwift any more.
+    """
+    text = str(label or "").strip()
+    match = re.search(r"(ID\d+)", text, re.IGNORECASE)
+    return match.group(1).upper() if match else text
 
 # Exactly what a projected line may carry. Asserted rather than assumed,
 # because the projection is a compliance boundary and an extra key here would

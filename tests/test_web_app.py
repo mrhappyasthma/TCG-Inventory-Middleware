@@ -282,20 +282,6 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["synced_count"], 1)
 
-        order_csv = (
-            "Sales Record Number,Order Number,Item Title,Custom Label,Quantity\n"
-            "901,ORD-901,Pokemon Deerling,ID1001-Bin_A-12,2\n"
-        )
-        order_res = self.client.post(
-            "/api/process/orders",
-            files={"file": ("ebay_orders.csv", order_csv, "text/csv")},
-        )
-        self.assertEqual(order_res.status_code, 200)
-        data = order_res.json()
-        self.assertEqual(data["converted_count"], 2)
-        self.assertIn("7805758", data["csv_content"])
-        self.assertIn("ORD-901", data["csv_content"])
-
     # -- configuration ----------------------------------------------------
 
     def test_13_pricing_rules_api(self):
@@ -685,8 +671,7 @@ class TestWebApp(unittest.TestCase):
         from app.main import MAX_UPLOAD_BYTES
 
         oversized = b"a,b,c" + b"x" * (MAX_UPLOAD_BYTES + 1024)
-        for path in ("/api/process/batch", "/api/process/sync",
-                     "/api/process/orders"):
+        for path in ("/api/process/batch", "/api/process/sync"):
             res = self.client.post(
                 path, files={"file": ("big.csv", oversized, "text/csv")}
             )

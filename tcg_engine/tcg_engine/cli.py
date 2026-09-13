@@ -2,7 +2,6 @@ import argparse
 import csv
 import os
 from .db import Database
-from .orders import process_orders_file
 from .batches import process_batch_file
 from .sync import sync_active_listings_file
 from .relink import relink_from_file
@@ -15,16 +14,6 @@ def _get_db(db_path: str) -> Database:
 def handle_init_db(args):
     db = _get_db(args.db)
     print(f"Database initialized successfully at: {os.path.abspath(db.db_path)}")
-
-
-def handle_orders(args):
-    db = _get_db(args.db)
-    output_path = args.output or "sortswift_orders.csv"
-    print(f"Processing eBay Orders from: {args.input_file}")
-    result = process_orders_file(args.input_file, db, output_path)
-    for log in result["logs"]:
-        print(f"[{log['level']}] {log['message']}")
-    print(f"\nGenerated SortSwift Orders file: {output_path} ({result['converted_count']} items converted)")
 
 
 def handle_batch(args):
@@ -177,15 +166,6 @@ def main():
         "status",
         parents=[db_parent], help="Show inventory statistics")
     p_status.set_defaults(func=handle_status)
-
-    # orders (Module C)
-    p_orders = subparsers.add_parser(
-        "orders",
-        parents=[db_parent], help="Module C: Convert eBay Orders CSV to SortSwift Orders Import CSV"
-    )
-    p_orders.add_argument("input_file", help="Path to raw eBay orders CSV")
-    p_orders.add_argument("-o", "--output", help="Output path for SortSwift import CSV")
-    p_orders.set_defaults(func=handle_orders)
 
     # batch (Module A)
     p_batch = subparsers.add_parser(

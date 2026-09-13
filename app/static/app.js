@@ -16,12 +16,10 @@ let currentSortBy = "manifest_id";
 let currentSortDir = "ASC";
 // Held so the "Force process anyway" button can resubmit the same upload.
 let pendingBatchFile = null;
-// Module C still produces a file: the SortSwift deduction import is read by
-// SortSwift, not by eBay. The eBay-bound Add and Revise files are gone --
-// every listing is managed through the eBay API now.
-let storedGeneratedCSVs = {
-    orders: null
-};
+// No module generates a file. The eBay-bound Add and Revise files went with
+// the File Exchange path, and the SortSwift deduction import went with Module
+// C: eBay's orders API is the only thing that deducts stock now, and nothing
+// is written back to SortSwift.
 
 // Initialize Application
 document.addEventListener("DOMContentLoaded", () => {
@@ -1303,19 +1301,10 @@ async function deleteUserAccount(userId) {
 // -------------------------------------------------------------------
 
 function setupDropzones() {
-    // 1. Orders
-    bindDropzone("dropzoneOrders", "fileInputOrders", "labelOrders", handleOrdersUpload);
-    // 2. Batch
+    // Module A ingests a SortSwift export; Module B reconciles against eBay's
+    // Active Listings report. Neither produces a file to download.
     bindDropzone("dropzoneBatch", "fileInputBatch", "labelBatch", handleBatchUpload);
-    // 3. Sync
     bindDropzone("dropzoneSync", "fileInputSync", "labelSync", handleSyncUpload);
-
-    // Download button event listeners
-    document.getElementById("btnDownloadOrders").addEventListener("click", () => {
-        if (storedGeneratedCSVs.orders) {
-            triggerBrowserDownload(storedGeneratedCSVs.orders, "sortswift_orders_import.csv");
-        }
-    });
 
     document.getElementById("btnDownloadOnlyBatch").addEventListener("click", () => {
         if (!pendingBatchFile) return;
@@ -1365,43 +1354,6 @@ function bindDropzone(zoneId, inputId, labelId, uploadHandler) {
             uploadHandler(file);
         }
     });
-}
-
-async function handleOrdersUpload(file) {
-    const formData = new FormData();
-    formData.append("file", file);
-
-    logToTerminal("INFO", `[MODULE C] Uploading ${file.name} for eBay Orders processing...`);
-    const orderRows = await countCsvRows(file);
-    setModuleBusy("Orders", "Processing orders\u2026",
-                  orderRows === null ? file.name : `${orderRows.toLocaleString()} rows`);
-
-    try {
-        const res = await fetch("/api/process/orders", {
-            method: "POST",
-            body: formData
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to process orders");
-
-        // Display logs
-        if (data.logs) {
-            data.logs.forEach(l => logToTerminal(l.level, l.message));
-        }
-
-        storedGeneratedCSVs.orders = data.csv_content;
-        document.getElementById("resultBoxOrders").classList.remove("hidden");
-        document.getElementById("ordersReadyText").innerText =
-            `sortswift_orders_import.csv ready (${data.converted_count} items)`;
-
-        // The file is built and held in memory; downloading is an explicit
-        // click so an unwanted file is never dropped into Downloads.
-        logToTerminal("SUCCESS", `[MODULE C] sortswift_orders_import.csv is ready (${data.converted_count} items). Click to download.`);
-    } catch (err) {
-        logToTerminal("ERROR", `[MODULE C] ${err.message}`);
-    } finally {
-        clearModuleBusy("Orders");
-    }
 }
 
 // -------------------------------------------------------------------
@@ -2159,8 +2111,6 @@ function openQuantityModal(manifestId) {
         : `[${manifestId}]`;
     document.getElementById("quantityPrevious").innerText = quantityEditPrevious;
     document.getElementById("quantityInput").value = quantityEditPrevious;
-    document.getElementById("quantityGenerateDeduction").checked = false;
-    document.getElementById("quantityDeductionNote").classList.add("hidden");
 
     // Blank when the card follows the account default, so saving without
     // touching it cannot silently pin the current default onto the card --
@@ -2184,24 +2134,6 @@ function closeQuantityModal() {
     document.getElementById("quantityModal").classList.add("hidden");
     syncModalScrollLock();
     quantityEditManifestId = null;
-}
-
-// Show what a deduction would cover before the change is committed.
-function updateQuantityDeductionNote() {
-    const note = document.getElementById("quantityDeductionNote");
-    const wanted = parseInt(document.getElementById("quantityInput").value || "0", 10);
-    const checked = document.getElementById("quantityGenerateDeduction").checked;
-    const delta = quantityEditPrevious - (isNaN(wanted) ? quantityEditPrevious : wanted);
-
-    if (checked && delta > 0) {
-        note.innerText = `A deduction CSV for ${delta} unit(s) will be produced.`;
-        note.classList.remove("hidden");
-    } else if (checked && delta <= 0) {
-        note.innerText = "No deduction: the quantity is not decreasing.";
-        note.classList.remove("hidden");
-    } else {
-        note.classList.add("hidden");
-    }
 }
 
 // What the field means right now: following the account default, or this
@@ -2228,21 +2160,18 @@ function updateQuantityTargetNote() {
 
 document.getElementById("quantityTarget")?.addEventListener("input", updateQuantityTargetNote);
 document.getElementById("quantityInput")?.addEventListener("input", updateQuantityTargetNote);
-document.getElementById("quantityInput")?.addEventListener("input", updateQuantityDeductionNote);
-document.getElementById("quantityGenerateDeduction")?.addEventListener("change", updateQuantityDeductionNote);
 
 async function saveQuantity(e) {
     if (e && e.preventDefault) e.preventDefault();
     if (!quantityEditManifestId) return;
 
     const quantity = parseInt(document.getElementById("quantityInput").value || "0", 10);
-    const generate = document.getElementById("quantityGenerateDeduction").checked;
 
     try {
         const res = await fetch(`/api/inventory/${encodeURIComponent(quantityEditManifestId)}/quantity`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ quantity, generate_deduction: generate })
+            body: JSON.stringify({ quantity })
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Failed to update quantity");
@@ -2274,15 +2203,6 @@ async function saveQuantity(e) {
         closeQuantityModal();
         logToTerminal("SUCCESS",
             `Quantity for [${id}] changed from ${data.previous} to ${data.current}.`);
-
-        if (data.csv_content) {
-            triggerBrowserDownload(data.csv_content, `sortswift_deduction_${id}.csv`);
-            logToTerminal("INFO",
-                `Deduction CSV for ${data.deducted} unit(s) downloaded for [${id}].`);
-        } else if (generate) {
-            logToTerminal("INFO",
-                "No deduction file: the quantity did not decrease.");
-        }
 
         fetchStats();
         fetchInventory();

@@ -70,11 +70,6 @@ from tcg_engine.db import (
     apply_pricing_rules,
     apply_condition_multiplier,
 )
-from tcg_engine.orders import (
-    process_orders_csv,
-    build_deduction_csv,
-    deduction_row,
-)
 from tcg_engine.batches import (
     process_batch_csv,
 )
@@ -487,10 +482,6 @@ REMARK_MAX_LENGTH = 60
 
 class QuantityUpdateRequest(BaseModel):
     quantity: int
-    # When the quantity drops, optionally emit a SortSwift deduction file for
-    # the difference so the correction can be pushed back to SortSwift.
-    generate_deduction: bool = False
-    order_number: Optional[str] = None
 
 
 class PickRequest(BaseModel):
@@ -701,25 +692,6 @@ def delete_user(
 # ---------------------------------------------------------
 # CORE BUSINESS LOGIC / PROCESSING ENDPOINTS
 # ---------------------------------------------------------
-
-@app.post("/api/process/orders")
-async def process_orders_endpoint(
-    file: UploadFile = File(...),
-    user: Dict[str, Any] = Depends(require_active_user),
-):
-    """
-    Module C: Process raw eBay orders CSV & convert to SortSwift Orders Import CSV.
-    """
-    inv = inventory_for(user)
-    content_bytes = await read_upload_limited(file)
-    csv_text = decode_csv_bytes(content_bytes)
-
-    def run():
-        with inv.session():
-            return process_orders_csv(csv_text, inv)
-
-    return await run_in_threadpool(run)
-
 
 @app.post("/api/process/batch")
 async def process_batch_endpoint(
@@ -2018,37 +1990,28 @@ def set_card_quantity(
     Set a card's catalogued quantity to an absolute value.
 
     This is the manual correction path, so the figure supplied is the figure
-    stored -- unlike batch intake, which accumulates. When the quantity drops
-    and generate_deduction is set, a SortSwift deduction CSV for the difference
-    is returned so the same correction can be applied there.
+    stored -- unlike batch intake, which accumulates.
+
+    Nothing is written back to SortSwift. Its numbers drift upward from
+    reality by design; this catalogue is the authoritative one, and eBay's
+    orders API is the only other thing that moves a quantity.
     """
     inv = inventory_for(user)
     if req.quantity < 0:
         raise HTTPException(status_code=400, detail="Quantity cannot be negative.")
 
-    card = inv.get_manifest_by_id(manifest_id)
-    if not card:
-        raise HTTPException(status_code=404, detail="Card not found.")
-
+    # One existence check, not two: set_manifest_quantity already reports
+    # a missing card. The card itself was only read to build the
+    # deduction row that no longer exists.
     result = inv.set_manifest_quantity(manifest_id, req.quantity)
     if not result:
         raise HTTPException(status_code=404, detail="Card not found.")
-
-    delta = result["previous"] - result["current"]
-    csv_content = None
-    if req.generate_deduction and delta > 0:
-        order_number = (req.order_number or "").strip() or f"MANUAL-{manifest_id}"
-        csv_content = build_deduction_csv(
-            [deduction_row(card, delta, order_number)]
-        )
 
     return {
         "success": True,
         "manifest_id": manifest_id,
         "previous": result["previous"],
         "current": result["current"],
-        "deducted": delta if delta > 0 else 0,
-        "csv_content": csv_content,
     }
 
 
