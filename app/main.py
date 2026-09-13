@@ -397,6 +397,13 @@ class PickRequest(BaseModel):
     line_item_id: Optional[str] = None
 
 
+class TargetQuantityRequest(BaseModel):
+    # How many copies of this card to aim to hold. None clears the override
+    # so the card follows the account default again -- which is not the same
+    # as zero, a deliberate "never restock this one".
+    target_quantity: Optional[int] = Field(default=None, ge=0, le=999)
+
+
 class RemarkUpdateRequest(BaseModel):
     # The bin or note a card is stored under. Capped because it is a shelf
     # label, not a field for prose, and an unbounded string here would end up
@@ -1650,9 +1657,19 @@ def get_inventory_endpoint(
     limit: int = 50,
     offset: int = 0,
     set_name: Optional[str] = None,
+    below_target: bool = False,
     user: Dict[str, Any] = Depends(require_active_user),
 ):
-    """Fetch paginated, filtered, and sorted inventory list."""
+    """
+    Fetch paginated, filtered, and sorted inventory list.
+
+    ``below_target`` narrows it to cards held below the depth they aim for,
+    which is the restock list: combined with the set filter it answers "which
+    cards in this set do I still need".
+    """
+    # Read once and passed to both calls, so the rows and the total cannot
+    # be computed against different targets.
+    target_default = db.get_target_quantity_default(user_id=user["id"])
     items = db.get_inventory(
         search=search,
         sort_by=sort_by,
@@ -1660,13 +1677,59 @@ def get_inventory_endpoint(
         limit=limit,
         offset=offset,
         set_name=set_name,
+        below_target=below_target,
+        target_default=target_default,
     )
-    total = db.get_inventory_count(search=search, set_name=set_name)
+    total = db.get_inventory_count(
+        search=search, set_name=set_name,
+        below_target=below_target, target_default=target_default,
+    )
     return {
         "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
+        "target_default": target_default,
+        # Always the full shortfall under the current search and set, not
+        # just this page's. The question is how much there is left to buy,
+        # which a page cannot answer.
+        "restock": db.get_restock_summary(
+            set_name=set_name, search=search, target_default=target_default
+        ),
+    }
+
+
+@app.post("/api/inventory/{manifest_id}/target-quantity")
+def set_card_target_quantity(
+    manifest_id: str,
+    req: TargetQuantityRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Set how many copies of one card to aim to hold.
+
+    A target, not a ceiling: nothing refuses stock above it and no listing is
+    delisted down to it. Holding more than the target simply means nothing is
+    needed. Its whole purpose is the restock question.
+
+    Sending no value clears the override, so the card follows the account
+    default again.
+    """
+    result = db.set_manifest_target_quantity(manifest_id, req.target_quantity)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Card not found.")
+    target_default = db.get_target_quantity_default(user_id=user["id"])
+    effective = (
+        result["current"] if result["current"] is not None else target_default
+    )
+    return {
+        "success": True,
+        "manifest_id": manifest_id,
+        "previous": result["previous"],
+        "target_quantity": result["current"],
+        "effective_target": effective,
+        "quantity": result["quantity"],
+        "needed": max(0, effective - result["quantity"]),
     }
 
 

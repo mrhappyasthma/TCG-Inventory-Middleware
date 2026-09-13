@@ -2066,6 +2066,172 @@ class TestWebApp(unittest.TestCase):
         finally:
             self.clear_pick_fixture()
 
+    # -- stock targets and the restock list --------------------------------
+
+    def target_fixture(self):
+        """Three cards in one set: short, at target, and over it."""
+        for manifest_id, name, held in (
+            ("ID9400", "Charizard", 1),
+            ("ID9401", "Pikachu", 4),
+            ("ID9402", "Blastoise", 9),
+        ):
+            db.insert_manifest(manifest_id, name, "Target Test Set",
+                               "Near Mint", "Normal", card_number="001/102")
+            db.set_manifest_quantity(manifest_id, held)
+
+    def clear_target_fixture(self):
+        for manifest_id in ("ID9400", "ID9401", "ID9402"):
+            db.delete_manifest(manifest_id)
+
+    def test_57a_inventory_rows_carry_the_target_and_the_shortfall(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.target_fixture()
+        try:
+            body = self.client.get(
+                "/api/inventory?set_name=Target+Test+Set"
+            ).json()
+            self.assertEqual(body["target_default"], 4)
+            rows = {r["product_name"]: r for r in body["items"]}
+            self.assertEqual(rows["Charizard"]["effective_target"], 4)
+            self.assertEqual(rows["Charizard"]["needed"], 3)
+            self.assertEqual(rows["Pikachu"]["needed"], 0)
+            # A target, not a cap: nine held against a target of four needs
+            # nothing, rather than reporting a negative.
+            self.assertEqual(rows["Blastoise"]["needed"], 0)
+            self.assertIsNone(rows["Charizard"]["target_quantity"])
+        finally:
+            self.clear_target_fixture()
+
+    def test_57b_the_restock_filter_narrows_to_what_is_short(self):
+        """
+        Set filter plus this one is the whole feature: "which cards in this
+        set do I still need".
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.target_fixture()
+        try:
+            body = self.client.get(
+                "/api/inventory?set_name=Target+Test+Set&below_target=true"
+            ).json()
+            self.assertEqual(
+                [r["product_name"] for r in body["items"]], ["Charizard"]
+            )
+            # The total has to agree with the rows, or the pager lies.
+            self.assertEqual(body["total"], 1)
+            self.assertEqual(body["restock"]["cards_short"], 1)
+            self.assertEqual(body["restock"]["copies_needed"], 3)
+        finally:
+            self.clear_target_fixture()
+
+    def test_57c_a_card_can_be_given_and_then_released_from_its_own_target(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.target_fixture()
+        try:
+            res = self.client.post(
+                "/api/inventory/ID9402/target-quantity",
+                json={"target_quantity": 12},
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertEqual(res.json()["target_quantity"], 12)
+            self.assertEqual(res.json()["needed"], 3, "holds 9, wants 12")
+
+            # Now short, so it joins the restock list.
+            listed = self.client.get(
+                "/api/inventory?set_name=Target+Test+Set&below_target=true"
+            ).json()
+            self.assertIn(
+                "Blastoise", [r["product_name"] for r in listed["items"]]
+            )
+
+            # Sending no value clears it, which is not the same as zero.
+            cleared = self.client.post(
+                "/api/inventory/ID9402/target-quantity", json={}
+            )
+            self.assertEqual(cleared.status_code, 200, cleared.text)
+            self.assertIsNone(cleared.json()["target_quantity"])
+            self.assertEqual(cleared.json()["effective_target"], 4)
+            self.assertEqual(cleared.json()["needed"], 0)
+        finally:
+            self.clear_target_fixture()
+
+    def test_57d_a_target_of_zero_is_kept_as_a_deliberate_choice(self):
+        """
+        "Never restock this bulk common" must survive a round trip, so zero
+        cannot be collapsed into "no override".
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.target_fixture()
+        try:
+            res = self.client.post(
+                "/api/inventory/ID9400/target-quantity",
+                json={"target_quantity": 0},
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertEqual(res.json()["target_quantity"], 0)
+            self.assertEqual(res.json()["needed"], 0)
+
+            short = self.client.get(
+                "/api/inventory?set_name=Target+Test+Set&below_target=true"
+            ).json()
+            self.assertEqual(short["items"], [], "nothing is short now")
+        finally:
+            self.clear_target_fixture()
+
+    def test_57e_an_unknown_card_or_an_absurd_target_is_refused(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.assertEqual(
+            self.client.post(
+                "/api/inventory/ID999999/target-quantity",
+                json={"target_quantity": 4},
+            ).status_code,
+            404,
+        )
+        self.target_fixture()
+        try:
+            for bad in (-1, 1000):
+                self.assertEqual(
+                    self.client.post(
+                        "/api/inventory/ID9400/target-quantity",
+                        json={"target_quantity": bad},
+                    ).status_code,
+                    422,
+                    f"target {bad} should be refused",
+                )
+        finally:
+            self.clear_target_fixture()
+
+    def test_57f_the_account_default_is_a_per_user_setting(self):
+        """
+        Saved like the other rules, and applied to every card that has no
+        target of its own -- resolved at query time, so raising it moves the
+        shortfall without touching a single card row.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        self.target_fixture()
+        try:
+            saved = self.client.post(
+                "/api/listing-settings",
+                json={"settings": {"target_quantity_default": "6"}},
+            )
+            self.assertEqual(saved.status_code, 200, saved.text)
+
+            body = self.client.get(
+                "/api/inventory?set_name=Target+Test+Set"
+            ).json()
+            self.assertEqual(body["target_default"], 6)
+            rows = {r["product_name"]: r for r in body["items"]}
+            self.assertEqual(rows["Pikachu"]["needed"], 2, "held 4, wants 6")
+            self.assertIsNone(
+                rows["Pikachu"]["target_quantity"],
+                "the card row is untouched; the default is resolved in the query",
+            )
+        finally:
+            self.client.post(
+                "/api/listing-settings",
+                json={"settings": {"target_quantity_default": "4"}},
+            )
+            self.clear_target_fixture()
+
     # -- automatic repricing ----------------------------------------------
 
     def test_48_the_repricer_preview_needs_no_ebay_connection(self):

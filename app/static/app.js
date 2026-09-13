@@ -831,6 +831,8 @@ async function loadAutoReprice() {
             s.price_boundary_margin_percent || "10";
         document.getElementById("repriceMaxChange").value =
             s.reprice_max_change_percent || "25";
+        const depth = document.getElementById("targetQuantityDefault");
+        if (depth) depth.value = s.target_quantity_default || "4";
 
         if (badge) {
             badge.innerText = preview.enabled ? "On" : "Off";
@@ -909,6 +911,29 @@ async function saveRepriceSettings() {
         await loadAutoReprice();
     } catch (err) {
         logToTerminal("ERROR", `[REPRICE] ${err.message}`);
+    }
+}
+
+async function saveStockDepth() {
+    const raw = String(document.getElementById("targetQuantityDefault").value).trim();
+    const value = raw === "" ? "4" : String(Math.max(0, Math.min(999, parseInt(raw, 10) || 0)));
+    try {
+        const res = await fetch("/api/listing-settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ settings: { target_quantity_default: value } }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Save failed");
+        accountTargetDefault = Number(value);
+        logToTerminal("SUCCESS",
+            `[STOCK] Default target set to ${value} cop${value === "1" ? "y" : "ies"}. `
+            + `Cards with their own target keep it.`);
+        // The Need column and the restock badge are computed against this,
+        // so they are stale the moment it changes.
+        fetchInventory();
+    } catch (err) {
+        logToTerminal("ERROR", `[STOCK] ${err.message}`);
     }
 }
 
@@ -1625,6 +1650,13 @@ function setupTableListeners() {
         });
     }
 
+    // Wired here rather than with an inline onchange, to match the two
+    // filters it sits beside.
+    const belowTarget = document.getElementById("inventoryBelowTarget");
+    if (belowTarget) {
+        belowTarget.addEventListener("change", toggleBelowTarget);
+    }
+
     document.getElementById("btnOpenAddCardModal").addEventListener("click", () => {
         document.getElementById("addCardModal").classList.remove("hidden");
         syncModalScrollLock();
@@ -1722,6 +1754,7 @@ async function fetchInventory() {
         offset: String(offset),
     });
     if (currentSetFilter) params.set("set_name", currentSetFilter);
+    if (belowTargetOnly()) params.set("below_target", "true");
     const url = `/api/inventory?${params.toString()}`;
 
     try {
@@ -1729,11 +1762,22 @@ async function fetchInventory() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail);
 
+        // The account default, kept so the quantity dialog can show what an
+        // empty target field will fall back to rather than guessing 4.
+        if (data.target_default !== undefined) {
+            accountTargetDefault = Number(data.target_default);
+        }
         renderInventoryTable(data.items, data.total, offset);
+        renderRestockSummary(data);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="12" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="14" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
+
+// What a card with no target of its own aims for. Read from the inventory
+// response rather than hard-coded, so raising it in Listing Rules is
+// reflected everywhere without a second fetch.
+let accountTargetDefault = 4;
 
 // The quantity dialog needs the row it was opened from.
 let lastInventoryItems = [];
@@ -1997,6 +2041,16 @@ function renderInventoryTable(items, total, offset) {
                         ${qty}
                     </button>
                 </td>
+                <td class="py-3 px-4 text-center whitespace-nowrap">
+                    <button onclick="openQuantityModal('${item.manifest_id}')" title="${escapeHtml(item.target_quantity === null || item.target_quantity === undefined ? "Follows the account default. Click to give this card its own target." : "This card has its own target. Click to change it.")}" class="inline-block min-w-[28px] px-2 py-0.5 rounded text-[11px] font-mono ${item.target_quantity === null || item.target_quantity === undefined ? "text-slate-500 hover:text-slate-300" : "text-brand-300 font-bold"} hover:ring-1 hover:ring-brand-500 transition-all cursor-pointer">
+                        ${item.effective_target}
+                    </button>
+                </td>
+                <td class="py-3 px-4 text-center whitespace-nowrap">
+                    ${item.needed > 0
+                        ? `<span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono bg-emerald-950 text-emerald-300 border border-emerald-800/60" title="Buy ${item.needed} more to reach ${item.effective_target}.">+${item.needed}</span>`
+                        : `<span class="text-slate-700">&mdash;</span>`}
+                </td>
                 <td class="py-3 px-4 text-center whitespace-nowrap" title="${escapeHtml(driftTitle)}">
                     <span class="inline-block min-w-[28px] px-2 py-0.5 rounded-full text-[11px] font-bold font-mono ${stockBadge}">
                         ${item.last_known_qty}
@@ -2022,6 +2076,39 @@ function renderInventoryTable(items, total, offset) {
     document.getElementById("pageIndicator").innerText = `Page ${currentPage} of ${totalPages}`;
     document.getElementById("btnPrevPage").disabled = currentPage <= 1;
     document.getElementById("btnNextPage").disabled = currentPage >= totalPages;
+}
+
+// The restock question, as a filter rather than a report: pick a set, tick
+// the box, and what is left is the shopping list for that set.
+//
+// It belongs on the table rather than in a view of its own because the table
+// already has the search, the set filter, the sorting and the paging that a
+// list like this needs, and a separate report would have had to grow all
+// four again.
+function toggleBelowTarget() {
+    currentPage = 1;
+    fetchInventory();
+}
+
+function belowTargetOnly() {
+    const box = document.getElementById("inventoryBelowTarget");
+    return !!(box && box.checked);
+}
+
+// How far the catalogue is from its target, under whatever search and set
+// filter is in force. Deliberately the whole shortfall and not this page's:
+// "how much is left to buy" is not a question a page can answer.
+function renderRestockSummary(data) {
+    const badge = document.getElementById("inventoryRestockBadge");
+    if (!badge) return;
+    const restock = data.restock || {};
+    const cards = Number(restock.cards_short) || 0;
+    const copies = Number(restock.copies_needed) || 0;
+    badge.innerText = copies ? `${cards} / +${copies}` : "";
+    badge.title = copies
+        ? `${cards} card(s) below target, ${copies} cop${copies === 1 ? "y" : "ies"} to buy.`
+        : "";
+    badge.classList.toggle("hidden", copies === 0);
 }
 
 function handleSort(col) {
@@ -2075,6 +2162,18 @@ function openQuantityModal(manifestId) {
     document.getElementById("quantityGenerateDeduction").checked = false;
     document.getElementById("quantityDeductionNote").classList.add("hidden");
 
+    // Blank when the card follows the account default, so saving without
+    // touching it cannot silently pin the current default onto the card --
+    // which would then stop tracking it.
+    const targetInput = document.getElementById("quantityTarget");
+    if (targetInput) {
+        const own = row ? row.target_quantity : null;
+        targetInput.value = (own === null || own === undefined) ? "" : String(own);
+        targetInput.placeholder = String(accountTargetDefault);
+        quantityEditTargetWas = targetInput.value;
+        updateQuantityTargetNote();
+    }
+
     document.getElementById("quantityModal").classList.remove("hidden");
     syncModalScrollLock();
     document.getElementById("quantityInput").focus();
@@ -2105,6 +2204,30 @@ function updateQuantityDeductionNote() {
     }
 }
 
+// What the field means right now: following the account default, or this
+// card's own number, and what either leaves to buy.
+let quantityEditTargetWas = "";
+
+function updateQuantityTargetNote() {
+    const note = document.getElementById("quantityTargetNote");
+    const input = document.getElementById("quantityTarget");
+    if (!note || !input) return;
+    const raw = String(input.value).trim();
+    const target = raw === "" ? accountTargetDefault : parseInt(raw, 10);
+    if (isNaN(target) || target < 0) {
+        note.innerText = "";
+        return;
+    }
+    const held = parseInt(document.getElementById("quantityInput").value || "0", 10);
+    const need = Math.max(0, target - (isNaN(held) ? 0 : held));
+    note.innerText = (raw === ""
+        ? `following the account default of ${accountTargetDefault}`
+        : "this card's own target")
+        + (need ? `, ${need} to buy` : ", nothing needed");
+}
+
+document.getElementById("quantityTarget")?.addEventListener("input", updateQuantityTargetNote);
+document.getElementById("quantityInput")?.addEventListener("input", updateQuantityTargetNote);
 document.getElementById("quantityInput")?.addEventListener("input", updateQuantityDeductionNote);
 document.getElementById("quantityGenerateDeduction")?.addEventListener("change", updateQuantityDeductionNote);
 
@@ -2125,6 +2248,29 @@ async function saveQuantity(e) {
         if (!res.ok) throw new Error(data.detail || "Failed to update quantity");
 
         const id = quantityEditManifestId;
+
+        // Only when it actually moved. Sending it every time would write a
+        // target on every hand correction, pinning cards to whatever the
+        // default happened to be that day.
+        const targetInput = document.getElementById("quantityTarget");
+        const targetNow = targetInput ? String(targetInput.value).trim() : "";
+        if (targetInput && targetNow !== quantityEditTargetWas) {
+            const body = targetNow === ""
+                ? { target_quantity: null }
+                : { target_quantity: parseInt(targetNow, 10) };
+            const tRes = await fetch(`/api/inventory/${encodeURIComponent(id)}/target-quantity`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body)
+            });
+            const tData = await tRes.json();
+            if (!tRes.ok) throw new Error(tData.detail || "Failed to set the target");
+            logToTerminal("SUCCESS", tData.target_quantity === null
+                ? `Target for [${id}] cleared; it follows the account default of ${tData.effective_target} again.`
+                : `Target for [${id}] set to ${tData.target_quantity}`
+                  + (tData.needed ? `, ${tData.needed} to buy.` : ", nothing needed."));
+        }
+
         closeQuantityModal();
         logToTerminal("SUCCESS",
             `Quantity for [${id}] changed from ${data.previous} to ${data.current}.`);

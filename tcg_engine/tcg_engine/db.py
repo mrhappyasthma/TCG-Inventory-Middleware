@@ -42,6 +42,16 @@ DEFAULT_PRICE_BOUNDARY_MARGIN_PERCENT = "10"
 # away margin that only a sale at the higher price could have earned, so the
 # two directions are deliberately not symmetric.
 DEFAULT_PRICE_HOLD_DAYS = "14"
+# How many copies of a card to aim to hold. Four, because that is a playset:
+# the most a deck may run of one card, so it is the depth a singles seller
+# stocks to. A per-user setting rather than a constant, and overridable per
+# card, since a staple worth keeping eight of is not rare.
+#
+# A target, not a ceiling. Nothing refuses stock above it and nothing delists
+# down to it -- holding more than the target simply means nothing is needed.
+# The question it exists to answer is "what do I still have to buy".
+DEFAULT_TARGET_QUANTITY = "4"
+
 # The share of live cards that may change price in one run before the run is
 # refused outright. A repricer is downstream of a third-party price feed, and
 # the signature of bad feed data is that it moves everything at once. Same
@@ -291,6 +301,7 @@ class Database:
                     stock_image TEXT,
                     remarks TEXT,
                     remarks_edited_at TIMESTAMP,
+                    target_quantity INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """
@@ -779,6 +790,25 @@ class Database:
                     "ALTER TABLE manifest ADD COLUMN remarks_edited_at TIMESTAMP"
                 )
 
+            # How many copies of this card to aim to hold, when it differs
+            # from the account's default.
+            #
+            # NULL means "use the default", which is not the same as zero: a
+            # card deliberately targeted at nothing is a real choice -- a
+            # bulk common not worth restocking -- and has to be expressible.
+            # Storing the default here instead would freeze it, so raising
+            # the account default from four to six would move nothing.
+            #
+            # Deliberately on the card rather than per user. There is one
+            # physical stack per card, so how deep to keep it is a fact about
+            # the collection, not about whoever is looking at it. Two users
+            # disagreeing about the target for the same shelf would make the
+            # restock report depend on who asked, which is a bug.
+            if "target_quantity" not in manifest_columns:
+                cursor.execute(
+                    "ALTER TABLE manifest ADD COLUMN target_quantity INTEGER"
+                )
+
             # When the automatic repricer first computed a price *below* what
             # this variation is listed at. It is the start of a hold: a rise
             # applies at once, a fall has to keep being true for the whole
@@ -973,6 +1003,7 @@ class Database:
                     ("price_hold_days", DEFAULT_PRICE_HOLD_DAYS),
                     ("reprice_max_change_percent",
                      DEFAULT_REPRICE_MAX_CHANGE_PERCENT),
+                    ("target_quantity_default", DEFAULT_TARGET_QUANTITY),
                 ]
                 cursor.executemany(
                     """
@@ -1000,6 +1031,7 @@ class Database:
                 ("price_hold_days", DEFAULT_PRICE_HOLD_DAYS),
                 ("reprice_max_change_percent",
                  DEFAULT_REPRICE_MAX_CHANGE_PERCENT),
+                ("target_quantity_default", DEFAULT_TARGET_QUANTITY),
             ):
                 cursor.execute(
                     """
@@ -1524,6 +1556,11 @@ class Database:
         "sku_id": "m.sku_id",
         "ebay_parent_id": "v.ebay_parent_id",
         "last_known_qty": "v.last_known_qty",
+        # Sorting by shortfall needs the resolved target, so the default is
+        # interpolated into the expression at query time. It arrives as an
+        # int from the settings reader, never from a request.
+        "needed": "needed",
+        "target_quantity": "effective_target",
     }
 
     # Columns a free-text inventory search matches against.
@@ -1551,13 +1588,35 @@ class Database:
             return "", []
         return " LOWER(m.set_name) = LOWER(?) ", [str(set_name).strip()]
 
+    @staticmethod
+    def _target_sql(target_default: int) -> str:
+        """
+        The number of copies of a card we are aiming to hold.
+
+        The card's own target when it has one, the account default when it
+        does not. NULL on the card means "use the default"; zero means
+        "deliberately none", which is why COALESCE and not NULLIF.
+
+        Interpolated rather than bound because it also appears in ORDER BY,
+        where a placeholder cannot go. Cast to int by the caller for that
+        reason -- it comes from settings, never from a request.
+        """
+        return f"COALESCE(m.target_quantity, {int(target_default)})"
+
     @classmethod
     def _build_where(
-        cls, search: Optional[str], set_name: Optional[str] = None
+        cls, search: Optional[str], set_name: Optional[str] = None,
+        below_target: bool = False, target_default: int = 4,
     ) -> Tuple[str, List[Any]]:
         """Combine the search and set filters into a single WHERE clause."""
         clauses: List[str] = []
         params: List[Any] = []
+
+        if below_target:
+            # The restock question: cards held below what we aim to hold.
+            clauses.append(
+                f"(COALESCE(m.quantity, 0) < {cls._target_sql(target_default)})"
+            )
 
         search_sql, search_params = cls._build_search_clause(search)
         if search_sql:
@@ -1862,15 +1921,22 @@ class Database:
         limit: int = 50,
         offset: int = 0,
         set_name: Optional[str] = None,
+        below_target: bool = False,
+        target_default: int = 4,
     ) -> List[Dict[str, Any]]:
         """
         Combined live inventory query (manifest LEFT JOIN ebay_variations).
+
+        ``target_default`` is the account's aimed-for depth, applied to any
+        card without its own target. ``below_target`` narrows the result to
+        cards held below it -- the restock list.
         """
         order_spec = self._SORTABLE_COLUMNS.get(sort_by, "m.manifest_id")
         if isinstance(order_spec, str):
             order_spec = (order_spec,)
         direction = "DESC" if str(sort_dir).upper() == "DESC" else "ASC"
         order_by = ", ".join(f"{expr} {direction}" for expr in order_spec)
+        target_sql = self._target_sql(target_default)
 
         query = f"""
             SELECT
@@ -1884,6 +1950,15 @@ class Database:
                 COALESCE(m.quantity, 0) AS quantity,
                 COALESCE(m.remarks, '') AS remarks,
                 m.remarks_edited_at,
+                -- The card's own target, or NULL when it follows the
+                -- account default. Sent as-is so the dashboard can tell an
+                -- override from an inherited value and mark it.
+                m.target_quantity,
+                {target_sql} AS effective_target,
+                -- How many more to buy. Clamped at zero: holding more than
+                -- the target is not a negative requirement, it is simply
+                -- nothing needed.
+                MAX(0, {target_sql} - COALESCE(m.quantity, 0)) AS needed,
                 COALESCE(m.sku_id, '') AS sku_id,
                 -- The card face, for the dashboard's hover preview. Comes
                 -- from the SortSwift export and is often the only picture of
@@ -1897,7 +1972,9 @@ class Database:
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
-        where_clause, params = self._build_where(search, set_name)
+        where_clause, params = self._build_where(
+            search, set_name, below_target, target_default
+        )
         query += where_clause
         query += f" ORDER BY {order_by} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
@@ -1908,15 +1985,24 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_inventory_count(
-        self, search: Optional[str] = None, set_name: Optional[str] = None
+        self, search: Optional[str] = None, set_name: Optional[str] = None,
+        below_target: bool = False, target_default: int = 4,
     ) -> int:
-        """Count total matching rows in inventory."""
+        """
+        Count total matching rows in inventory.
+
+        Takes the same filters as ``get_inventory`` and must keep taking
+        them: a count computed without the below-target filter would page a
+        thirty-row restock list as though it had eight hundred rows.
+        """
         query = """
             SELECT COUNT(*) AS total
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
-        where_clause, params = self._build_where(search, set_name)
+        where_clause, params = self._build_where(
+            search, set_name, below_target, target_default
+        )
         query += where_clause
 
         with self.get_connection() as conn:
@@ -3484,6 +3570,104 @@ class Database:
                 (int(plan_id),),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def set_manifest_target_quantity(
+        self, manifest_id: str, target: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Set how many copies of one card to aim to hold, or clear the override.
+
+        ``None`` clears it, so the card follows the account default again --
+        which is not the same as setting it to zero. Zero is a real choice
+        ("never restock this bulk common") and has to stay expressible, so
+        the two cannot be collapsed.
+
+        Returns the previous and current override plus the shortfall the
+        change produces, or None when there is no such card.
+        """
+        cleaned = None if target is None else max(0, int(target))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT target_quantity, COALESCE(quantity, 0) AS quantity "
+                "FROM manifest WHERE manifest_id = ?",
+                (str(manifest_id).strip(),),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            previous = row["target_quantity"]
+            held = int(row["quantity"] or 0)
+            cursor.execute(
+                "UPDATE manifest SET target_quantity = ? WHERE manifest_id = ?",
+                (cleaned, str(manifest_id).strip()),
+            )
+            conn.commit()
+        return {
+            "previous": previous,
+            "current": cleaned,
+            "quantity": held,
+        }
+
+    def get_restock_summary(
+        self,
+        set_name: Optional[str] = None,
+        search: Optional[str] = None,
+        target_default: int = 4,
+    ) -> Dict[str, Any]:
+        """
+        How far the catalogue is from the depth it aims to hold.
+
+        Answers "what do I still need to buy" in two numbers: how many
+        distinct cards are short, and how many copies that adds up to. Under
+        the same search and set filters as the table, so the figures always
+        describe what is on screen.
+
+        **Only cards already catalogued are counted.** A card from the set
+        that has never been owned is not in the manifest at all, so nothing
+        here knows it exists -- this reports the depth of what is stocked,
+        not the completeness of a set against its checklist.
+        """
+        target_sql = self._target_sql(target_default)
+        where_clause, params = self._build_where(
+            search, set_name, True, target_default
+        )
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT COUNT(*) AS cards,
+                       COALESCE(SUM({target_sql} - COALESCE(m.quantity, 0)), 0)
+                           AS copies
+                  FROM manifest m
+                  LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
+                {where_clause}
+                """,
+                params,
+            )
+            row = cursor.fetchone()
+            return {
+                "cards_short": int(row["cards"]),
+                "copies_needed": int(row["copies"]),
+                "target_default": int(target_default),
+            }
+
+    def get_target_quantity_default(self, user_id: int = 0) -> int:
+        """
+        The account's aimed-for depth, as an int the query can interpolate.
+
+        Read through the same per-user inheritance as the other rules, and
+        clamped: this value is spliced into SQL rather than bound, so it must
+        never be able to arrive as anything but a small non-negative integer.
+        """
+        raw = self.get_listing_setting(
+            "target_quantity_default", DEFAULT_TARGET_QUANTITY, user_id=user_id
+        )
+        try:
+            value = int(str(raw).strip() or DEFAULT_TARGET_QUANTITY)
+        except (TypeError, ValueError):
+            value = int(DEFAULT_TARGET_QUANTITY)
+        return max(0, min(999, value))
 
     def set_manifest_remarks(
         self, manifest_id: str, remarks: Optional[str]

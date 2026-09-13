@@ -1673,6 +1673,8 @@ recorded and the dialog says why, so nothing is silently lost.
 | **eBay Item #** | Links to the live listing. Only present once Module B has linked it. |
 | **Bin / Remark** | Click to edit it (see below). |
 | **Quantity** | Click to adjust it (see below). |
+| **Target** | Copies you aim to hold. Four unless the card has its own. Click to change it. |
+| **Need** | How many more to buy to reach the target. Blank when nothing is needed. |
 
 An **expansion set filter** sits beside the search box, populated from the sets
 actually present in the catalog — it can never offer a set with no cards behind
@@ -1686,6 +1688,51 @@ silently filtering to nothing.
 > could not be verified automatically. If the links do not resolve, the pattern
 > is a single constant (`TCGPLAYER_PRODUCT_URL`) at the top of
 > `app/static/app.js`.
+
+### Stock depth: what to restock
+
+Answers **"which cards in this set do I still need?"**
+
+Every card has a **target**: how many copies to aim to hold. The default is
+**4** — a playset, the most a deck may run of one card, so it is the depth a
+singles seller stocks to. Any card can be given its own.
+
+Pick a set in the **expansion set filter**, tick **Below target**, and what
+remains is the shopping list for that set. The **Need** column is how many to
+buy; sort by it to put the biggest gaps first. The badge on the filter shows
+the whole shortfall under the current search and set — `12 / +37` means twelve
+cards short, thirty-seven copies to buy — and it is deliberately the full
+figure rather than the current page's, because "how much is left to buy" is
+not a question a page can answer.
+
+* **A target, not a cap.** Nothing refuses stock above it, no listing is ever
+  cut down to it, and nothing about eBay changes. Holding nine of a card
+  targeted at four simply means nothing is needed. Its only job is the
+  restock question.
+* **The default is a per-user rule**, set under **Stock depth** in Listing
+  Rules alongside the repricing settings, and inherited the same way.
+* **A card's own target lives on the card**, not per user, and is set from the
+  **On Hand** dialog. There is one physical stack per card, so how deep to
+  keep it is a fact about the collection rather than about whoever is looking
+  — two users disagreeing about the target for the same shelf would make the
+  restock list depend on who asked.
+* **Empty is not zero.** Leaving the field empty means *follow the account
+  default*, so raising the default from 4 to 6 moves that card too. Setting
+  it to **0** is a deliberate "never restock this one" and is kept. The
+  default is resolved when the query runs rather than copied onto cards, which
+  is what makes raising it reach everything that never had its own.
+* **Saving a quantity does not write a target.** The dialog only sends one if
+  you changed it, so a hand correction cannot silently pin the card to
+  whatever the default happened to be that day.
+* **SortSwift never touches it.** The export has no such column, so a
+  re-upload leaves every target alone.
+
+> **It reports depth, not completeness.** Only cards **already in the
+> catalogue** are counted. A card from the set you have never owned a single
+> copy of is not in the manifest at all, so nothing here knows it exists —
+> this tells you to top up the cards you stock, not to complete a set against
+> its checklist. Doing the latter would mean importing each set's full product
+> list from TCGCSV, which the market-price refresh reaches but does not store.
 
 ### Editing a bin by hand
 
@@ -1833,14 +1880,24 @@ but **absent** from the report is no longer live on eBay, so its figure drops to
 
 **Pricing rules** and **listing settings** belong to the account that saved
 them. The catalog is shared — one manifest ID per card, for everyone — but no
-computed eBay price is ever stored in it. Prices exist only in the generated
-CSV, which is why per-user pricing cannot put two users in conflict: each gets
-their own file from the same shared inventory.
+computed eBay price is ever stored in it: a price is worked out when a draft
+plan is built and again when it is pushed, always from the rules of the account
+doing it. That is why per-user pricing cannot put two users in conflict.
 
 Listing settings are per-user for a plainer reason. The postal code, the
 shipping/return/payment profile names and the title template all describe *your*
 eBay seller account, and there is no sensible single value for them once more
-than one person is listing.
+than one person is listing. The
+[default stock depth](#stock-depth-what-to-restock) is per-user on the same
+basis — how deep *you* choose to stock is a policy, not a fact about a card.
+
+Two things are deliberately **not** per-user, because they describe the
+physical collection rather than the person looking at it: a card's
+[**bin**](#editing-a-bin-by-hand), and a card's own
+[**target**](#stock-depth-what-to-restock) where it overrides the default.
+There is one stack of each card on one shelf. Two users disagreeing about where
+it is, or how many of it to keep, would make the restock list and the pick
+sheet depend on who asked — which is a bug, not a preference.
 
 ### Inheritance and reset
 

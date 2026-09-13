@@ -4,7 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from tcg_engine.db import (Database, apply_pricing_rules,
+from tcg_engine.db import (SHARED_SCOPE, Database, apply_pricing_rules,
                           apply_condition_multiplier,
                           normalize_condition_key)
 from tcg_engine.orders import process_orders_csv
@@ -2627,6 +2627,204 @@ class HandEditedRemarkTests(unittest.TestCase):
 
     def test_an_unknown_card_is_reported_rather_than_created(self):
         self.assertIsNone(self.db.set_manifest_remarks("ID9999", "Bin A-12"))
+
+
+class StockTargetTests(unittest.TestCase):
+    """
+    How many copies of a card to aim to hold, and what is still missing.
+
+    A target, not a ceiling: nothing refuses stock above it and no listing is
+    cut down to it. Its entire purpose is answering "which cards in this set
+    do I still need".
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "target.db"))
+        for manifest_id, name, set_name, held in (
+            ("ID1001", "Charizard", "Base Set", 1),
+            ("ID1002", "Pikachu", "Base Set", 4),
+            ("ID1003", "Blastoise", "Base Set", 0),
+            ("ID1004", "Snorlax", "Base Set", 9),
+            ("ID2001", "Mewtwo", "Jungle", 2),
+        ):
+            self.db.insert_manifest(
+                manifest_id, name, set_name, "Near Mint", "Normal",
+                card_number="001/102",
+            )
+            self.db.set_manifest_quantity(manifest_id, held)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def rows(self, **kwargs):
+        kwargs.setdefault("limit", 50)
+        kwargs.setdefault(
+            "target_default", self.db.get_target_quantity_default()
+        )
+        return {
+            r["product_name"]: r
+            for r in self.db.get_inventory(**kwargs)
+        }
+
+    def test_the_default_is_a_playset(self):
+        """
+        Four: the most a deck may run of one card, so it is the depth a
+        singles seller stocks to.
+        """
+        self.assertEqual(self.db.get_target_quantity_default(), 4)
+        self.assertEqual(self.rows()["Charizard"]["effective_target"], 4)
+        self.assertEqual(self.rows()["Charizard"]["needed"], 3)
+
+    def test_holding_more_than_the_target_needs_nothing(self):
+        """
+        Not a negative requirement, and not a cap: nine of a card we aim to
+        hold four of is fine, and the answer to "how many to buy" is none.
+        """
+        row = self.rows()["Snorlax"]
+        self.assertEqual(row["quantity"], 9)
+        self.assertEqual(row["needed"], 0)
+
+    def test_a_card_can_be_given_its_own_target(self):
+        self.db.set_manifest_target_quantity("ID1004", 12)
+        row = self.rows()["Snorlax"]
+        self.assertEqual(row["target_quantity"], 12, "its own")
+        self.assertEqual(row["effective_target"], 12)
+        self.assertEqual(row["needed"], 3)
+
+    def test_raising_the_account_default_moves_only_inherited_cards(self):
+        """
+        The default is resolved at query time rather than copied onto cards,
+        so raising it reaches every card that never had its own -- and leaves
+        the ones that do alone.
+        """
+        self.db.set_manifest_target_quantity("ID1004", 12)
+        self.db.set_listing_settings(
+            {"target_quantity_default": "6"}, user_id=SHARED_SCOPE
+        )
+        rows = self.rows()
+        self.assertEqual(rows["Pikachu"]["effective_target"], 6)
+        self.assertEqual(rows["Pikachu"]["needed"], 2, "held 4, wants 6")
+        self.assertEqual(rows["Snorlax"]["effective_target"], 12, "kept")
+
+    def test_a_target_of_zero_is_a_real_choice_and_not_the_default(self):
+        """
+        "Never restock this bulk common" has to be expressible, so zero and
+        "no override" cannot be collapsed into one value.
+        """
+        self.db.set_manifest_target_quantity("ID1003", 0)
+        row = self.rows()["Blastoise"]
+        self.assertEqual(row["target_quantity"], 0)
+        self.assertEqual(row["effective_target"], 0)
+        self.assertEqual(row["needed"], 0)
+        self.assertNotIn(
+            "Blastoise",
+            self.rows(below_target=True),
+            "a card targeted at nothing is not short",
+        )
+
+    def test_clearing_an_override_returns_the_card_to_the_default(self):
+        self.db.set_manifest_target_quantity("ID1003", 0)
+        self.db.set_manifest_target_quantity("ID1003", None)
+        row = self.rows()["Blastoise"]
+        self.assertIsNone(row["target_quantity"])
+        self.assertEqual(row["effective_target"], 4)
+        self.assertEqual(row["needed"], 4)
+
+    def test_the_restock_filter_answers_the_question_per_set(self):
+        """
+        "Which cards in this set do I still need" is the set filter and this
+        one together.
+        """
+        short = self.rows(below_target=True, set_name="Base Set")
+        self.assertEqual(
+            sorted(short), ["Blastoise", "Charizard"],
+            "Pikachu is at target and Snorlax is over it",
+        )
+        self.assertNotIn("Mewtwo", short, "a different set")
+
+    def test_the_count_takes_the_same_filter_as_the_rows(self):
+        """
+        Otherwise a thirty-row restock list would page as though it had
+        eight hundred rows.
+        """
+        default = self.db.get_target_quantity_default()
+        self.assertEqual(
+            self.db.get_inventory_count(
+                below_target=True, target_default=default
+            ),
+            3,
+        )
+        self.assertEqual(
+            self.db.get_inventory_count(
+                below_target=True, set_name="Base Set",
+                target_default=default,
+            ),
+            2,
+        )
+
+    def test_the_summary_totals_cards_and_copies(self):
+        summary = self.db.get_restock_summary(
+            target_default=self.db.get_target_quantity_default()
+        )
+        # Charizard 3 + Blastoise 4 + Mewtwo 2.
+        self.assertEqual(summary["cards_short"], 3)
+        self.assertEqual(summary["copies_needed"], 9)
+
+        per_set = self.db.get_restock_summary(
+            set_name="Base Set",
+            target_default=self.db.get_target_quantity_default(),
+        )
+        self.assertEqual(per_set["cards_short"], 2)
+        self.assertEqual(per_set["copies_needed"], 7)
+
+    def test_the_shortfall_can_be_sorted_on(self):
+        """The biggest gap first is how a shopping list gets read."""
+        ordered = [
+            r["product_name"] for r in self.db.get_inventory(
+                limit=50, sort_by="needed", sort_dir="DESC",
+                target_default=self.db.get_target_quantity_default(),
+            )
+        ]
+        self.assertEqual(ordered[0], "Blastoise", "4 missing")
+        self.assertEqual(ordered[1], "Charizard", "3 missing")
+
+    def test_a_non_numeric_default_setting_falls_back_rather_than_breaking(self):
+        """
+        The default is spliced into SQL rather than bound, because it also
+        appears in ORDER BY. So it must never be able to arrive as anything
+        but a small non-negative integer.
+        """
+        self.db.set_listing_settings(
+            {"target_quantity_default": "not a number"}, user_id=SHARED_SCOPE
+        )
+        self.assertEqual(self.db.get_target_quantity_default(), 4)
+
+        self.db.set_listing_settings(
+            {"target_quantity_default": "-5"}, user_id=SHARED_SCOPE
+        )
+        self.assertEqual(self.db.get_target_quantity_default(), 0)
+
+        self.db.set_listing_settings(
+            {"target_quantity_default": "99999"}, user_id=SHARED_SCOPE
+        )
+        self.assertEqual(self.db.get_target_quantity_default(), 999)
+
+    def test_an_unknown_card_is_reported_rather_than_created(self):
+        self.assertIsNone(self.db.set_manifest_target_quantity("ID9999", 4))
+
+    def test_an_upload_does_not_disturb_a_target(self):
+        """
+        The target is ours, not the export's -- SortSwift has no column for
+        it, and a re-upload must not clear what was set by hand.
+        """
+        self.db.set_manifest_target_quantity("ID1001", 8)
+        self.db.get_or_create_manifest(
+            "Charizard", "Base Set", "Near Mint", "Normal", remarks="Bin A-1"
+        )
+        self.assertEqual(
+            self.db.get_manifest_by_id("ID1001")["target_quantity"], 8
+        )
 
 
 if __name__ == "__main__":
