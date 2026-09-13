@@ -3554,6 +3554,48 @@ class Database:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def set_manifest_price(
+        self, manifest_id: str, price: float
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Set the price we hold for a card, by hand.
+
+        The only other writer of this column is the backfill in
+        ``get_or_create_manifest``, which fires only when the stored price is
+        blank -- so a value set here is permanent. No upload recomputes it, no
+        market refresh touches it, and the repricer writes eBay's price to
+        ``ebay_variations.last_known_price`` rather than to this.
+
+        That last asymmetry is why this exists. A draft plan proposes a price
+        whenever this column disagrees with what eBay is known to hold, so
+        after the repricer moves a live price the catalogue still holds the
+        old number and every rebuild offers to undo the change. Pinning this
+        to eBay's figure settles it.
+
+        Returns the previous and current values, or None when there is no such
+        card, so a caller can print what it changed and what to pass to undo
+        it.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT price FROM manifest WHERE manifest_id = ?",
+                (str(manifest_id).strip(),),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            previous = row["price"]
+            cursor.execute(
+                "UPDATE manifest SET price = ? WHERE manifest_id = ?",
+                (round(float(price), 2), str(manifest_id).strip()),
+            )
+            conn.commit()
+        return {
+            "previous": None if previous is None else float(previous),
+            "current": round(float(price), 2),
+        }
+
     def set_manifest_target_quantity(
         self, manifest_id: str, target: Optional[int]
     ) -> Optional[Dict[str, Any]]:

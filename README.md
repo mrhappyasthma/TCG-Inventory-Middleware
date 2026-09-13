@@ -702,6 +702,29 @@ that happens:
 * **The two genuinely differ**, because the card was priced at a market level
   that has since moved, or its price was set before a rules change.
 
+There is a third cause, and it is a **defect rather than a design choice**:
+the repricer records the price it applied against the *variation*
+(`ebay_variations.last_known_price`) and never writes it back to the card
+(`manifest.price`). So after the repricer moves a live price, the catalogue
+still holds the pre-repricer number, the two disagree, and **every draft
+rebuild proposes putting the old price back** — for as long as the
+disagreement stands. That is the usual reason a card keeps reappearing with a
+price change nobody asked for.
+
+To settle it for a card, accepting eBay's figure as yours:
+
+```bash
+python scripts/accept_ebay_price.py "Risky Ruins" "Rare Candy"        # dry run
+python scripts/accept_ebay_price.py "Risky Ruins" "Rare Candy" --yes
+```
+
+It prints all three numbers, sets ours to eBay's, and prints the exact command
+that undoes it — the previous value is the only copy of itself. `--set PRICE`
+pins an explicit figure instead, which is also how you undo a run or handle a
+card whose eBay price is not yet known. Nothing recomputes the stored price
+afterwards, so the pin is permanent: the only other writer of that column
+fills a blank.
+
 To find out which, for any card:
 
 ```bash
