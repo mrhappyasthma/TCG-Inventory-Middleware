@@ -33,6 +33,8 @@ os.environ["EBAY_NOTIFICATION_ENDPOINT"] = "https://cards.example.com/api/ebay/n
 
 from app import main  # noqa: E402
 from app.main import app, db, user_db  # noqa: E402
+from app import deps  # noqa: E402
+from app.routes import ebay as ebay_routes  # noqa: E402
 
 # A SortSwift export row, reused so the duplicate-batch guard can be exercised.
 BATCH_CSV = """"Stock Item ID","Game","File Name","Set","Set Code","Card Number","Name","Rarity","Market Price","Low Price","Mid Price","High Price","EU Price","Condition","Language","Printing","Quantity","Comment","Remarks","TCGplayer Id","SKU Id","ID Product","UPC","CDN Image","Card Back CDN Image","Cost","Price","TCGPlayer Price","Shopify Price","Cardtrader Price","Manapool Price","Misprint Price","eBay Price","Square Price","*ConditionID"
@@ -1087,7 +1089,7 @@ class TestWebApp(unittest.TestCase):
             ).encode()
         ).decode()
 
-        client = main.get_ebay_client(main._owner_scope())
+        client = deps.get_ebay_client(main._owner_scope())
         self.assertIsNotNone(client, "eBay env vars should make a client available")
         original = client.public_keys
         client.public_keys = PublicKeyCache(lambda _kid: pem)
@@ -1139,11 +1141,11 @@ class TestWebApp(unittest.TestCase):
         this endpoint validates, and the RuName is registered later still. So
         the challenge must answer with only the token and the endpoint URL.
         """
-        saved = dict(main._ebay_clients)
-        main._ebay_clients.clear()
+        saved = dict(deps._ebay_clients)
+        deps._ebay_clients.clear()
         try:
             with mock.patch.object(
-                main.EbayConfig, "is_configured", return_value=False
+                deps.EbayConfig, "is_configured", return_value=False
             ):
                 res = TestClient(app).get(
                     "/api/ebay/notifications", params={"challenge_code": "BOOT"}
@@ -1158,21 +1160,21 @@ class TestWebApp(unittest.TestCase):
                 ).hexdigest(),
             )
         finally:
-            main._ebay_clients.clear()
-            main._ebay_clients.update(saved)
+            deps._ebay_clients.clear()
+            deps._ebay_clients.update(saved)
 
     def test_39_an_unconfigured_deployment_reports_503_not_a_crash(self):
         """
         The app must keep working as a CSV tool with no eBay credentials, and
         say so plainly rather than raising.
         """
-        saved_client = dict(main._ebay_clients)
-        saved_endpoint = main.EBAY_NOTIFICATION_ENDPOINT
-        main._ebay_clients.clear()
-        main.EBAY_NOTIFICATION_ENDPOINT = ""
+        saved_client = dict(deps._ebay_clients)
+        saved_endpoint = ebay_routes.EBAY_NOTIFICATION_ENDPOINT
+        deps._ebay_clients.clear()
+        ebay_routes.EBAY_NOTIFICATION_ENDPOINT = ""
         try:
             with mock.patch.object(
-                main.EbayConfig, "is_configured", return_value=False
+                deps.EbayConfig, "is_configured", return_value=False
             ):
                 anonymous = TestClient(app)
                 self.assertEqual(
@@ -1186,9 +1188,9 @@ class TestWebApp(unittest.TestCase):
                     503,
                 )
         finally:
-            main._ebay_clients.clear()
-            main._ebay_clients.update(saved_client)
-            main.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
+            deps._ebay_clients.clear()
+            deps._ebay_clients.update(saved_client)
+            ebay_routes.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
 
     def test_39a_a_draft_cover_photo_is_staged_not_applied(self):
         """
@@ -1501,7 +1503,7 @@ class TestWebApp(unittest.TestCase):
         url = self.client.post("/api/ebay/connect").json()["authorization_url"]
         state = url.split("state=")[1].split("&")[0]
 
-        client = main.get_ebay_client(main._owner_scope())
+        client = deps.get_ebay_client(main._owner_scope())
         original_opener = client.oauth._opener
 
         def fake_opener(method, target, headers, body, timeout):
@@ -1576,7 +1578,7 @@ class TestWebApp(unittest.TestCase):
         user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
         try:
             with mock.patch.object(
-                main,
+                deps,
                 "download_active_inventory_report",
                 return_value={
                     "task_id": "t-1",
@@ -1617,7 +1619,7 @@ class TestWebApp(unittest.TestCase):
         user_db.save_ebay_token(main._owner_scope(), {"refresh_token": "rt"}, connected_by=1)
         try:
             with mock.patch.object(
-                main,
+                deps,
                 "download_active_inventory_report",
                 return_value={
                     "task_id": "t-2",
@@ -1888,7 +1890,7 @@ class TestWebApp(unittest.TestCase):
             oauth = _Oauth()
             seller = object()
 
-        with mock.patch.object(main, "get_ebay_client", return_value=_Client()),              mock.patch.object(main, "get_orders",
+        with mock.patch.object(deps, "get_ebay_client", return_value=_Client()),              mock.patch.object(main, "get_orders",
                                side_effect=main.OrderPageError("truncated")):
             res = self.client.post("/api/orders/poll")
         self.assertEqual(res.status_code, 409)
@@ -1929,7 +1931,7 @@ class TestWebApp(unittest.TestCase):
             seller = object()
 
         try:
-            with mock.patch.object(main, "get_ebay_client",
+            with mock.patch.object(deps, "get_ebay_client",
                                    return_value=_Client()),                  mock.patch.object(main, "get_orders", return_value=[order]):
                 first = self.client.post("/api/orders/poll")
                 self.assertEqual(first.status_code, 200, first.text)

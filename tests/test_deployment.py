@@ -415,16 +415,46 @@ import json
 from fastapi.testclient import TestClient
 from app.main import app, EBAY_CLIENT_AVAILABLE
 
+
+def _walk_routes(routes):
+    # Every (path, method) pair, including those inside included routers.
+    #
+    # FastAPI 0.141 keeps an included router as a single _IncludedRouter
+    # entry that exposes the original object as `original_router` rather
+    # than flattening its children into app.routes. Walking only the top
+    # level therefore reports an endpoint as missing when it is served --
+    # which is the opposite of what this probe is for.
+    for route in routes:
+        for attr in ('original_router', 'router', 'app'):
+            inner = getattr(route, attr, None)
+            nested = getattr(inner, 'routes', None)
+            if nested:
+                yield from _walk_routes(nested)
+                break
+        else:
+            nested = getattr(route, 'routes', None)
+            if nested:
+                yield from _walk_routes(nested)
+        path = getattr(route, "path", None)
+        if not path:
+            continue
+        for method in getattr(route, "methods", set()) or ():
+            yield path, method
+
 client = TestClient(app)
 health = client.get("/api/health")
 print(json.dumps({
     "status_code": health.status_code,
     "body": health.json(),
     "ebay_client_available": EBAY_CLIENT_AVAILABLE,
+    # Descends into included routers. The endpoints live in
+    # app/routes/*.py now, and FastAPI keeps an included router as a
+    # single entry in app.routes rather than flattening its children --
+    # so a walk of the top level alone reports the notification endpoint
+    # as missing when it is in fact served.
     "routes": sorted(
-        [r.path, m]
-        for r in app.routes
-        for m in getattr(r, "methods", set())
+        [path, method]
+        for path, method in _walk_routes(app.routes)
     ),
 }))
 """
