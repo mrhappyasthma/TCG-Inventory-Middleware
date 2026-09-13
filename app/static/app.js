@@ -1742,6 +1742,40 @@ let lastInventoryItems = [];
 // pointer and starts flickering between enter and leave.
 const CARD_PREVIEW_OFFSET = 18;
 
+// An image the browser could not fetch, marked rather than hidden.
+//
+// These three thumbnails used to hide themselves on error, which made a
+// recorded-but-unloadable picture look exactly like no picture at all. That
+// is not a hypothetical confusion: eBay copies a cover photo to its own CDN
+// when you set it, so a listing keeps working while the original URL stops
+// serving browsers from other sites -- hotlink protection, an expired link,
+// a host that refuses a cross-site referrer. The listing is fine and the
+// dashboard looks broken, and a blank space cannot say so.
+//
+// scripts/check_images.py --listing <item id> fetches every image we hold
+// for a listing and is the way to confirm which URL is at fault.
+function markImageBroken(img, sizeClasses) {
+    if (!img || !img.parentNode || img.dataset.brokenHandled) return;
+    img.dataset.brokenHandled = "1";
+    const marker = document.createElement("span");
+    marker.className =
+        (sizeClasses || "w-8 h-8")
+        + " shrink-0 rounded border border-dashed border-rose-800/70 "
+        + "bg-rose-950/30 text-rose-400 text-[10px] flex items-center "
+        + "justify-center font-bold";
+    marker.innerText = "!";
+    marker.title =
+        "This image is recorded, but your browser could not load it:\n"
+        + String(img.getAttribute("src") || "")
+        + "\n\nThe live eBay listing is unaffected -- eBay keeps its own copy "
+        + "of a picture you set. This is the original URL refusing the "
+        + "request, usually hotlink protection or a dead link. Run "
+        + "scripts/check_images.py --listing <item id> to confirm, then set "
+        + "a URL that serves browsers.";
+    img.parentNode.insertBefore(marker, img);
+    img.remove();
+}
+
 // The picture for a card: its own scan, or failing that the generic
 // catalogue photo SortSwift carries for it.
 //
@@ -1795,7 +1829,7 @@ function cardThumbnailCell(item, cellClasses = "py-2 px-4") {
         <td class="${cellClasses}" ${cardPreviewAttrs(item)}>
             <img src="${escapeHtml(url)}" alt="" loading="lazy" title="${escapeHtml(hint)}"
                 class="block h-10 w-auto rounded border ${border} bg-dark-900"
-                onerror="this.style.visibility='hidden'">
+                onerror="markImageBroken(this, 'h-10 w-7')">
         </td>`;
 }
 
@@ -3115,7 +3149,7 @@ async function fetchEbayListings() {
                             ${l.cover_image_url ? `data-card-image="${escapeHtml(l.cover_image_url)}" data-preview-kind="cover"` : ""}
                             title="${l.cover_image_url ? escapeHtml(l.cover_image_url) : "No cover photo recorded. Click to set one."}">
                             ${l.cover_image_url
-                                ? `<img src="${escapeHtml(l.cover_image_url)}" alt="" class="w-8 h-8 rounded object-cover border border-slate-700 bg-dark-900" onerror="this.style.display='none'">`
+                                ? `<img src="${escapeHtml(l.cover_image_url)}" alt="" class="w-8 h-8 rounded object-cover border border-slate-700 bg-dark-900" onerror="markImageBroken(this, 'w-8 h-8')">`
                                 : `<span class="w-8 h-8 rounded border border-dashed border-slate-700 flex items-center justify-center text-slate-600 text-[10px]">?</span>`}
                             <span class="text-[11px] ${l.cover_image_url ? "text-slate-400" : "text-slate-600 italic"} group-hover/cover:text-accent-cyan underline decoration-dotted">
                                 ${l.cover_image_url ? "Change" : "Set cover"}
@@ -3412,7 +3446,7 @@ function draftCoverControl(group) {
             ${url ? `data-card-image="${escapeHtml(url)}" data-preview-kind="cover"` : ""}
             title="${escapeHtml(title)}">
             ${url
-                ? `<img src="${escapeHtml(url)}" alt="" class="block h-8 w-auto rounded border border-slate-700 bg-dark-900" onerror="this.style.visibility='hidden'">`
+                ? `<img src="${escapeHtml(url)}" alt="" class="block h-8 w-auto rounded border border-slate-700 bg-dark-900" onerror="markImageBroken(this, 'h-8 w-8')">`
                 : `<span class="block w-6 h-8 rounded border border-dashed border-slate-700"></span>`}
             <span class="text-[10px] font-semibold ${staged ? "text-brand-400" : "text-slate-400"}">
                 ${staged ? "Cover changed" : (url ? "Cover" : "Set cover")}
