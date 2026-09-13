@@ -10,39 +10,22 @@ import mimetypes
 # That text arrives in a query string, so it is attacker-controlled for anyone
 # who can get a person to click a link -- it must be escaped.
 from html import escape as escape_html
-import shutil
-import tempfile
 import threading
 import time
 import uuid
-import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Literal, Sequence
 
-# Ensure project root is in sys.path when running as direct script
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-# Load .env file into os.environ BEFORE any other imports that read env vars at import time
-# (auth.py reads GOOGLE_CLIENT_ID at module level and refuses to import without it,
-# so this must run first)
-_env_path = os.path.join(project_root, ".env")
-if os.path.isfile(_env_path):
-    with open(_env_path, encoding="utf-8") as _ef:
-        for _line in _ef:
-            _line = _line.strip()
-            if not _line or _line.startswith("#") or "=" not in _line:
-                continue
-            _key, _, _val = _line.partition("=")
-            _key = _key.strip()
-            _val = _val.strip().strip('"').strip("'")
-            if _key and _key not in os.environ:  # don't override real env vars (e.g. Docker)
-                os.environ[_key] = _val
+# Importing app.deps first is load-bearing, not stylistic: it puts the
+# project root on sys.path and loads .env, and `auth` reads GOOGLE_CLIENT_ID
+# at module level and refuses to import without it.
+try:
+    from app.deps import project_root  # noqa: F401
+except ImportError:
+    from .deps import project_root  # noqa: F401
 
 from fastapi import (
     FastAPI,
-    BackgroundTasks,
     UploadFile,
     File,
     Form,
@@ -56,14 +39,18 @@ from fastapi.responses import (
     HTMLResponse,
     StreamingResponse,
     JSONResponse,
-    
-    FileResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from tcg_engine.csvtools import decode_csv_bytes
+
+try:
+    from app.routes import database as database_routes
+except ImportError:
+    from .routes import database as database_routes
+
 from tcg_engine.db import (
     SHARED_SCOPE,
     Database,
@@ -171,29 +158,56 @@ except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
     report_outline = None
 
 try:
-    from app.user_db import UserDatabase
     from app.auth import (
-        AuthManager,
         create_jwt_token,
         decode_jwt_token,
         set_session_cookie,
         verify_google_id_token,
         GOOGLE_CLIENT_ID,
+    )
+    from app.deps import (
+        DATABASE_URL,
+        MAX_UPLOAD_BYTES,
+        USER_DATABASE_URL,
+        _inventories,
+        _owner_scope,
+        auth_manager,
+        db,
+        get_current_user,
+        inventory_for,
+        inventory_path_for,
+        owner_inventory,
+        read_upload_limited,
+        require_active_user,
+        require_admin_user,
+        user_db,
     )
 except ImportError:
-    from .user_db import UserDatabase
     from .auth import (
-        AuthManager,
         create_jwt_token,
         decode_jwt_token,
         set_session_cookie,
         verify_google_id_token,
         GOOGLE_CLIENT_ID,
     )
+    from .deps import (
+        DATABASE_URL,
+        MAX_UPLOAD_BYTES,
+        USER_DATABASE_URL,
+        _inventories,
+        _owner_scope,
+        auth_manager,
+        db,
+        get_current_user,
+        inventory_for,
+        inventory_path_for,
+        owner_inventory,
+        read_upload_limited,
+        require_active_user,
+        require_admin_user,
+        user_db,
+    )
 
-# App Configuration
-DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
-USER_DATABASE_URL = os.environ.get("USER_DATABASE_URL", "data/users.db")
 PORT = int(os.environ.get("PORT", 8080))
 
 # The eBay integration is optional: with these unset the app is exactly the
@@ -274,92 +288,6 @@ class _UserDbTokenStore(TokenStore):
             self.user_id, token, connected_by=self.actor
         )
 
-# Initialize databases & auth
-#
-# `db` is the **deployment owner's** inventory. It keeps the historic path,
-# because that file holds the live catalogue whose manifest ids are the SKUs
-# of live eBay listings -- and a variation's SKU cannot be renamed, so the
-# file can never be rebuilt or re-keyed. Every other account gets its own
-# file beside it. See `inventory_for`.
-db = Database(db_path=DATABASE_URL)
-user_db = UserDatabase(db_path=USER_DATABASE_URL)
-auth_manager = AuthManager(user_db=user_db)
-
-# One inventory database per account, opened on demand and kept.
-#
-# Isolation by file rather than by a `user_id` column on sixty-four query
-# methods. The two differ in the kind of mistake they permit: a forgotten
-# scope filter silently shows one account another's cards -- or pushes them
-# to the wrong eBay store -- while a mis-resolved database is loud and
-# harmless. There is no legitimate view that spans accounts, so nothing is
-# lost by making the join impossible to write.
-#
-# Keyed by user id. The owner maps to the original path so their catalogue is
-# untouched by this change; nobody else has one until they sign in and it is
-# created empty.
-_inventories: Dict[int, Database] = {}
-_inventory_lock = threading.Lock()
-
-
-def inventory_path_for(user_id: int) -> str:
-    """
-    Where one account's inventory lives.
-
-    The owner keeps `data/inventory.db`. Anyone else gets a sibling named
-    after their user id, in the same directory, so the existing data volume,
-    backup routine and NAS bind mount all keep working untouched.
-    """
-    if int(user_id) == _owner_scope():
-        return DATABASE_URL
-    root, ext = os.path.splitext(DATABASE_URL)
-    return f"{root}-user-{int(user_id)}{ext or '.db'}"
-
-
-def _owner_scope() -> int:
-    """
-    The account whose inventory is the original file.
-
-    The oldest active admin, which is the same account background jobs act
-    as. Before anyone has signed up there is none, and the owner path is
-    reserved rather than handed to whoever arrives first -- the first admin
-    to be created inherits it.
-    """
-    owner = user_db.get_owner_user_id()
-    return int(owner) if owner is not None else 0
-
-
-def inventory_for(user: Any) -> Database:
-    """
-    The inventory database belonging to one account.
-
-    Accepts a user dict (as the endpoints hold) or a bare id (as background
-    jobs resolve). Instances are cached because `Database.__init__` runs the
-    schema migration, which should happen once per file and not per request.
-    """
-    user_id = int(user["id"] if isinstance(user, dict) else user)
-    with _inventory_lock:
-        existing = _inventories.get(user_id)
-        if existing is not None:
-            return existing
-        path = inventory_path_for(user_id)
-        # The owner's database is already open as `db`; reuse that instance
-        # rather than opening a second connection pool onto the same file.
-        instance = db if path == DATABASE_URL else Database(db_path=path)
-        _inventories[user_id] = instance
-        return instance
-
-
-def owner_inventory() -> Database:
-    """
-    The database an unattended job should act on.
-
-    Falls back to the owner's file when there is no admin yet, which is the
-    same thing it has always been: on a deployment with no users there is
-    nothing to reprice and nothing to poll, so the fallback only has to be
-    harmless.
-    """
-    owner = user_db.get_owner_user_id()
-    return db if owner is None else inventory_for(owner)
 
 app = FastAPI(
     title="TCG Card Inventory Middleware",
@@ -376,43 +304,17 @@ mimetypes.add_type("image/x-icon", ".ico")
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
+# Routes that act on whole databases rather than on cards: backup and
+# restore. The first group split out of this module -- their paths are
+# unchanged, so nothing about the API moved with them.
+app.include_router(database_routes.router)
+
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 # An upload is read into memory before parsing, so without a ceiling a single
 # request can exhaust the container's RAM. Generous enough for any real
 # SortSwift or eBay export; a 50,000-row dump is a few megabytes.
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "25")) * 1024 * 1024
-
-
-async def read_upload_limited(
-    file: UploadFile, limit: int = MAX_UPLOAD_BYTES
-) -> bytes:
-    """
-    Read an upload, refusing anything over the limit.
-
-    Streams in chunks and stops at the ceiling rather than calling read() with
-    no argument, which would materialise the whole body first and so defeat
-    the check it is meant to enforce.
-    """
-    chunks: List[bytes] = []
-    total = 0
-    while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > limit:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"That file is larger than the {limit // (1024 * 1024)} MB "
-                    f"upload limit. Raise MAX_UPLOAD_MB if you really need to "
-                    f"process a file this big."
-                ),
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 @app.middleware("http")
@@ -516,19 +418,6 @@ class ManualCardAddRequest(BaseModel):
     printing: str = "Normal"
     quantity: int = 0
     ebay_parent_id: Optional[str] = None
-
-
-# Dependencies
-def get_current_user(request: Request) -> Optional[Dict[str, Any]]:
-    return auth_manager.get_current_user_from_request(request)
-
-
-def require_active_user(request: Request) -> Dict[str, Any]:
-    return auth_manager.require_user(request)
-
-
-def require_admin_user(request: Request) -> Dict[str, Any]:
-    return auth_manager.require_admin(request)
 
 
 # ---------------------------------------------------------
@@ -2139,309 +2028,6 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
 # ---------------------------------------------------------
 # DATABASE BACKUP / RESTORE
 # ---------------------------------------------------------
-
-# Every SQLite file the deployment owns, so "download the database" can mean
-# all of it rather than just the inventory. Each entry knows how to take its
-# own consistent snapshot; a plain file copy is not safe while the app is
-# running, because both databases are in WAL mode.
-DATABASE_FILES = {
-    "inventory": {
-        "label": "Inventory",
-        "stem": "tcg-inventory",
-        "description": (
-            "Card catalogue, eBay links, catalogued quantities, per-user "
-            "pricing rules and listing settings, and cover photo overrides."
-        ),
-        "path": lambda: DATABASE_URL,
-        "export": lambda dest: db.export_snapshot(dest),
-        "summary": lambda: {
-            "cards": db.get_stats()["total_cards"],
-            "linked_to_ebay": db.get_stats()["active_listings"],
-        },
-    },
-    "users": {
-        "label": "Users",
-        "stem": "tcg-users",
-        "description": (
-            "Google accounts, roles and approval status. Contains no passwords "
-            "and no OAuth secrets -- sign-in is delegated to Google."
-        ),
-        "path": lambda: USER_DATABASE_URL,
-        "export": lambda dest: user_db.export_snapshot(dest),
-        "summary": lambda: {"accounts": user_db.count_users()},
-    },
-}
-
-
-def database_specs() -> Dict[str, Dict[str, Any]]:
-    """
-    Every database the deployment owns, including one per extra account.
-
-    `DATABASE_FILES` describes the two fixed files. Since each account now
-    keeps its own inventory, the rest are discovered from the user list --
-    and only the ones that exist on disk are offered, because an account that
-    has never signed in has no file yet and a zero-byte member in a backup is
-    worse than an absent one.
-
-    Computed per call rather than cached: a backup taken after a new account
-    joined has to include them, and nobody is going to restart the container
-    to make that true.
-    """
-    specs = dict(DATABASE_FILES)
-    owner = _owner_scope()
-    for account in user_db.list_all_users():
-        user_id = int(account["id"])
-        if user_id == owner:
-            continue
-        path = inventory_path_for(user_id)
-        if not os.path.exists(path):
-            continue
-        label = account.get("username") or account.get("email") or f"user {user_id}"
-        specs[f"inventory-user-{user_id}"] = {
-            "label": f"Inventory ({label})",
-            "stem": f"tcg-inventory-user-{user_id}",
-            "description": (
-                f"Card catalogue, eBay links, quantities, pricing rules and "
-                f"listing settings belonging to {label}."
-            ),
-            "path": (lambda p=path: p),
-            "export": (
-                lambda dest, uid=user_id: inventory_for(uid).export_snapshot(dest)
-            ),
-            "summary": (
-                lambda uid=user_id: {
-                    "cards": inventory_for(uid).get_stats()["total_cards"],
-                }
-            ),
-        }
-    return specs
-
-
-@app.get("/api/database/files")
-def list_database_files(admin: Dict[str, Any] = Depends(require_admin_user)):
-    """
-    What is available to download, so the UI does not hardcode the list.
-
-    Admin only, matching the downloads themselves.
-    """
-    entries = []
-    for name, spec in database_specs().items():
-        path = os.path.abspath(spec["path"]())
-        try:
-            summary = spec["summary"]()
-        except Exception:
-            # A summary is cosmetic; never let it block a backup.
-            summary = {}
-        entries.append(
-            {
-                "name": name,
-                "label": spec["label"],
-                "description": spec["description"],
-                "filename": os.path.basename(path),
-                "size_bytes": os.path.getsize(path) if os.path.exists(path) else 0,
-                "summary": summary,
-            }
-        )
-    return {"files": entries}
-
-
-@app.get("/api/database/download/{name}")
-def download_database_file(
-    name: str,
-    background: BackgroundTasks,
-    admin: Dict[str, Any] = Depends(require_admin_user),
-):
-    """Download one database as a consistent snapshot. Admin only."""
-    spec = database_specs().get(name)
-    if spec is None:
-        raise HTTPException(status_code=404, detail=f"No such database: {name}")
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tmp_dir = tempfile.mkdtemp(prefix="tcg-snapshot-")
-    dest = os.path.join(tmp_dir, f"{spec['stem']}-{stamp}.db")
-
-    try:
-        spec["export"](dest)
-    except Exception as exc:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=500, detail=f"Could not create a snapshot: {exc}"
-        )
-
-    background.add_task(shutil.rmtree, tmp_dir, ignore_errors=True)
-    return FileResponse(
-        dest,
-        media_type="application/vnd.sqlite3",
-        filename=os.path.basename(dest),
-        background=background,
-    )
-
-
-@app.get("/api/database/bundle")
-def download_database_bundle(
-    background: BackgroundTasks,
-    admin: Dict[str, Any] = Depends(require_admin_user),
-):
-    """
-    Download every database in one zip. Admin only.
-
-    Each member is a VACUUM INTO snapshot rather than a copied file, so the
-    archive is internally consistent and restorable without sidecars. A short
-    README is included because a bare pair of .db files is not self-describing
-    six months later.
-    """
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tmp_dir = tempfile.mkdtemp(prefix="tcg-bundle-")
-    archive = os.path.join(tmp_dir, f"tcg-databases-{stamp}.zip")
-    notes = [
-        f"TCG Inventory Middleware -- database backup taken {stamp}",
-        "",
-        "Each .db is a VACUUM INTO snapshot: complete on its own, with no",
-        "-wal or -shm sidecar needed.",
-        "",
-    ]
-
-    try:
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-            for name, spec in database_specs().items():
-                member = f"{spec['stem']}-{stamp}.db"
-                staged = os.path.join(tmp_dir, member)
-                spec["export"](staged)
-                bundle.write(staged, arcname=member)
-                os.remove(staged)
-                notes.append(f"{member}")
-                notes.append(f"    {spec['description']}")
-                notes.append("")
-            bundle.writestr("README.txt", chr(10).join(notes))
-    except Exception as exc:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=500, detail=f"Could not build the backup archive: {exc}"
-        )
-
-    background.add_task(shutil.rmtree, tmp_dir, ignore_errors=True)
-    return FileResponse(
-        archive,
-        media_type="application/zip",
-        filename=os.path.basename(archive),
-        background=background,
-    )
-
-
-@app.get("/api/inventory/database")
-def download_inventory_database(
-    background: BackgroundTasks,
-    admin: Dict[str, Any] = Depends(require_admin_user),
-):
-    """
-    Download a consistent snapshot of the inventory database. Admin only.
-
-    Both halves of backup/restore are administrative: the file is the whole
-    shared catalog plus every listing setting, which is more than an ordinary
-    user needs in order to work. The endpoint is restricted rather than merely
-    hidden, so the permission does not depend on the UI.
-
-    Taken with VACUUM INTO so the write-ahead log is checkpointed into the file.
-    A hand-copied .db can otherwise be missing its most recent commits.
-    """
-    inv = inventory_for(admin)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tmp_dir = tempfile.mkdtemp(prefix="tcg-snapshot-")
-    dest = os.path.join(tmp_dir, f"tcg-inventory-{stamp}.db")
-
-    try:
-        inv.export_snapshot(dest)
-    except Exception as exc:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=500, detail=f"Could not create a snapshot: {exc}"
-        )
-
-    # Remove the temp copy once the response has been sent.
-    background.add_task(shutil.rmtree, tmp_dir, ignore_errors=True)
-
-    return FileResponse(
-        dest,
-        media_type="application/vnd.sqlite3",
-        filename=os.path.basename(dest),
-        background=background,
-    )
-
-
-@app.post("/api/inventory/database")
-async def import_inventory_database(
-    file: UploadFile = File(...),
-    confirm: bool = Form(False),
-    admin: Dict[str, Any] = Depends(require_admin_user),
-):
-    """
-    Replace the inventory database with an uploaded snapshot. Admin only.
-
-    Restricted to admins because the catalog is shared: a restore replaces
-    everyone's data, not just the uploader's.
-
-    Without confirm=true the upload is only validated and summarised, so an
-    operator can see what a restore would bring in before committing to it. The
-    current database is copied aside first either way, so a restore is
-    reversible.
-    """
-    inv = inventory_for(admin)
-    tmp_dir = tempfile.mkdtemp(prefix="tcg-import-")
-    staged = os.path.join(tmp_dir, "upload.db")
-    try:
-        written = 0
-        with open(staged, "wb") as out:
-            while chunk := await file.read(1024 * 1024):
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"That database is larger than the "
-                            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload "
-                            f"limit. Raise MAX_UPLOAD_MB to restore it."
-                        ),
-                    )
-                out.write(chunk)
-
-        check = inv.inspect_snapshot(staged)
-        if not check["ok"]:
-            raise HTTPException(status_code=400, detail=check["error"])
-
-        current = inv.get_stats()
-
-        if not confirm:
-            return {
-                "applied": False,
-                "filename": file.filename,
-                "incoming": check["counts"],
-                "current": {
-                    "manifest": current["total_cards"],
-                    "ebay_variations": current["active_listings"],
-                },
-                "message": (
-                    "Validated but not applied. Re-send with confirm=true to "
-                    "replace the current inventory database."
-                ),
-            }
-
-        result = inv.replace_with_snapshot(staged)
-        return {
-            "applied": True,
-            "filename": file.filename,
-            "incoming": result["counts"],
-            "backup_path": result["backup_path"],
-            "message": "Inventory database replaced. A backup of the previous one was kept.",
-        }
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Import failed: {exc}")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
 
 # ---------------------------------------------------------
 # HEALTH CHECK

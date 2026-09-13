@@ -2445,6 +2445,54 @@ class TestWebApp(unittest.TestCase):
         )
 
 
+    # -- module structure --------------------------------------------------
+
+    def test_59a_the_shared_runtime_has_exactly_one_instance(self):
+        """
+        `app.deps` owns the databases; `main` re-exports them.
+
+        Worth pinning because the near-miss is silent. While splitting the
+        first router out, both modules briefly defined `db` and the
+        per-account registry -- two connection pools on the same file and two
+        caches of which account maps to which database, so which one you got
+        depended on which module you asked. Nothing would have failed
+        loudly; writes would just have gone to a different handle than the
+        reads.
+        """
+        from app import deps
+
+        self.assertIs(main.db, deps.db)
+        self.assertIs(main.user_db, deps.user_db)
+        self.assertIs(main.auth_manager, deps.auth_manager)
+        self.assertIs(main.inventory_for, deps.inventory_for)
+        self.assertIs(main.inventory_path_for, deps.inventory_path_for)
+        self.assertIs(main._inventories, deps._inventories)
+        self.assertEqual(main.DATABASE_URL, deps.DATABASE_URL)
+
+    def test_59b_the_database_routes_are_served_from_their_own_module(self):
+        """
+        The split must not quietly drop a route. Paths are unchanged, so a
+        lost one shows up as a 404 rather than as a failed import.
+        """
+        from app.routes import database as database_routes
+
+        self.assertTrue(
+            any(
+                getattr(route, "path", "") == "/api/database/bundle"
+                for route in database_routes.router.routes
+            ),
+            "the bundle route is not on the database router",
+        )
+
+        # Reachable through the app, and still admin-only.
+        anonymous = TestClient(app)
+        for path in ("/api/database/files", "/api/database/bundle",
+                     "/api/inventory/database"):
+            res = anonymous.get(path)
+            self.assertNotEqual(res.status_code, 404, path)
+            self.assertIn(res.status_code, (401, 403), path)
+
+
     # -- automatic repricing ----------------------------------------------
 
     def test_48_the_repricer_preview_needs_no_ebay_connection(self):

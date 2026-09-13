@@ -165,3 +165,31 @@
   notification endpoint, which eBay addresses to the application rather than
   to a seller, and eBay's **call limits**, which are per-application and
   therefore shared across accounts.
+
+## 6. 🧩 Module Layout
+
+* **`app/deps.py` owns the shared runtime.** The databases (`db`, `user_db`),
+  the per-account registry (`inventory_for`, `owner_inventory`,
+  `inventory_path_for`), the request dependencies (`require_active_user`,
+  `require_admin_user`) and the upload guard all live there. It loads `.env`
+  itself, before `auth` can read `GOOGLE_CLIENT_ID` at module level, so it
+  must be the first `app.*` module imported.
+* **`main` re-exports what it uses from `deps`** rather than referencing it
+  through the module, because several tests patch `app.main.<name>`. Never
+  *redefine* one of those names in `main`: two `Database` instances on one
+  file means two connection pools and two per-account caches, so which one
+  you get depends on which module you ask, and nothing fails loudly.
+  `test_59a_the_shared_runtime_has_exactly_one_instance` pins this.
+* **Routes belong in `app/routes/<area>.py`**, one `APIRouter` per area,
+  included from `main`. Extracting a group must not change a single URL --
+  that is what lets the existing tests verify the move rather than needing to
+  be rewritten for it. `app/routes/database.py` (backup and restore) is the
+  worked example.
+* **`main` is still large.** Splitting it further is welcome and low-risk in
+  this shape: move a cohesive group of endpoints, swap `@app.` for
+  `@router.`, import what it needs from `deps`, and include the router. The
+  remaining natural groups are eBay connection/setup, orders and the pick
+  list, and plans/push -- roughly in that order of difficulty.
+* **A router must not import `main`.** That is the cycle `deps` exists to
+  prevent. If a router needs something that currently lives in `main`, move
+  it to `deps` or to the router itself, whichever it genuinely belongs to.
