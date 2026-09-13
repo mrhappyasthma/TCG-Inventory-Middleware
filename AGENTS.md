@@ -185,11 +185,32 @@
   that is what lets the existing tests verify the move rather than needing to
   be rewritten for it. `app/routes/database.py` (backup and restore) is the
   worked example.
-* **`main` is still large.** Splitting it further is welcome and low-risk in
-  this shape: move a cohesive group of endpoints, swap `@app.` for
-  `@router.`, import what it needs from `deps`, and include the router. The
-  remaining natural groups are eBay connection/setup, orders and the pick
-  list, and plans/push -- roughly in that order of difficulty.
+* **Anything a test patches is reached as `deps.<name>(...)` at call time**,
+  never imported into a second module. `from app.deps import get_ebay_client`
+  gives the importing module its own reference, so a test patching one
+  module's leaves the other talking to the real eBay -- an endpoint that keeps
+  working while the test believes it is exercising a stub. That is worse than
+  a plain failure, because the suite reports success. The eBay library
+  functions, the client factory and `get_orders` all follow this rule, and
+  their names are deliberately absent from the routers' import lists so a
+  second binding cannot come back.
 * **A router must not import `main`.** That is the cycle `deps` exists to
   prevent. If a router needs something that currently lives in `main`, move
   it to `deps` or to the router itself, whichever it genuinely belongs to.
+* **Background loops register in `main` and live in their router.**
+  `APIRouter.on_event` is deprecated, and a loop that silently stops being
+  registered is a poller indistinguishable from a shop with no sales. So the
+  `@app.on_event("startup")` handler stays beside `app` and does nothing but
+  await the router's function.
+* **`main` still holds 41 endpoints**: authentication, users, the CSV
+  ingests, inventory and its per-card edits, pricing rules, the repricer, the
+  eBay listings mirror, health and the cached assets. Splitting further is
+  welcome and follows the same recipe -- move a cohesive group, swap `@app.`
+  for `@router.`, import from `deps`, include the router, change no URL.
+  Inventory (largest), pricing/repricing, and authentication/users are the
+  obvious next groups.
+* **The route walk in `tests/test_deployment.py` must descend into included
+  routers.** FastAPI 0.141 keeps an included router as one `_IncludedRouter`
+  entry exposing `original_router`, rather than flattening its children into
+  `app.routes`. A walk of the top level alone reports a served endpoint as
+  missing.

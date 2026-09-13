@@ -15,10 +15,10 @@ per-application and therefore shared.
 
 import json
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -28,7 +28,6 @@ from starlette.concurrency import run_in_threadpool
 # who can get a person to click a link -- it must be escaped.
 from html import escape as escape_html
 
-from tcg_engine.db import SHARED_SCOPE
 from tcg_engine.sync import sync_active_listings_csv
 
 try:

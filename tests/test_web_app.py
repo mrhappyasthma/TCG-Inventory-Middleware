@@ -33,6 +33,7 @@ os.environ["EBAY_NOTIFICATION_ENDPOINT"] = "https://cards.example.com/api/ebay/n
 
 from app import main  # noqa: E402
 from app.main import app, db, user_db  # noqa: E402
+from tcg_engine.db import SHARED_SCOPE  # noqa: E402
 from app import deps  # noqa: E402
 from app.routes import ebay as ebay_routes  # noqa: E402
 from app.routes import orders as orders_routes  # noqa: E402
@@ -1909,7 +1910,7 @@ class TestWebApp(unittest.TestCase):
         """
         self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
         db.set_listing_settings({orders_routes.ORDER_WATERMARK_SETTING: ""},
-                                user_id=main.SHARED_SCOPE)
+                                user_id=SHARED_SCOPE)
         db.insert_manifest("ID9200", "Sneasel", "Unified Minds", "Near Mint",
                            "Holofoil", card_number="032/236")
         db.set_manifest_quantity("ID9200", 4)

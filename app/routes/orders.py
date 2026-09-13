@@ -35,7 +35,7 @@ from starlette.concurrency import run_in_threadpool
 
 from tcg_engine.db import SHARED_SCOPE, Database
 from tcg_engine.order_sync import OrderSyncError, sync_orders
-from tcg_engine.repricer import format_timestamp, parse_timestamp, utcnow
+from tcg_engine.repricer import format_timestamp, parse_timestamp
 
 try:
     from app import deps
