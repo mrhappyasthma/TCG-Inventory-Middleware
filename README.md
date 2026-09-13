@@ -669,6 +669,54 @@ listing before it will migrate one (error `25002`), it **re-validates every
 picture** on any change so one undersized image blocks everything, and
 `getOffers` **nests the listing id** where the other calls do not.
 
+### Why a draft wants to change a price
+
+Two things change a listed price, and **they do not share their safety
+rules.** This is the single most common surprise in the app, so it is worth
+stating plainly:
+
+| | Automatic repricer | Draft plan |
+|---|---|---|
+| Runs | Nightly, unattended | When you build or rebuild a draft |
+| Reads | The **market price** from TCGCSV | The **stored price** on the card |
+| Compares against | eBay's last known price | eBay's last known price |
+| Hold window on a fall | **Yes** — 14 days by default | **No** |
+| Boundary margin at a tier edge | **Yes** | **No** |
+| Refuses a run that moves too much | **Yes** | **No** |
+| Reaches eBay | By itself | Only after you approve it |
+
+The damping belongs to the repricer *because* it is unattended. A draft is
+reviewed by a person before anything is sent, so it does the honest thing and
+reports the difference it found.
+
+So a draft proposing a price drop is **not** the repricer ignoring its hold
+window — the repricer was not involved. A draft proposes a price whenever the
+stored price differs from what eBay is known to hold, and there are two ways
+that happens:
+
+* **eBay's price is unknown.** An unknown counts as changed, deliberately:
+  nothing is suppressed until a sync has told us what eBay actually holds,
+  because suppressing against a value we never learned would silently drop a
+  real change. A **Module B sync** fills it in and the entry goes away. This
+  is the usual cause.
+* **The two genuinely differ**, because the card was priced at a market level
+  that has since moved, or its price was set before a rules change.
+
+To find out which, for any card:
+
+```bash
+python scripts/explain_price.py "Risky Ruins"
+python scripts/explain_price.py ID1074
+```
+
+It prints every number involved — the stored price, the market price, eBay's
+last known, what the rules say now — then what a draft would propose and what
+the repricer would decide, each with its reason. On the NAS:
+
+```bash
+docker compose exec tcg-middleware python scripts/explain_price.py "Rare Candy"
+```
+
 ### Finding images eBay will refuse
 
 That middle one keeps mattering, so the check outlived the migration:
