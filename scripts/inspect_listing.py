@@ -1,32 +1,48 @@
 #!/usr/bin/env python3
 """
-Compare a live eBay listing against what we think is in it, and say whether
-pressing Refresh will restore it.
+Compare a live eBay listing against what we think is in it, and say what will
+restore it.
 
 Written for one situation. A push built from a partial plan used to replace
 the whole inventory item group, which takes every variation it did not send
 off sale -- so a one-card plan could reduce a 35-card listing to one card.
-Refresh rebuilds the group from every card our mirror links to the listing,
-which is the remedy, but it **touches no offers**: it writes the inventory
-items and the group and nothing else.
+Three states look identical from outside the listing and need different
+remedies, so this reports them separately, per card:
 
-That is the distinction this answers, per card:
+* **Missing from the group.** The variation is gone. Refresh rebuilds the
+  group from every card our mirror links to the listing, so this is the case
+  Refresh fixes.
+* **In the group, offer live, quantity zero.** The variation exists and
+  nobody can buy it. eBay hides a zero-quantity variation from the dropdown,
+  so this looks like a listing that lost its variations and is not one.
+  Refresh cannot fix it: quantity lives on the offer, and Refresh writes the
+  inventory items and the group and never touches offers.
+* **In the group, no offer or an unpublished one.** A half-built variation,
+  which needs its offer recreated rather than restocked.
 
-* **Missing from the group but its offer is still there** -- Refresh puts it
-  back, because the SKU returning to `variantSKUs` is all that was needed.
-* **Missing from the group and its offer is gone** -- Refresh is not enough
-  on its own. The SKU goes back into the group with nothing behind it, and
-  the variation needs its offer recreated.
+Everything is read from eBay. Our mirror's `last_known_qty` is the one number
+that cannot be trusted here -- the push never updated it for the cards it did
+not touch, so it still believes they hold stock.
 
 Reads only. It writes nothing, to our database or to eBay.
 
     python scripts/inspect_listing.py 227521446958
+    python scripts/inspect_listing.py 227521446958 --limit 10
+    python scripts/inspect_listing.py 227521446958 --pictures --all
 
 On the NAS, which is where the eBay connection lives:
 
     cd /volume1/docker/tcg-middleware
     docker compose exec tcg-middleware python scripts/inspect_listing.py \\
-        227521446958
+        227521446958 --limit 10
+
+There is no bulk read in the Inventory API for any of this, so it is one call
+per card -- a 123-card listing takes a couple of minutes. Rows are therefore
+printed as they arrive rather than collected and tabulated at the end: a slow
+script that prints nothing is indistinguishable from a hung one. `--limit`
+samples the first N cards, which is usually enough to establish the pattern.
+`--pictures` reads each inventory item too, which doubles the calls, so it is
+off by default.
 """
 
 import argparse
@@ -46,33 +62,69 @@ def sku_for(card):
     return str(card.get("custom_label") or card["manifest_id"]).strip()
 
 
-def read_offers(client, sku):
-    """Every offer eBay holds for one SKU, with its quantity and status."""
+def read_offer(client, sku):
+    """
+    eBay's own view of one SKU's offer: (quantity, note, offers).
+
+    Quantity is None when it could not be established, and that is **not**
+    the same fact as zero. The first version of this script treated the two
+    alike: it only counted a card as out of stock when the quantity was a
+    number and that number was zero, so every card it failed to read was
+    scored as healthy, printed nothing, and was counted into "123 of 123
+    variation(s) have stock at eBay" -- on a listing that did not have it.
+    An unreadable card is now its own outcome and says why.
+
+    Two ways the quantity goes missing, which the note distinguishes:
+    the call failed, or the call succeeded and the offer carried no
+    ``availableQuantity`` field at all.
+    """
     from ebay_client import inventory  # noqa: PLC0415
 
-    return inventory.get_offers(client.seller, sku)
+    try:
+        offers = inventory.get_offers(client.seller, sku)
+    except Exception as exc:  # noqa: BLE001 - report, never traceback
+        return None, f"unreadable: {exc}", None
+    if not offers:
+        return None, "no offer", offers
+    offer = offers[0]
+    note = str(offer.get("offerId") or "?")
+    status = str(offer.get("status") or "").upper()
+    if status and status != "PUBLISHED":
+        note += " (" + status.lower() + ")"
+    if "availableQuantity" not in offer:
+        # eBay answered, and its answer contained no quantity. Reporting that
+        # as stock is how the listing got a clean bill of health.
+        return None, note + " (no qty field)", offers
+    raw = offer.get("availableQuantity")
+    return (int(raw) if raw is not None else None), note, offers
 
 
-def read_item(client, sku):
+def read_pictures(client, sku):
     """
-    The inventory item, which is where a variation's pictures live.
+    How many photos the inventory item carries, or None if unreadable.
 
-    "Every variation has 0 photos" is a statement about these, not about the
-    group -- the group only says that pictures vary by the Card aspect.
+    "Every variation has 0 photos" is a statement about the inventory items,
+    not about the group -- the group only says pictures vary by Card. None
+    here means the question was not answered, and is reported as unknown
+    rather than folded in with either answer.
     """
     from ebay_client import inventory  # noqa: PLC0415
 
     getter = getattr(inventory, "get_inventory_item", None)
     if not callable(getter):
         return None
-    return getter(client.seller, sku)
+    try:
+        item = getter(client.seller, sku) or {}
+    except Exception:  # noqa: BLE001 - reported as unknown, not as zero
+        return None
+    return len(((item.get("product") or {}).get("imageUrls") or []))
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Compare a live eBay listing with our mirror, and say whether "
-            "Refresh will restore it."
+            "Compare a live eBay listing with our mirror, and say what will "
+            "restore it."
         ),
     )
     parser.add_argument("item_id", help="The eBay item number")
@@ -80,6 +132,16 @@ def main(argv=None):
         "--all", action="store_true",
         help="Print every card. By default only the ones with something "
              "wrong are listed and the rest are counted.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0, metavar="N",
+        help="Only check the first N cards. Each card is an eBay call, and a "
+             "sample is usually enough to establish the pattern.",
+    )
+    parser.add_argument(
+        "--pictures", action="store_true",
+        help="Also count each inventory item's photos. This doubles the "
+             "number of eBay calls.",
     )
     parser.add_argument(
         "--user-id", type=int, default=None,
@@ -134,50 +196,39 @@ def main(argv=None):
 
     on_ebay = {str(s).strip() for s in (live.get("variantSKUs") or [])}
     print(f"  eBay's group holds {len(on_ebay)} variation(s)")
+
+    checked = cards[:args.limit] if args.limit > 0 else cards
+    print(f"  reading {len(checked)} card(s) from eBay, "
+          f"{len(checked) * (2 if args.pictures else 1)} call(s)"
+          + (f", sampled from {len(cards)}"
+             if len(checked) < len(cards) else "")
+          + " -- rows appear as they arrive")
     print()
+
+    header = (f"  {'SKU':16} {'in group':9} {'offer':34} {'eBay qty':9} "
+              f"{'ours':5}")
+    if args.pictures:
+        header += f"{'pics':5} "
+    print(header + "card")
+    print("  " + "-" * (104 if args.pictures else 99))
 
     missing_with_offer = []
     missing_without_offer = []
     no_offer_but_present = []
     out_of_stock = []
-    no_photos = []
-    rows = []
+    unknown_qty = []
+    unreadable = []
+    no_pictures = []
+    unknown_pictures = []
+    confirmed_stock = 0
+    right = 0
 
-    for card in cards:
+    for index, card in enumerate(checked, start=1):
         sku = sku_for(card)
         present = sku in on_ebay
-        # eBay's own figure, which is what decides whether a buyer sees the
-        # variation at all -- eBay hides one with no stock from the dropdown.
         ours = int(card.get("quantity") or 0)
-        # eBay's own figures, read now. Our mirror's last_known_qty is the
-        # one number that cannot be trusted here: the push never updated it
-        # for the cards it did not touch, so it still believes they hold
-        # stock.
-        live_qty = None
-        item_photos = None
-        try:
-            offers = read_offers(client, sku)
-        except Exception as exc:  # noqa: BLE001
-            offers = None
-            note = f"unknown ({exc})"
-        else:
-            if offers:
-                offer = offers[0]
-                note = str(offer.get("offerId") or "?")
-                raw = offer.get("availableQuantity")
-                live_qty = int(raw) if raw is not None else None
-                if str(offer.get("status") or "").upper() != "PUBLISHED":
-                    note += " (" + str(offer.get("status") or "?").lower() + ")"
-            else:
-                note = "none"
-        try:
-            item = read_item(client, sku)
-        except Exception:  # noqa: BLE001 - the picture count is advisory
-            item_photos = None
-        else:
-            item_photos = len(
-                ((item or {}).get("product") or {}).get("imageUrls") or []
-            )
+        live_qty, note, offers = read_offer(client, sku)
+        pics = read_pictures(client, sku) if args.pictures else None
 
         if not present:
             if offers:
@@ -188,41 +239,96 @@ def main(argv=None):
             no_offer_but_present.append(sku)
         if present and live_qty is not None and live_qty <= 0:
             out_of_stock.append(sku)
-        if present and item_photos == 0:
-            no_photos.append(sku)
+        if present and live_qty is not None and live_qty > 0:
+            confirmed_stock += 1
+        # Not knowing the quantity is a finding, not a pass. Scoring it as a
+        # pass is what let this report 123 of 123 in stock while the listing
+        # was not up to date.
+        if present and live_qty is None and offers:
+            unknown_qty.append(sku)
+        if offers is None:
+            # The call itself failed, so this card contributes nothing to any
+            # other count -- including the missing-from-group ones, which we
+            # also cannot judge without knowing whether an offer exists.
+            unreadable.append(sku)
+        if present and pics == 0:
+            no_pictures.append(sku)
+        if args.pictures and present and pics is None:
+            unknown_pictures.append(sku)
 
         wrong = (
             (not present)
             or (offers is not None and not offers)
-            or (live_qty is not None and live_qty <= 0)
-            or item_photos == 0
+            or offers is None
+            or live_qty is None
+            or live_qty <= 0
+            or pics == 0
+            or (args.pictures and pics is None)
         )
-        rows.append(
-            (wrong, sku, present, note, live_qty, ours, item_photos, card)
-        )
+        if not wrong:
+            right += 1
+        if wrong or args.all:
+            line = (
+                f"  {sku:16} {'yes' if present else 'NO':9} {note[:34]:34} "
+                f"{('?' if live_qty is None else str(live_qty)):<9} "
+                f"{ours:<5}"
+            )
+            if args.pictures:
+                line += f"{('?' if pics is None else str(pics)):<5} "
+            line += (f"{card.get('product_name')} "
+                     f"{card.get('card_number') or ''}")
+            print(line)
+        # Flushed per row, not collected for a table at the end: at one
+        # HTTP call per card this runs for minutes, and silence for minutes
+        # is why the first version of this looked like it had hung.
+        sys.stdout.flush()
+        if index % 25 == 0 and index < len(checked):
+            print(f"  ... {index}/{len(checked)} read", flush=True)
 
-    shown = [r for r in rows if r[0] or args.all]
-    if shown:
-        print(f"  {'SKU':16} {'in group':9} {'offer':22} {'eBay qty':9} "
-              f"{'ours':5} {'pics':5} card")
-        print("  " + "-" * 92)
-        for _, sku, present, note, live_qty, ours, pics, card in shown:
-            qty = "?" if live_qty is None else str(live_qty)
-            pic = "?" if pics is None else str(pics)
-            print(f"  {sku:16} {'yes' if present else 'NO':9} {str(note):22} "
-                  f"{qty:<9} {ours:<5} {pic:<5} {card.get('product_name')} "
-                  f"{card.get('card_number') or ''}")
-        if not args.all:
-            print(f"  ... {len(rows) - len(shown)} more card(s) are in the "
-                  f"group, have an offer and have stock (--all to list them)")
+    print()
+    if not args.all and right:
+        print(f"  {right} of {len(checked)} card(s) checked are in the group, "
+              f"have a published")
+        print(f"  offer and have stock"
+              + (" and a picture" if args.pictures else "")
+              + " (--all lists them).")
+
+    # Every count below is of something eBay actually told us. The ones it
+    # did not answer are reported as unanswered rather than divided between
+    # the other columns.
+    with_stock = confirmed_stock
+    print(f"  {with_stock} of {len(checked)} are confirmed in stock at eBay.")
+    if unreadable:
+        print(f"  {len(unreadable)} could not be read from eBay at all, so "
+              f"nothing is known")
+        print(f"  about them -- the reason is on each row above.")
+    if out_of_stock:
+        print(f"  {len(out_of_stock)} are confirmed at quantity zero.")
+    if unknown_qty:
+        print(f"  {len(unknown_qty)} have an offer whose quantity eBay did "
+              f"not report.")
+    if no_pictures:
+        print(f"  {len(no_pictures)} of {len(checked)} have no picture on "
+              f"their inventory item.")
+    if unknown_pictures:
+        print(f"  {len(unknown_pictures)} inventory item(s) could not be "
+              f"read for pictures.")
+    if not args.pictures:
+        print("  Pictures were not checked at all; add --pictures to count "
+              "them.")
     print()
 
-    with_stock = len(rows) - len(out_of_stock)
-    print(f"  {with_stock} of {len(rows)} variation(s) have stock at eBay.")
-    if no_photos:
-        print(f"  {len(no_photos)} of {len(rows)} have no picture on their "
-              f"inventory item.")
-    print()
+    if unknown_qty and not out_of_stock:
+        print("  Read the quantity column before drawing any conclusion: "
+              "eBay returned an")
+        print("  offer for these and no quantity in it, so this run cannot "
+              "say whether they")
+        print("  are in stock. It is not evidence that they are. The offer "
+              "note on each row")
+        print("  above says which of the two happened -- the call failing, "
+              "or the call")
+        print("  succeeding with no availableQuantity field in the answer.")
+        print()
 
     if out_of_stock and with_stock <= 1:
         print("  The variation set is intact; what is missing is the stock. "
@@ -263,12 +369,28 @@ def main(argv=None):
         # being well: the stock and the pictures are separate facts, and
         # saying 'nothing to restore' over the top of them would be the
         # same false reassurance the success log gave.
-        if out_of_stock or no_photos:
-            print("  The variation set itself needs nothing from Refresh -- every card")
-            print("  our mirror links to this listing is already in eBay's group.")
+        # The guard is the count of cards that came back clean, not a list of
+        # the ways they can come back dirty. Enumerating the failure lists
+        # here missed the case where every single read failed: none of the
+        # lists filled, and the report declared the whole listing healthy.
+        if right < len(checked):
+            print("  The variation set itself needs nothing from Refresh -- "
+                  "every card")
+            print("  our mirror links to this listing is already in eBay's "
+                  "group. That is the")
+            print("  only thing this run establishes; the stock and the "
+                  "pictures are separate")
+            print("  facts and are listed above.")
             return 0
-        print("  Every card is in the group, has a live offer, has stock and has a")
-        print("  picture. Nothing to restore.")
+        print(f"  All {len(checked)} card(s) checked are in the group and "
+              f"have a published offer")
+        print(f"  holding stock"
+              + (", with at least one picture" if args.pictures
+                 else " (pictures not checked)")
+              + ".")
+        if len(checked) < len(cards):
+            print(f"  That is a sample of {len(checked)} from {len(cards)}; "
+                  f"drop --limit to check them all.")
         return 0
 
     if missing_with_offer:
