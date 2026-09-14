@@ -836,11 +836,32 @@ def _push_group(
     # is meaningless to a buyer looking for 045/132. The CSV path has always
     # sorted here; the API path did not, and the first listings went up
     # scrambled.
-    entries = [
-        (item, _sku_for(item))
-        for item in sorted(live, key=variation_sort_key)
-        if item["action"] != ACTION_REMOVE
-    ]
+    # Everything the listing should still hold afterwards -- not just what
+    # this plan touched.
+    #
+    # Writing the group is a full replace, so a SKU missing from variantSKUs
+    # is a card taken off sale. Building this from the plan's items alone
+    # meant approving one card's quantity change and pushing it replaced a
+    # 35-card listing with a 1-card listing: every other variation removed
+    # from the live listing, immediately, with a SUCCESS in the log. A plan
+    # is a diff, so anything it does not mention has to survive it.
+    keep: Dict[str, Dict[str, Any]] = {}
+    if published and (managed or {}).get("ebay_parent_id"):
+        for card in db.get_cards_for_listing(str(managed["ebay_parent_id"])):
+            keep[_sku_for(card)] = card
+    for item in live:
+        if item["action"] == ACTION_REMOVE:
+            keep.pop(_sku_for(item), None)
+            continue
+        keep[_sku_for(item)] = item
+    # A card whose offer was withdrawn above is off sale, so it must not be
+    # written back into the group -- the mirror still links it to this
+    # listing at quantity zero.
+    for item in ends:
+        keep.pop(_sku_for(item), None)
+
+    kept = sorted(keep.values(), key=variation_sort_key)
+    entries = [(card, _sku_for(card)) for card in kept]
     api.upsert_group(ebay_group_key, _group_payload(
         ebay_group_key,
         entries,
@@ -848,8 +869,10 @@ def _push_group(
             set_name, condition=condition, template=title_template
         ),
         description=description,
-        cover_image_url=cover_image_url or _first_image(live),
-        aspects=_uniform_aspects(live, settings),
+        # Both from the full set, for the same reason: a one-card plan was
+        # narrowing the listing-level aspects and could blank the cover.
+        cover_image_url=cover_image_url or _first_image(kept),
+        aspects=_uniform_aspects(kept, settings),
     ))
     db.upsert_managed_listing(
         group_key, inventory_item_group_key=ebay_group_key, pushed=True
@@ -868,7 +891,10 @@ def _push_group(
     else:
         listing_id = managed["ebay_parent_id"]
         _record_cover(db, listing_id, cover_image_url)
-        record("INFO", f"{group_key}: updated listing #{listing_id}")
+        record("INFO", (
+            f"{group_key}: updated listing #{listing_id}, which now carries "
+            f"{len(entries)} variation(s)"
+        ))
 
     _confirm(db, live, listing_id, counts)
     return (0 if published else 1, 1 if published else 0)

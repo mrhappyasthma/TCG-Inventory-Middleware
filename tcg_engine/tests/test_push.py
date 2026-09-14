@@ -20,6 +20,7 @@ import unittest
 
 from tcg_engine.db import Database, SHARED_SCOPE
 from tcg_engine.plans import (
+    ACTION_REMOVE,
     ACTION_UPDATE,
     STATUS_DEFERRED,
     STATUS_FAILED,
@@ -1045,6 +1046,123 @@ class RefreshTests(PushTestCase):
             refresh_listing(self.db, FakeEbay(), "227511361186",
                             user_id=SHARED_SCOPE)
         self.assertIn("not managed through this API", str(caught.exception))
+
+
+class PartialPushKeepsTheWholeListingTests(PushTestCase):
+    """
+    A plan touching one card must not take the rest of the listing off sale.
+
+    Writing an inventory item group is a full replace: a SKU absent from
+    variantSKUs is a card removed from the live listing, immediately, with no
+    staged state to inspect. `_group_payload` says so in its own docstring and
+    `refresh_listing` was built around it -- but the push was not, and built
+    the group from the plan's items alone.
+
+    The cost, in production: a quantity change approved on one card replaced a
+    35-card listing with a 1-card listing. Nothing failed and the log said
+    success. Nothing in this suite caught it, which is the more useful fact.
+    """
+
+    def live_three_card_listing(self):
+        """Three cards, pushed and published, as the starting state."""
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        self.add_card("ID1003", "Venusaur", "015/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        self.assertEqual(
+            len(group["variantSKUs"]), 3, "fixture should list three cards"
+        )
+        return api
+
+    def test_changing_one_card_keeps_the_other_variations(self):
+        self.live_three_card_listing()
+
+        # One card's stock changes, so the rebuilt plan holds one item.
+        self.db.set_manifest_quantity("ID1002", 7)
+        plan_id = self.approved_plan()
+        items = self.db.get_plan_items(plan_id)
+        self.assertEqual(
+            [row["manifest_id"] for row in items], ["ID1002"],
+            "the plan should be a diff of one card",
+        )
+
+        api = FakeEbay()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        group = list(api.groups.values())[0]
+        self.assertEqual(
+            sorted(group["variantSKUs"]), ["ID1001", "ID1002", "ID1003"],
+            "the cards the plan did not mention must survive it",
+        )
+        # And the dropdown still offers all three, in card-number order.
+        options = group["variesBy"]["specifications"][0]["values"]
+        self.assertEqual(len(options), 3)
+        self.assertTrue(
+            options[0].endswith("(004/102)"), f"unsorted: {options}"
+        )
+
+    def test_the_listing_level_aspects_are_not_narrowed_to_one_card(self):
+        """
+        Aspects are computed from the cards in the group, so deriving them
+        from a one-card plan would rewrite the whole listing's specifics from
+        a sample of one.
+        """
+        self.live_three_card_listing()
+        self.db.set_manifest_quantity("ID1002", 7)
+
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        # Whatever the aspects are, they must have been derived from three
+        # cards rather than one -- the option list is the visible proxy.
+        self.assertEqual(
+            len(group["variesBy"]["specifications"][0]["values"]), 3
+        )
+
+    def test_a_removed_card_is_the_one_thing_that_does_come_off(self):
+        """
+        The mechanism is not disabled, only made deliberate: a card the plan
+        removes is meant to leave the listing.
+        """
+        self.live_three_card_listing()
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        items = {
+            row["manifest_id"]: row for row in self.db.get_plan_items(plan_id)
+        }
+        if "ID1003" not in items:
+            # Nothing to change for it, so stage a removal directly.
+            self.db.add_plan_items(plan_id, [{
+                "manifest_id": "ID1003",
+                "group_key": "Base Set|Near Mint",
+                "action": ACTION_REMOVE,
+                "proposed_qty": 0,
+                "proposed_price": None,
+            }])
+        approve_plan(self.db, plan_id, approved_by=1)
+
+        api = FakeEbay()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        self.assertNotIn(
+            "ID1003", group["variantSKUs"],
+            "a card the plan removes should leave the listing",
+        )
+        self.assertIn("ID1001", group["variantSKUs"])
+        self.assertIn("ID1002", group["variantSKUs"])
+
+    def test_a_brand_new_listing_sends_only_its_own_cards(self):
+        """
+        There is nothing to preserve before the listing exists, so a create
+        must not pick up unrelated cards.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+        group = list(api.groups.values())[0]
+        self.assertEqual(sorted(group["variantSKUs"]), ["ID1001", "ID1002"])
 
 
 class CoverVerificationTests(PushTestCase):
