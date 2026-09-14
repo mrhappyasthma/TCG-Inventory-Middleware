@@ -55,6 +55,11 @@ def main(argv=None):
     )
     parser.add_argument("item_id", help="The eBay item number")
     parser.add_argument(
+        "--all", action="store_true",
+        help="Print every card. By default only the ones with something "
+             "wrong are listed and the rest are counted.",
+    )
+    parser.add_argument(
         "--user-id", type=int, default=None,
         help="Whose eBay connection and inventory to use. Defaults to the "
              "deployment owner.",
@@ -111,12 +116,17 @@ def main(argv=None):
 
     missing_with_offer = []
     missing_without_offer = []
+    no_offer_but_present = []
+    out_of_stock = []
+    rows = []
 
-    print(f"  {'SKU':16} {'in group':9} {'offer at eBay':14} card")
-    print("  " + "-" * 66)
     for card in cards:
         sku = sku_for(card)
         present = sku in on_ebay
+        # eBay's own figure, which is what decides whether a buyer sees the
+        # variation at all -- eBay hides one with no stock from the dropdown.
+        live_qty = int(card.get("last_known_qty") or 0)
+        ours = int(card.get("quantity") or 0)
         try:
             offers = adapter.offer_ids_for(sku)
         except Exception as exc:  # noqa: BLE001
@@ -130,14 +140,56 @@ def main(argv=None):
                 missing_with_offer.append(sku)
             elif offers is not None:
                 missing_without_offer.append(sku)
+        elif offers is not None and not offers:
+            no_offer_but_present.append(sku)
+        if present and live_qty <= 0:
+            out_of_stock.append(sku)
 
-        print(f"  {sku:16} {'yes' if present else 'NO':9} {str(note):14} "
-              f"{card.get('product_name')} {card.get('card_number') or ''}")
+        wrong = (not present) or (offers is not None and not offers) or live_qty <= 0
+        rows.append((wrong, sku, present, note, live_qty, ours, card))
 
+    shown = [r for r in rows if r[0] or args.all]
+    if shown:
+        print(f"  {'SKU':16} {'in group':9} {'offer':14} {'eBay qty':9} "
+              f"{'ours':5} card")
+        print("  " + "-" * 78)
+        for _, sku, present, note, live_qty, ours, card in shown:
+            print(f"  {sku:16} {'yes' if present else 'NO':9} {str(note):14} "
+                  f"{live_qty:<9} {ours:<5} {card.get('product_name')} "
+                  f"{card.get('card_number') or ''}")
+        if not args.all:
+            print(f"  ... {len(rows) - len(shown)} more card(s) are in the "
+                  f"group, have an offer and have stock (--all to list them)")
     print()
+
+    with_stock = len(rows) - len(out_of_stock)
+    print(f"  {with_stock} of {len(rows)} variation(s) have stock at eBay.")
+    if out_of_stock and with_stock <= 1:
+        print()
+        print("  That is almost certainly what you were looking at. eBay "
+              "hides a variation")
+        print("  with no stock from the dropdown, so a listing whose "
+              "variation set is")
+        print("  complete can still show only the one card a buyer can "
+              "actually buy.")
+        print("  Nothing is missing from the listing -- the others are at "
+              "quantity zero.")
+    elif out_of_stock:
+        print(f"  {len(out_of_stock)} are at zero, so a buyer does not see "
+              f"those in the dropdown.")
+
+    if no_offer_but_present:
+        print(f"  {len(no_offer_but_present)} card(s) are in the group but "
+              f"have no offer at eBay, which is a half-built variation:")
+        for sku in no_offer_but_present[:10]:
+            print(f"    {sku}")
+        print()
+
     if not missing_with_offer and not missing_without_offer:
-        print("Every card our mirror links to this listing is in eBay's "
-              "group. Nothing to restore.")
+        print("  Every card our mirror links to this listing is in eBay's "
+              "group, so")
+        print("  the variation set is intact and there is nothing for "
+              "Refresh to restore.")
         return 0
 
     if missing_with_offer:

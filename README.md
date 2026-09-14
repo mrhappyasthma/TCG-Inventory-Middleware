@@ -759,8 +759,15 @@ depends on what eBay did with the offers of the cards it removed:
 docker compose exec tcg-middleware python scripts/inspect_listing.py 227521446958
 ```
 
-That prints, per card: whether eBay's group still holds it, and whether eBay
-still holds an offer for it.
+That prints, per card: whether eBay's group still holds it, whether eBay
+still holds an offer for it, and **eBay's quantity**. By default it lists only
+the cards with something wrong and counts the rest; `--all` prints everything.
+
+The quantity matters as much as the rest, because **eBay hides a variation
+with no stock from the dropdown**. A listing whose variation set is complete
+can therefore show only the one card a buyer can actually buy — which looks
+exactly like a listing that lost its variations, and is not one. The script
+says so explicitly when it sees that shape.
 
 * **Missing from the group, offer still there** → Refresh restores it.
 * **Missing from the group, offer gone** → Refresh is not enough on its own;
