@@ -28,6 +28,7 @@ from tcg_engine.plans import (
     build_plan,
 )
 from tcg_engine.push import (
+    is_single,
     PushError,
     inventory_group_key,
     push_plan,
@@ -143,6 +144,17 @@ class FakeEbay:
     def upsert_group(self, group_key, payload):
         self.calls.append(("upsert_group", group_key))
         self.groups[group_key] = payload
+
+    def get_group(self, group_key):
+        """
+        What eBay would report holding, which is what it last accepted.
+
+        Faithful rather than fixed, so the read-back that confirms a
+        cover photo is actually exercised. Without this the check lands
+        in its 'could not ask eBay' branch and proves nothing.
+        """
+        self.calls.append(("get_group", group_key))
+        return self.groups.get(group_key, {})
 
     def publish_group(self, group_key):
         self.calls.append(("publish_group", group_key))
@@ -1033,6 +1045,134 @@ class RefreshTests(PushTestCase):
             refresh_listing(self.db, FakeEbay(), "227511361186",
                             user_id=SHARED_SCOPE)
         self.assertIn("not managed through this API", str(caught.exception))
+
+
+class CoverVerificationTests(PushTestCase):
+    """
+    A cover photo is confirmed against eBay, not against eBay's response.
+
+    The per-variation upserts were always checked per SKU, because a bulk
+    call answers 200 with failures in the body. The **group** write -- the
+    one that actually carries imageUrls -- had its return value discarded,
+    and the count reported afterwards counts item upserts. So a group write
+    that did not take still read as success, and the log line said "N
+    variation(s) re-sent" either way.
+    """
+
+    def live_listing(self):
+        """A pushed, API-managed variation listing to refresh."""
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        push_plan(self.db, FakeEbay(), self.approved_plan(),
+                  user_id=SHARED_SCOPE)
+        return self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+
+    def test_a_cover_eBay_reports_back_is_confirmed(self):
+        listing_id = self.live_listing()
+        self.db.set_listing_cover_image(
+            listing_id, "https://cdn.example.com/cover.jpg"
+        )
+
+        result = refresh_listing(
+            self.db, FakeEbay(), listing_id, user_id=SHARED_SCOPE
+        )
+        self.assertEqual(result["cover_sent"], "https://cdn.example.com/cover.jpg")
+        self.assertIs(result["cover_verified"], True)
+        self.assertTrue(
+            any(l["level"] == "SUCCESS" for l in result["logs"]),
+            "a confirmed cover should report success",
+        )
+
+    def test_a_cover_eBay_has_not_reported_back_is_not_claimed_applied(self):
+        """
+        eBay accepts the call and still reports its old picture. Usually
+        that is propagation -- its view of a listing lags by minutes -- and
+        occasionally it is a picture eBay refused to fetch. Either way the
+        one thing this must not do is claim the cover was applied.
+        """
+        listing_id = self.live_listing()
+        self.db.set_listing_cover_image(
+            listing_id, "https://cdn.example.com/too-small.jpg"
+        )
+
+        class Ignores(FakeEbay):
+            def get_group(self, group_key):
+                # Accepted the write, kept its own picture.
+                return {"imageUrls": ["https://i.ebayimg.com/old.jpg"]}
+
+        result = refresh_listing(
+            self.db, Ignores(), listing_id, user_id=SHARED_SCOPE
+        )
+        self.assertIs(result["cover_verified"], False)
+        warnings = [l["message"] for l in result["logs"] if l["level"] == "WARN"]
+        self.assertTrue(warnings, "a cover that did not take must warn")
+        joined = " ".join(warnings)
+        self.assertIn("not reported the new cover photo back yet", joined)
+        self.assertIn("too-small.jpg", joined, "says what we sent")
+        self.assertIn("old.jpg", joined, "and what eBay holds")
+        # The refresh itself did succeed -- every variation went up -- so the
+        # summary stays a success. What must not happen is the cover being
+        # reported as confirmed when eBay has not said so.
+        self.assertNotIn(
+            "eBay confirms the cover photo",
+            " ".join(l["message"] for l in result["logs"]),
+        )
+
+    def test_a_read_back_that_fails_is_unconfirmed_not_failed(self):
+        """
+        Not being able to ask is not evidence of a failed write, and
+        reporting it as one would send somebody chasing a change that
+        landed.
+        """
+        listing_id = self.live_listing()
+        self.db.set_listing_cover_image(
+            listing_id, "https://cdn.example.com/cover.jpg"
+        )
+
+        class Unreadable(FakeEbay):
+            def get_group(self, group_key):
+                raise RuntimeError("eBay is having a moment")
+
+        result = refresh_listing(
+            self.db, Unreadable(), listing_id, user_id=SHARED_SCOPE
+        )
+        self.assertIsNone(
+            result["cover_verified"], "unknown, rather than True or False"
+        )
+        joined = " ".join(
+            l["message"] for l in result["logs"] if l["level"] == "WARN"
+        )
+        self.assertIn("unconfirmed", joined)
+
+    def test_a_single_listing_has_no_group_to_confirm(self):
+        """
+        A single is one inventory item with no group, so there is no group
+        write and nothing to read back -- which is unknown, not a failure.
+        """
+        self.db.set_listing_settings(
+            {"group_by_set": "false"}, user_id=SHARED_SCOPE
+        )
+        try:
+            self.add_card("ID1003", "Venusaur", "015/102")
+            push_plan(self.db, FakeEbay(), self.approved_plan(),
+                      user_id=SHARED_SCOPE)
+            managed = self.db.get_managed_listings()
+            single = next(
+                (m for m in managed if is_single(m["group_key"])), None
+            )
+            if single is None:
+                self.skipTest("no single listing was produced")
+            result = refresh_listing(
+                self.db, FakeEbay(), single["ebay_parent_id"],
+                user_id=SHARED_SCOPE,
+            )
+            self.assertIsNone(result["cover_verified"])
+        finally:
+            self.db.set_listing_settings(
+                {"group_by_set": "true"}, user_id=SHARED_SCOPE
+            )
 
 
 class DraftEditTests(unittest.TestCase):

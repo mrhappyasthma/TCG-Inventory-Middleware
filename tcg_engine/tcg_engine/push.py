@@ -1184,6 +1184,63 @@ def _uniform_aspects(
     return shared
 
 
+def _confirm_group_cover(
+    api: Any,
+    ebay_group_key: str,
+    cover_sent: Optional[str],
+    record: Callable[[str, str], None],
+) -> Optional[bool]:
+    """
+    Ask eBay what the group's cover now is, and say whether it took.
+
+    Returns True when eBay reports the picture we sent, False when it does
+    not *yet*, and None when the question could not be asked.
+
+    A read-back rather than the write's own response, because this project
+    has been bitten by the difference: a SKU rename returned Success and
+    changed nothing, and the bulk calls answer 200 with failures in the body.
+    What eBay reports holding is the only answer worth having.
+
+    Note the asymmetry, which is deliberate. **True is definite** -- eBay
+    reports our picture, so it took. **False is not**: this runs immediately
+    after the write and eBay's own view of a listing can lag by minutes, so a
+    mismatch is far more often propagation than rejection. It is reported as
+    unconfirmed rather than failed, because sending somebody to chase a
+    change that actually landed is worse than the silence this replaced.
+    """
+    if not cover_sent:
+        return None
+    try:
+        live = api.get_group(ebay_group_key) or {}
+    except Exception as exc:  # noqa: BLE001 - a failed check is not a failure
+        record(
+            "WARN",
+            f"Could not read the group back from eBay to confirm the cover "
+            f"photo, so it is unconfirmed rather than known good: {exc}",
+        )
+        return None
+
+    images = live.get("imageUrls") or []
+    applied = str(images[0]).strip() if images else ""
+    if applied == str(cover_sent).strip():
+        record("INFO", f"eBay confirms the cover photo: {applied}")
+        return True
+
+    record(
+        "WARN",
+        "eBay accepted the update but has not reported the new cover photo "
+        f"back yet. Sent {cover_sent}; eBay currently holds "
+        + (applied if applied else "none")
+        + ". eBay's view of a listing can lag a few minutes, so this is "
+        "usually just propagation -- open the listing again, or press "
+        "Refresh on it, to re-check. If it persists, the cause is normally a "
+        "picture eBay would not fetch: it must be at least 500 pixels on the "
+        "longest side and reachable without credentials, and "
+        "scripts/check_images.py --url <url> measures one.",
+    )
+    return False
+
+
 def _cover_for_refresh(
     db: Database,
     api: Any,
@@ -1338,6 +1395,9 @@ def refresh_listing(
 
     refreshed = len(payloads) - len(failures)
 
+    cover_sent = None
+    cover_verified = None
+
     if not single and refreshed:
         set_name, _, condition = group_key.partition("|")
         ebay_group_key = (
@@ -1345,6 +1405,10 @@ def refresh_listing(
             or inventory_group_key(group_key)
         )
         kept = [(card, sku) for card, sku in entries if sku not in failures]
+        cover_sent = _cover_for_refresh(
+            db, api, ebay_parent_id, ebay_group_key,
+            [c for c, _ in kept], settings, record,
+        )
         api.upsert_group(ebay_group_key, _group_payload(
             ebay_group_key,
             kept,
@@ -1352,15 +1416,18 @@ def refresh_listing(
                 set_name, condition=condition, template=title_template
             ),
             description=_group_description([c for c, _ in kept], single),
-            cover_image_url=_cover_for_refresh(
-                db, api, ebay_parent_id, ebay_group_key,
-                [c for c, _ in kept], settings, record,
-            ),
+            cover_image_url=cover_sent,
             aspects=_uniform_aspects([c for c, _ in kept], settings),
         ))
+        cover_verified = _confirm_group_cover(
+            api, ebay_group_key, cover_sent, record
+        )
 
+    # Only real failures downgrade the summary. An unconfirmed cover has
+    # already said so on its own line, and is usually eBay lagging.
+    level = "SUCCESS" if not failures else "WARN"
     record(
-        "SUCCESS" if not failures else "WARN",
+        level,
         f"Listing #{ebay_parent_id}: refreshed {refreshed} variation(s)"
         + (f", {len(failures)} failed" if failures else ""),
     )
@@ -1368,5 +1435,9 @@ def refresh_listing(
         "ebay_parent_id": str(ebay_parent_id),
         "refreshed": refreshed,
         "failed": len(failures),
+        # None when there was no group write to check -- a single listing, or
+        # nothing left to send. True or False only when eBay was asked.
+        "cover_sent": cover_sent,
+        "cover_verified": cover_verified,
         "logs": logs,
     }

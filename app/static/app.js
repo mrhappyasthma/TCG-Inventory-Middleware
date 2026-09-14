@@ -3049,13 +3049,46 @@ async function saveCoverPhoto(e) {
     if (!coverEditItemId) return;
 
     const url = document.getElementById("coverUrlInput").value.trim();
+
+    // Saving a cover re-sends every variation in the listing, so a 35-card
+    // set is 35 upserts plus the group -- seconds, not milliseconds. Left
+    // inert the dialog looks like the button did nothing, and a second press
+    // is a second full re-send.
+    // The same element openCoverModal() rewrites the label of, so the
+    // label captured here is whichever one it chose.
+    const button = document.getElementById("coverModalSubmit");
+    const wasLabel = button ? button.innerHTML : null;
+    if (button) {
+        button.disabled = true;
+        button.innerHTML =
+            '<span class="inline-block w-3 h-3 rounded-full border-2 '
+            + 'border-white/30 border-t-white animate-spin align-[-1px]'
+            + '"></span> Applying to eBay\u2026';
+    }
+
     try {
         const res = await fetch(`/api/ebay-listings/${encodeURIComponent(coverEditItemId)}/cover`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ cover_image_url: url })
         });
-        const data = await res.json();
+        // Not res.json(): a request that outlasts the reverse proxy comes
+        // back as an HTML error page, and parsing that would report a
+        // failure for something that very likely succeeded.
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            const id = coverEditItemId;
+            closeCoverModal();
+            logToTerminal("WARN", (
+                `The connection dropped while the cover photo for #${id} was `
+                + `being applied (a ${res.status} page came back instead of a `
+                + "result). It was saved here, and the change is probably "
+                + "still going through -- check the listing in a minute, or "
+                + "press Refresh on it."
+            ));
+            fetchEbayListings();
+            return;
+        }
         if (!res.ok) throw new Error(data.detail || "Failed to save the cover photo");
 
         const id = coverEditItemId;
@@ -3074,6 +3107,11 @@ async function saveCoverPhoto(e) {
         fetchEbayListings();
     } catch (err) {
         alert(err.message);
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = wasLabel;
+        }
     }
 }
 
