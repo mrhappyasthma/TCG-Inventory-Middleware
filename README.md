@@ -741,6 +741,37 @@ the repricer would decide, each with its reason. On the NAS:
 docker compose exec tcg-middleware python scripts/explain_price.py "Rare Candy"
 ```
 
+### Restoring a listing a partial push narrowed
+
+Writing an inventory item group is a **full replace**: a SKU absent from
+`variantSKUs` is a card taken off the live listing. A push built from a
+partial plan used to send only the cards the plan touched, so approving one
+card's quantity change could reduce a many-card listing to one card. That is
+fixed — a group update now sends every card the listing holds — but listings
+already narrowed need restoring.
+
+**Refresh** on the eBay Listings tab rebuilds the group from every card our
+mirror links to the listing, which is the remedy. But it writes the inventory
+items and the group and **never touches offers**, so whether it is sufficient
+depends on what eBay did with the offers of the cards it removed:
+
+```bash
+docker compose exec tcg-middleware python scripts/inspect_listing.py 227521446958
+```
+
+That prints, per card: whether eBay's group still holds it, and whether eBay
+still holds an offer for it.
+
+* **Missing from the group, offer still there** → Refresh restores it.
+* **Missing from the group, offer gone** → Refresh is not enough on its own;
+  the SKU returns to the group with nothing behind it and the offer has to be
+  recreated.
+
+> **Do this before running a Module B sync.** Refresh rebuilds the listing
+> from our mirror, so the mirror's memory of which cards belong to that
+> listing is what makes recovery possible. A sync reconciles the mirror
+> *towards* eBay, and eBay currently says the listing has one card.
+
 ### Finding images eBay will refuse
 
 That middle one keeps mattering, so the check outlived the migration:
