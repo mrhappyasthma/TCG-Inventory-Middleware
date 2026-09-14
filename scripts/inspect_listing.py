@@ -46,6 +46,28 @@ def sku_for(card):
     return str(card.get("custom_label") or card["manifest_id"]).strip()
 
 
+def read_offers(client, sku):
+    """Every offer eBay holds for one SKU, with its quantity and status."""
+    from ebay_client import inventory  # noqa: PLC0415
+
+    return inventory.get_offers(client.seller, sku)
+
+
+def read_item(client, sku):
+    """
+    The inventory item, which is where a variation's pictures live.
+
+    "Every variation has 0 photos" is a statement about these, not about the
+    group -- the group only says that pictures vary by the Card aspect.
+    """
+    from ebay_client import inventory  # noqa: PLC0415
+
+    getter = getattr(inventory, "get_inventory_item", None)
+    if not callable(getter):
+        return None
+    return getter(client.seller, sku)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
@@ -118,6 +140,7 @@ def main(argv=None):
     missing_without_offer = []
     no_offer_but_present = []
     out_of_stock = []
+    no_photos = []
     rows = []
 
     for card in cards:
@@ -125,15 +148,36 @@ def main(argv=None):
         present = sku in on_ebay
         # eBay's own figure, which is what decides whether a buyer sees the
         # variation at all -- eBay hides one with no stock from the dropdown.
-        live_qty = int(card.get("last_known_qty") or 0)
         ours = int(card.get("quantity") or 0)
+        # eBay's own figures, read now. Our mirror's last_known_qty is the
+        # one number that cannot be trusted here: the push never updated it
+        # for the cards it did not touch, so it still believes they hold
+        # stock.
+        live_qty = None
+        item_photos = None
         try:
-            offers = adapter.offer_ids_for(sku)
+            offers = read_offers(client, sku)
         except Exception as exc:  # noqa: BLE001
             offers = None
             note = f"unknown ({exc})"
         else:
-            note = offers[0] if offers else "none"
+            if offers:
+                offer = offers[0]
+                note = str(offer.get("offerId") or "?")
+                raw = offer.get("availableQuantity")
+                live_qty = int(raw) if raw is not None else None
+                if str(offer.get("status") or "").upper() != "PUBLISHED":
+                    note += " (" + str(offer.get("status") or "?").lower() + ")"
+            else:
+                note = "none"
+        try:
+            item = read_item(client, sku)
+        except Exception:  # noqa: BLE001 - the picture count is advisory
+            item_photos = None
+        else:
+            item_photos = len(
+                ((item or {}).get("product") or {}).get("imageUrls") or []
+            )
 
         if not present:
             if offers:
@@ -142,20 +186,31 @@ def main(argv=None):
                 missing_without_offer.append(sku)
         elif offers is not None and not offers:
             no_offer_but_present.append(sku)
-        if present and live_qty <= 0:
+        if present and live_qty is not None and live_qty <= 0:
             out_of_stock.append(sku)
+        if present and item_photos == 0:
+            no_photos.append(sku)
 
-        wrong = (not present) or (offers is not None and not offers) or live_qty <= 0
-        rows.append((wrong, sku, present, note, live_qty, ours, card))
+        wrong = (
+            (not present)
+            or (offers is not None and not offers)
+            or (live_qty is not None and live_qty <= 0)
+            or item_photos == 0
+        )
+        rows.append(
+            (wrong, sku, present, note, live_qty, ours, item_photos, card)
+        )
 
     shown = [r for r in rows if r[0] or args.all]
     if shown:
-        print(f"  {'SKU':16} {'in group':9} {'offer':14} {'eBay qty':9} "
-              f"{'ours':5} card")
-        print("  " + "-" * 78)
-        for _, sku, present, note, live_qty, ours, card in shown:
-            print(f"  {sku:16} {'yes' if present else 'NO':9} {str(note):14} "
-                  f"{live_qty:<9} {ours:<5} {card.get('product_name')} "
+        print(f"  {'SKU':16} {'in group':9} {'offer':22} {'eBay qty':9} "
+              f"{'ours':5} {'pics':5} card")
+        print("  " + "-" * 92)
+        for _, sku, present, note, live_qty, ours, pics, card in shown:
+            qty = "?" if live_qty is None else str(live_qty)
+            pic = "?" if pics is None else str(pics)
+            print(f"  {sku:16} {'yes' if present else 'NO':9} {str(note):22} "
+                  f"{qty:<9} {ours:<5} {pic:<5} {card.get('product_name')} "
                   f"{card.get('card_number') or ''}")
         if not args.all:
             print(f"  ... {len(rows) - len(shown)} more card(s) are in the "
@@ -164,16 +219,34 @@ def main(argv=None):
 
     with_stock = len(rows) - len(out_of_stock)
     print(f"  {with_stock} of {len(rows)} variation(s) have stock at eBay.")
+    if no_photos:
+        print(f"  {len(no_photos)} of {len(rows)} have no picture on their "
+              f"inventory item.")
+    print()
+
     if out_of_stock and with_stock <= 1:
+        print("  The variation set is intact; what is missing is the stock. "
+              "eBay hides a")
+        print("  variation with no quantity from the dropdown, so this looks "
+              "like a listing")
+        print("  that lost its variations and is not one.")
         print()
-        print("  That is almost certainly what you were looking at. eBay "
-              "hides a variation")
-        print("  with no stock from the dropdown, so a listing whose "
-              "variation set is")
-        print("  complete can still show only the one card a buyer can "
-              "actually buy.")
-        print("  Nothing is missing from the listing -- the others are at "
-              "quantity zero.")
+        print("  Quantity lives on the **offer**, and Refresh writes the "
+              "inventory items and")
+        print("  the group and never touches offers -- so Refresh alone "
+              "cannot restore it.")
+        print("  Say so and the repair can be taught to re-send quantities "
+              "from the")
+        print("  catalogue; it is a write to live stock, so it is not being "
+              "guessed at here.")
+        print()
+        print("  Note our own mirror still believes these hold stock, since "
+              "the push never")
+        print("  updated it for cards it did not touch. A Module B sync "
+              "would correct that")
+        print("  -- and would also be the moment the mirror stops being able "
+              "to tell you what")
+        print("  the quantities should be. Read the 'ours' column first.")
     elif out_of_stock:
         print(f"  {len(out_of_stock)} are at zero, so a buyer does not see "
               f"those in the dropdown.")
@@ -186,10 +259,16 @@ def main(argv=None):
         print()
 
     if not missing_with_offer and not missing_without_offer:
-        print("  Every card our mirror links to this listing is in eBay's "
-              "group, so")
-        print("  the variation set is intact and there is nothing for "
-              "Refresh to restore.")
+        # The variation set being intact is not the same as the listing
+        # being well: the stock and the pictures are separate facts, and
+        # saying 'nothing to restore' over the top of them would be the
+        # same false reassurance the success log gave.
+        if out_of_stock or no_photos:
+            print("  The variation set itself needs nothing from Refresh -- every card")
+            print("  our mirror links to this listing is already in eBay's group.")
+            return 0
+        print("  Every card is in the group, has a live offer, has stock and has a")
+        print("  picture. Nothing to restore.")
         return 0
 
     if missing_with_offer:
