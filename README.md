@@ -702,16 +702,17 @@ that happens:
 * **The two genuinely differ**, because the card was priced at a market level
   that has since moved, or its price was set before a rules change.
 
-There is a third cause, and it is a **defect rather than a design choice**:
-the repricer records the price it applied against the *variation*
-(`ebay_variations.last_known_price`) and never writes it back to the card
-(`manifest.price`). So after the repricer moves a live price, the catalogue
-still holds the pre-repricer number, the two disagree, and **every draft
-rebuild proposes putting the old price back** — for as long as the
-disagreement stands. That is the usual reason a card keeps reappearing with a
-price change nobody asked for.
+There *was* a third cause, now fixed: the repricer recorded the price it
+applied against the variation (`ebay_variations.last_known_price`) and never
+wrote it back to the card (`manifest.price`). So after it moved a live price
+the catalogue kept the pre-repricer number, the two disagreed, and every
+draft rebuild proposed putting the old price back — for as long as the
+disagreement stood. An applied price now reaches both, so a repricing leaves
+no draft entry behind.
 
-To settle it for a card, accepting eBay's figure as yours:
+Cards repriced **before** that fix still carry the divergence and will keep
+appearing until it is settled. To settle one, accepting eBay's figure as
+yours:
 
 ```bash
 python scripts/accept_ebay_price.py "Risky Ruins" "Rare Candy"        # dry run

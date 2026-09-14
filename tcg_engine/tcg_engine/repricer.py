@@ -656,6 +656,19 @@ def run_reprice(
                 db.set_variation_known_price(
                     decision["manifest_id"], decision["target_price"]
                 )
+                # And the catalogue's own figure, which is the price we say
+                # we want. Both halves of one fact: leaving the card behind
+                # meant a draft plan -- which proposes a price whenever the
+                # two disagree -- offered to undo this change on every
+                # rebuild, for good. A raise to $2.49 showed up the next day
+                # as a draft proposing $2.49 -> $1.99.
+                #
+                # Not a side effect on the quantity: a price is not a
+                # quantity, and nothing about a pending stock change is
+                # touched here.
+                db.set_manifest_price(
+                    decision["manifest_id"], decision["target_price"]
+                )
                 applied += 1
                 was_applied = True
 

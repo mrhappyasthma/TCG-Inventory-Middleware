@@ -21,6 +21,9 @@ import unittest
 from datetime import timedelta
 
 from tcg_engine.db import Database, SHARED_SCOPE
+# The comparison a draft plan makes, so the test tracks the real
+# rule rather than a copy of it.
+from tcg_engine.plans import PRICE_EPSILON, desired_price
 from tcg_engine.repricer import (
     CAP_MINIMUM_CARDS,
     VERDICT_DROP,
@@ -438,6 +441,122 @@ class RunTests(unittest.TestCase):
         config = plan_reprice(self.db)["config"]
         self.assertEqual(config["hold_days"], 14.0)
         self.assertEqual(config["cap_fraction"], 0.25)
+
+
+class RepriceLeavesNoDraftBehindTests(unittest.TestCase):
+    """
+    A price the repricer applied must not come back as a draft proposing to
+    undo it.
+
+    This is the bug the class is named after. The repricer wrote only
+    ebay_variations.last_known_price -- eBay's side -- and a draft plan
+    proposes a price whenever that disagrees with manifest.price. So every
+    successful repricing left a permanent draft entry offering the old price
+    back, on every rebuild. Seen in the wild: Bayleef raised to $2.49 on
+    eBay, still $1.99 in the catalogue, draft proposing $2.49 -> $1.99.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "reprice.db"))
+        self.db.set_pricing_rules(
+            [dict(t, sort_order=i) for i, t in enumerate(TIERS)],
+            user_id=SHARED_SCOPE,
+        )
+        self.db.set_listing_settings(
+            {"auto_reprice_enabled": "true"}, user_id=SHARED_SCOPE
+        )
+        # Market at 0.90 puts the tiered rules well clear of the $1.99 tier,
+        # so the verdict is an unambiguous raise.
+        self.db.insert_manifest(
+            "ID1400", "Bayleef", "Mega Evolution", "Near Mint", "Normal",
+            card_number="009/132", market_price=0.90, price=1.99,
+        )
+        self.db.set_manifest_quantity("ID1400", 3)
+        self.db.upsert_variation(
+            "ID1400", "22751", 3, custom_label="ID1400", last_known_price=1.99
+        )
+        # Without an offer id the Inventory API cannot see the listing, so
+        # the repricer deliberately skips it.
+        self.db.set_variation_offer("ID1400", "9001")
+        self.db.upsert_managed_listing(
+            "Mega Evolution|Near Mint",
+            inventory_item_group_key="mega-evolution-nm",
+            ebay_parent_id="22751",
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def draft_would_propose_price(self):
+        """The comparison a plan makes, so this tracks the real rule."""
+        card = self.db.get_manifest_by_id("ID1400")
+        known = self.db.get_variation("ID1400")["last_known_price"]
+        proposed = desired_price(card)
+        if proposed is None or known is None:
+            return True
+        return abs(float(proposed) - float(known)) > PRICE_EPSILON
+
+    def test_an_applied_raise_reaches_the_card_as_well_as_ebay(self):
+        api = FakeEbay()
+        result = run_reprice(self.db, api, user_id=SHARED_SCOPE)
+        self.assertEqual(result["applied"], 1, result.get("logs"))
+
+        variation = self.db.get_variation("ID1400")
+        card = self.db.get_manifest_by_id("ID1400")
+        self.assertGreater(float(variation["last_known_price"]), 1.99)
+        self.assertEqual(
+            float(card["price"]), float(variation["last_known_price"]),
+            "the card must hold the price eBay was given, or a draft "
+            "proposes undoing it",
+        )
+        self.assertFalse(
+            self.draft_would_propose_price(),
+            "a repricing must not leave a draft entry behind",
+        )
+
+    def test_a_refused_change_leaves_both_sides_alone(self):
+        """
+        Only what eBay accepted is recorded. A card the bulk call rejected
+        keeps both its old prices, so the next run tries again rather than
+        believing a change that never happened.
+        """
+        run_reprice(
+            self.db,
+            FakeEbay(refuse={"ID1400": "eBay said no"}),
+            user_id=SHARED_SCOPE,
+        )
+        self.assertEqual(
+            float(self.db.get_manifest_by_id("ID1400")["price"]), 1.99
+        )
+        self.assertEqual(
+            float(self.db.get_variation("ID1400")["last_known_price"]), 1.99
+        )
+
+    def test_a_held_fall_changes_neither_price(self):
+        """
+        A hold is the absence of a change, so nothing may be written to
+        either side -- that is what lets the window be re-evaluated
+        tomorrow.
+        """
+        # Market well below the listed price, so the verdict is a fall and
+        # the hold window starts rather than the price moving.
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE manifest SET market_price = 0.05, price = 2.49 "
+                "WHERE manifest_id = 'ID1400'"
+            )
+            conn.commit()
+        self.db.set_variation_known_price("ID1400", 2.49)
+
+        run_reprice(self.db, FakeEbay(), user_id=SHARED_SCOPE)
+        self.assertEqual(
+            float(self.db.get_manifest_by_id("ID1400")["price"]), 2.49
+        )
+        self.assertEqual(
+            float(self.db.get_variation("ID1400")["last_known_price"]), 2.49
+        )
+
 
 
 if __name__ == "__main__":
