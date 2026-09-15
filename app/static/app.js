@@ -1139,6 +1139,11 @@ async function saveListingSettings(e) {
             `Updated Listing Rules: Single Threshold = $${parseFloat(threshold).toFixed(2)}, ` +
             `Set Grouping = ${groupBySet ? "on" : "off"}, Title Template saved.`
         );
+        // The account cover was stored but could not be measured. Not a
+        // failure, so the save stands -- but it is the cover every new
+        // listing falls back to, so silence here would be the wrong kind of
+        // quiet.
+        if (data.picture_note) logToTerminal("WARN", data.picture_note);
     } catch (err) {
         alert(err.message);
     }

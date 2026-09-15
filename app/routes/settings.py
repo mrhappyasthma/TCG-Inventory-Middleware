@@ -16,14 +16,16 @@ defaults back as overrides -- which would freeze them.
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from tcg_engine.batches import generate_variation_title
 
 try:
+    from app import deps
     from app.deps import inventory_for, require_active_user
 except ImportError:
+    from . import deps
     from .deps import inventory_for, require_active_user
 
 router = APIRouter()
@@ -65,11 +67,32 @@ def update_listing_settings_endpoint(
     eBay account, so they cannot sensibly be shared.
     """
     inv = inventory_for(user)
+
+    # The account cover is the fallback cover for every listing that has no
+    # staged one of its own (push.py reads it as ``account_cover``), so an
+    # undersized image here is worse than one on a single listing: it goes
+    # onto all of them, and eBay re-checks every picture on a listing
+    # whenever anything about it changes, which blocks later price and
+    # quantity updates. A 169x360 cover did exactly that to one listing until
+    # it was replaced.
+    #
+    # Only checked when this request actually carries the field: this endpoint
+    # also saves policy ids and templates, and those must not pay for a
+    # network fetch.
+    picture_note = ""
+    cover = str(req.settings.get("cover_image_url") or "").strip()
+    if cover:
+        verdict = deps.check_picture(cover)
+        if verdict["ok"] is False:
+            raise HTTPException(status_code=400, detail=verdict["reason"])
+        picture_note = verdict["reason"] if verdict["ok"] is not True else ""
+
     inv.set_listing_settings(req.settings, user_id=user["id"])
     return {
         "success": True,
         "settings": inv.get_listing_settings(user_id=user["id"]),
         "own_keys": inv.get_own_listing_setting_keys(user["id"]),
+        "picture_note": picture_note,
     }
 
 @router.post("/api/listing-settings/reset")

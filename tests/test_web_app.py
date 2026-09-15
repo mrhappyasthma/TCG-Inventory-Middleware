@@ -1198,6 +1198,55 @@ class TestWebApp(unittest.TestCase):
             deps._ebay_clients.update(saved_client)
             ebay_routes.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
 
+    def test_39w_an_undersized_account_wide_cover_is_refused(self):
+        """
+        The account cover is the fallback for every listing without its own.
+
+        push.py reads it as ``account_cover`` and hands it to every group that
+        has no staged cover, so one undersized image here reaches all of them
+        -- and because eBay re-checks every picture on a listing whenever
+        anything changes, it would block price and quantity updates across
+        the whole store rather than on one listing.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        # The PNG signature and an IHDR stating 169x360, the size of the
+        # picture that actually caused this. Built from integers because
+        # the signature's bytes do not survive being written as escapes.
+        small = (bytes([137, 80, 78, 71, 13, 10, 26, 10])
+                 + (13).to_bytes(4, "big") + b"IHDR"
+                 + (169).to_bytes(4, "big") + (360).to_bytes(4, "big"))
+        with mock.patch("ebay_client.pictures._fetch_header",
+                        return_value=small):
+            res = self.client.post(
+                "/api/listing-settings",
+                json={"settings": {
+                    "cover_image_url": "https://cdn.example.com/tiny.png"
+                }},
+            )
+        self.assertEqual(res.status_code, 400, res.text)
+        self.assertIn("169x360", res.json()["detail"])
+
+        # And it was not stored, or every later push would send it anyway.
+        settings = self.client.get("/api/listing-settings").json()["settings"]
+        self.assertNotEqual(
+            settings.get("cover_image_url"),
+            "https://cdn.example.com/tiny.png",
+        )
+
+    def test_39v_saving_other_settings_does_not_fetch_any_picture(self):
+        """
+        This endpoint saves templates and policy ids too, and those must not
+        pay for a network fetch. The push-setup panel posts only policy ids.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        with mock.patch("ebay_client.pictures._fetch_header") as fetch:
+            res = self.client.post(
+                "/api/listing-settings",
+                json={"settings": {"shipping_policy_id": "6000123456"}},
+            )
+        self.assertEqual(res.status_code, 200, res.text)
+        fetch.assert_not_called()
+
     def test_39z_a_cover_photo_too_small_for_ebay_is_refused_on_the_draft(self):
         """
         Measured when it is chosen, not when eBay refuses it.
