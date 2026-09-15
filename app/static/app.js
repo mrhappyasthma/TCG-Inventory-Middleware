@@ -3933,7 +3933,7 @@ function policySelect(id, entries, selected, configuredName) {
     return `<select id="${id}" class="w-full mt-1 bg-dark-900 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200">${options.join("")}</select>${hint}`;
 }
 
-function renderEbayPushSetup(data) {
+function renderEbayPushSetup(data, savedNote) {
     const box = document.getElementById("ebayPushSetupBox");
     if (!box) return;
     const current = data.current || {};
@@ -3968,9 +3968,33 @@ function renderEbayPushSetup(data) {
             ${policySelect("ebayPaymentPolicy", data.policies.payment, pick("payment", "payment_policy_id"), names.payment)}
         </label>
         ${locationBlock}
-        <button type="button" onclick="saveEbayPushSetup()" class="mt-2 text-[11px] font-bold px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 border border-brand-500 text-white transition-all">
+        <button type="button" id="btnEbaySaveSetup" onclick="saveEbayPushSetup()" class="mt-2 text-[11px] font-bold px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 border border-brand-500 text-white transition-all">
             Save for pushing
-        </button>`;
+        </button>
+        ${savedNote ? `<p class="text-emerald-400">${escapeHtml(savedNote)}</p>` : ""}
+        ${storedPolicySummary(current)}`;
+}
+
+// What is actually stored, spelled out. The ids are the whole point of this
+// panel and they appeared nowhere except as the selected option in a
+// dropdown -- so a save that worked looked identical to one that had not,
+// which is how "Save for pushing is not working" came to be reported about a
+// save that was working.
+function storedPolicySummary(current) {
+    const rows = [
+        ["Shipping", current.shipping_policy_id],
+        ["Return", current.return_policy_id],
+        ["Payment", current.payment_policy_id],
+        ["Location", current.merchant_location_key],
+    ];
+    if (!rows.some(([, value]) => value)) {
+        return `<p class="text-amber-300">Nothing stored yet &mdash; pick each policy above and press Save for pushing.</p>`;
+    }
+    return `<div class="mt-1 pt-1 border-t border-slate-800">
+        <p class="text-slate-500">Stored for pushing:</p>
+        ${rows.map(([label, value]) => `<p class="text-slate-400">${label}
+            <span class="font-mono ${value ? "text-slate-300" : "text-amber-300"}">${escapeHtml(value || "not set")}</span></p>`).join("")}
+    </div>`;
 }
 
 async function createEbayInventoryLocation() {
@@ -3998,6 +4022,9 @@ async function saveEbayPushSetup() {
     };
     const location = document.getElementById("ebayLocationSelect");
     if (location) settings.merchant_location_key = location.value;
+    const button = document.getElementById("btnEbaySaveSetup");
+    const label = button ? button.textContent : "Save for pushing";
+    if (button) { button.disabled = true; button.textContent = "Saving…"; }
     try {
         const res = await fetch("/api/listing-settings", {
             method: "POST",
@@ -4007,9 +4034,30 @@ async function saveEbayPushSetup() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Could not save");
         logToTerminal("SUCCESS", "eBay push settings saved");
+
+        // Re-rendered from what the server says it stored, not from the copy
+        // this page fetched before the save. Reusing the cached policy lists
+        // keeps this free: the dropdowns' contents came from eBay and have
+        // not changed, only which option is selected has.
+        const saved = data.settings || {};
+        if (ebayPushSetup) {
+            ebayPushSetup = {
+                ...ebayPushSetup,
+                current: {
+                    shipping_policy_id: saved.shipping_policy_id || "",
+                    return_policy_id: saved.return_policy_id || "",
+                    payment_policy_id: saved.payment_policy_id || "",
+                    merchant_location_key: saved.merchant_location_key || "",
+                },
+            };
+            renderEbayPushSetup(ebayPushSetup, "Saved. New pushes will use these.");
+        }
         if (typeof loadListingSettings === "function") loadListingSettings();
     } catch (err) {
         logToTerminal("ERROR", `Save failed: ${err.message}`);
+    } finally {
+        const again = document.getElementById("btnEbaySaveSetup");
+        if (again) { again.disabled = false; again.textContent = label; }
     }
 }
 
