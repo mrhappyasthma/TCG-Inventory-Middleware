@@ -27,6 +27,8 @@ happens in the layer above, which is what keeps this testable with no network
 and no database.
 """
 
+import json
+
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from .errors import ApiError
@@ -108,11 +110,11 @@ def bulk_create_or_replace_inventory_item(
         )
     for entry in items:
         validate_sku(entry.get("sku", ""))
-    payload = {"requests": list(items)}
-    response = transport.post(
-        f"{INVENTORY_BASE}/bulk_create_or_replace_inventory_item", payload
-    ) or {}
-    return bulk_statuses(response)
+    return _bulk_post(
+        transport,
+        f"{INVENTORY_BASE}/bulk_create_or_replace_inventory_item",
+        items,
+    )
 
 
 # -- offers --------------------------------------------------------------
@@ -161,10 +163,9 @@ def bulk_create_offer(
         )
     for entry in offers:
         validate_sku(entry.get("sku", ""))
-    response = transport.post(
-        f"{INVENTORY_BASE}/bulk_create_offer", {"requests": list(offers)}
-    ) or {}
-    return bulk_statuses(response)
+    return _bulk_post(
+        transport, f"{INVENTORY_BASE}/bulk_create_offer", offers
+    )
 
 
 def update_offer(transport, offer_id: str, payload: Dict[str, Any]) -> None:
@@ -330,10 +331,9 @@ def bulk_update_price_quantity(
             f"{len(requests)} updates exceeds eBay's limit of "
             f"{BULK_PRICE_QUANTITY_LIMIT} per call; use chunked()"
         )
-    response = transport.post(
-        f"{INVENTORY_BASE}/bulk_update_price_quantity", {"requests": list(requests)}
-    ) or {}
-    return bulk_statuses(response)
+    return _bulk_post(
+        transport, f"{INVENTORY_BASE}/bulk_update_price_quantity", requests
+    )
 
 
 def price_quantity_request(
@@ -373,6 +373,73 @@ def price_quantity_request(
 
 
 # -- reading the per-record outcome of a bulk call -----------------------
+
+
+def _bulk_post(transport, path: str, records: Sequence[Dict[str, Any]]):
+    """
+    Send one bulk request and return its per-record rows.
+
+    The subtlety this exists for. A bulk endpoint reports **per record**, and
+    its HTTP status reflects the worst record in the batch -- so a batch of 25
+    where one SKU is bad comes back 400, with a body saying 400 for that one
+    SKU and 200 for the other 24. eBay applied those 24. The transport raises
+    on any non-2xx, which turned that partial success into a total failure and
+    threw the body away.
+
+    What that cost, concretely: a repricing run hit
+    ``errorId 25002 ... does not meet eBay's Picture Policy requirements`` on
+    one card, the exception unwound the whole run, and the prices eBay had
+    already accepted in earlier batches were never written down -- because the
+    caller records its results after the loop. eBay held the new prices and we
+    held the old ones, so every following draft proposed undoing them.
+
+    So a refusal that carries per-record rows is returned as rows, exactly as
+    a 200 would be. The caller's existing per-SKU failure handling then does
+    the right thing with it, which is what it was written for. A refusal with
+    no usable rows -- an auth failure, a 500, an HTML gateway page -- still
+    raises, because that is a whole-batch failure and nothing is known about
+    any record in it.
+    """
+    try:
+        response = transport.post(path, {"requests": list(records)}) or {}
+    except ApiError as exc:
+        rows = _rows_from_refusal(exc, records)
+        if rows:
+            return rows
+        raise
+    return bulk_statuses(response)
+
+
+def _rows_from_refusal(
+    exc: ApiError, records: Sequence[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Per-record rows out of a refusal's body, or [] if it has none.
+
+    Conservative on purpose. The rows are only trusted when they name SKUs
+    that were actually sent: a body shaped like something else must not be
+    read as "every record succeeded", which is the one mistake here that
+    would silently lose a card.
+    """
+    body = getattr(exc, "body", "") or ""
+    if not body:
+        return []
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    rows = bulk_statuses(payload)
+    if not rows:
+        return []
+    sent = {str(r.get("sku") or "") for r in records}
+    sent.discard("")
+    named = {str(row.get("sku") or "") for row in rows}
+    named.discard("")
+    if not named or not (named & sent):
+        return []
+    return rows
 
 
 def bulk_statuses(response: Dict[str, Any]) -> List[Dict[str, Any]]:

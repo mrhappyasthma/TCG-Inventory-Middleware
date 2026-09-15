@@ -1072,7 +1072,16 @@ def _apply_price_quantity(
 
     failed: Dict[str, str] = {}
     for start in range(0, len(requests), BULK_LIMIT):
-        rows = api.update_price_quantity(requests[start:start + BULK_LIMIT])
+        batch = requests[start:start + BULK_LIMIT]
+        # As in the repricer: a whole-batch failure marks its own cards failed
+        # and lets the other batches stand, rather than unwinding the push and
+        # leaving the cards eBay already accepted unrecorded.
+        try:
+            rows = api.update_price_quantity(batch)
+        except Exception as exc:  # noqa: BLE001 - attributed per card below
+            for entry in batch:
+                failed[str(entry.get("sku") or "")] = str(exc)
+            continue
         for sku, message in api.failures(rows):
             failed[sku] = message
 

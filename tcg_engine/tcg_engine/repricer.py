@@ -633,7 +633,30 @@ def run_reprice(
             )
         requests = _price_requests(changes)
         for start in range(0, len(requests), BULK_LIMIT):
-            rows = api.update_price_quantity(requests[start:start + BULK_LIMIT])
+            batch = requests[start:start + BULK_LIMIT]
+            # One batch failing outright must not cost the batches that
+            # already succeeded. Everything below this loop is what writes
+            # an accepted price into our own records, so an exception
+            # escaping here left eBay holding new prices and us holding old
+            # ones -- and a draft plan proposes a price whenever those two
+            # disagree, so every later rebuild offered to undo the change.
+            #
+            # A refusal that names individual SKUs does not reach this:
+            # bulk calls return those as per-SKU rows. This is for the
+            # whole-batch failures -- a 500, a dropped connection -- where
+            # nothing is known about any card in the batch, so every card in
+            # it is recorded as not applied. Claiming otherwise in either
+            # direction is what causes the divergence.
+            try:
+                rows = api.update_price_quantity(batch)
+            except Exception as exc:  # noqa: BLE001 - reported per card
+                for entry in batch:
+                    failed[str(entry.get("sku") or "")] = str(exc)
+                record("ERROR", (
+                    f"eBay refused a batch of {len(batch)} price change(s), "
+                    f"so none of them were applied: {exc}"
+                ))
+                continue
             for sku, message in api.failures(rows):
                 failed[sku] = message
 

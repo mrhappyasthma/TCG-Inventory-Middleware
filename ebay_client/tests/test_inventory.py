@@ -291,3 +291,116 @@ class OfferListingIdTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def refused(status, payload):
+    """A non-2xx whose body still carries per-record results."""
+    return Response(status, {"content-type": "application/json"},
+                    json.dumps(payload).encode("utf-8"))
+
+
+class PartialRefusalTests(unittest.TestCase):
+    """
+    A bulk call's HTTP status reflects its worst record, not the batch.
+
+    So 25 price updates where one SKU has an undersized picture come back
+    400, with a body saying 400 for that SKU and 200 for the other 24 --
+    which eBay applied. Raising on the status turned that partial success
+    into a total failure and discarded the body, and the real cost was not
+    the lost error message: the caller records accepted prices *after* its
+    batch loop, so the exception meant eBay held new prices and the mirror
+    held old ones. Every draft afterwards proposed undoing them.
+    """
+
+    def real_picture_policy_refusal(self):
+        """The body eBay actually sent, trimmed to what is read here."""
+        return {"responses": [
+            {"statusCode": 200, "sku": "ID1439", "offerId": "263166596010"},
+            {"statusCode": 400, "sku": "ID1440", "offerId": "263166596011",
+             "errors": [{
+                 "errorId": 25002,
+                 "domain": "API_INVENTORY",
+                 "message": (
+                     "A user error has occurred. The resolution for provided "
+                     "picture(s) does not meet eBay's Picture Policy "
+                     "requirements. Please only use pictures that are at "
+                     "least 500 pixels on the longest side."
+                 ),
+             }]},
+            {"statusCode": 200, "sku": "ID1447", "offerId": "263166596012"},
+        ]}
+
+    def test_a_400_carrying_per_sku_rows_is_returned_not_raised(self):
+        transport, _ = transport_with(
+            refused(400, self.real_picture_policy_refusal())
+        )
+        rows = inventory.bulk_update_price_quantity(transport, [
+            {"sku": "ID1439"}, {"sku": "ID1440"}, {"sku": "ID1447"},
+        ])
+        self.assertEqual(len(rows), 3)
+        failed = [r["sku"] for r in rows if inventory.status_failed(r)]
+        self.assertEqual(
+            failed, ["ID1440"],
+            "only the card eBay refused should be a failure",
+        )
+
+    def test_the_cards_ebay_accepted_are_not_reported_as_failures(self):
+        transport, _ = transport_with(
+            refused(400, self.real_picture_policy_refusal())
+        )
+        rows = inventory.bulk_update_price_quantity(transport, [
+            {"sku": "ID1439"}, {"sku": "ID1440"}, {"sku": "ID1447"},
+        ])
+        accepted = [r["sku"] for r in rows if not inventory.status_failed(r)]
+        self.assertEqual(sorted(accepted), ["ID1439", "ID1447"])
+
+    def test_the_same_applies_to_bulk_item_upserts(self):
+        transport, _ = transport_with(refused(400, {"responses": [
+            {"statusCode": 200, "sku": "ID1001"},
+            {"statusCode": 400, "sku": "ID1002",
+             "errors": [{"errorId": 25002, "message": "picture too small"}]},
+        ]}))
+        rows = inventory.bulk_create_or_replace_inventory_item(transport, [
+            {"sku": "ID1001", "locale": "en_US"},
+            {"sku": "ID1002", "locale": "en_US"},
+        ])
+        self.assertEqual(
+            [r["sku"] for r in rows if inventory.status_failed(r)], ["ID1002"]
+        )
+
+    def test_a_refusal_with_no_usable_rows_still_raises(self):
+        """
+        A whole-batch failure is not a partial one. Nothing is known about
+        any record in it, so it must not be turned into "all succeeded".
+        """
+        transport, _ = transport_with(refused(400, {
+            "errors": [{"errorId": 25001, "message": "System error"}]
+        }))
+        with self.assertRaises(ApiError):
+            inventory.bulk_update_price_quantity(
+                transport, [{"sku": "ID1001"}]
+            )
+
+    def test_a_body_that_is_not_json_still_raises(self):
+        """An HTML error page carries no per-record verdict to salvage."""
+        transport, _ = transport_with(Response(
+            400, {"content-type": "text/html"}, b"<!DOCTYPE html><h1>400</h1>"
+        ))
+        with self.assertRaises(ApiError):
+            inventory.bulk_update_price_quantity(
+                transport, [{"sku": "ID1001"}]
+            )
+
+    def test_rows_naming_none_of_the_sent_skus_are_not_trusted(self):
+        """
+        A body shaped like a bulk response but about something else must not
+        be read as a verdict on this batch -- the failure mode that would
+        silently mark a refused card as applied.
+        """
+        transport, _ = transport_with(refused(400, {"responses": [
+            {"statusCode": 200, "sku": "SOMETHING-ELSE"},
+        ]}))
+        with self.assertRaises(ApiError):
+            inventory.bulk_update_price_quantity(
+                transport, [{"sku": "ID1001"}]
+            )
