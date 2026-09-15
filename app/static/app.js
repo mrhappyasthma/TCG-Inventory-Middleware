@@ -2968,8 +2968,13 @@ async function refreshListingContents(itemId, button) {
         }
         if (!res.ok) throw new Error(data.detail || "Could not refresh the listing");
         (data.logs || []).forEach(e => logToTerminal(e.level, e.message));
-        logToTerminal(data.failed ? "WARN" : "SUCCESS",
-            `Listing #${itemId}: ${data.refreshed} variation(s) refreshed`);
+        const trouble = data.failed || data.republished === false
+            || (data.logs || []).some(e => e.level === "ERROR");
+        logToTerminal(trouble ? "WARN" : "SUCCESS",
+            `Listing #${itemId}: ${data.refreshed} variation(s) refreshed`
+            // What eBay was asked and answered. Not a claim about what a
+            // buyer can see, which nothing here has read back.
+            + (data.republished ? ", and eBay accepted the publish" : ""));
     } catch (err) {
         logToTerminal("ERROR", `Refresh failed: ${err.message}`);
     } finally {
@@ -3097,7 +3102,10 @@ async function saveCoverPhoto(e) {
         // The endpoint applies it when it can and says why when it cannot.
         if (data.applied) {
             logToTerminal("SUCCESS",
-                `Cover photo applied to eBay #${id} (${data.refreshed} variation(s) re-sent).`);
+                `Cover photo applied to eBay #${id} (${data.refreshed} variation(s) re-sent).`
+                + (data.republished === false
+                    ? " eBay would not put the listing back on sale, though -- see the log above."
+                    : ""));
         } else {
             logToTerminal("SUCCESS", `Cover photo recorded for eBay #${id}.`);
             logToTerminal("WARN", data.reason

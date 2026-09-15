@@ -183,6 +183,11 @@ async def set_listing_cover(
         "cover_image_url": saved,
         "applied": True,
         "refreshed": result.get("refreshed", 0),
+        # The refresh underneath this also publishes the group, and it can be
+        # refused. Passed through so the page can say so rather than
+        # reporting the cover as applied to a listing left off sale.
+        "republished": result.get("republished"),
+        "logs": result.get("logs", []),
     }
 
 @router.post("/api/ebay-listings/{item_id}/refresh")

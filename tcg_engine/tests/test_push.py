@@ -20,6 +20,7 @@ import unittest
 
 from tcg_engine.db import Database, SHARED_SCOPE
 from tcg_engine.plans import (
+    ACTION_END,
     ACTION_REMOVE,
     ACTION_UPDATE,
     STATUS_DEFERRED,
@@ -65,6 +66,9 @@ class FakeEbay:
         self.items = {}
         self.offers = {}
         self.groups = {}
+        # group key -> the listing id it was published at, so republishing
+        # returns the same id the way eBay does.
+        self.group_listings = {}
         self.withdrawn = []
         self.next_offer = 1000
         self.next_listing = 220000
@@ -158,9 +162,22 @@ class FakeEbay:
         return self.groups.get(group_key, {})
 
     def publish_group(self, group_key):
+        """
+        Publish a group, returning the listing id it lives at.
+
+        Republishing is not a new listing: eBay returns the *same* id,
+        because the group is already associated with it. This was observed
+        directly when a 123-card listing whose offers had all been ended was
+        republished and came back as the id it already had. A fake that
+        invented a fresh id each time would have made a second listing look
+        like the normal outcome, and the code that checks for exactly that
+        would have looked broken.
+        """
         self.calls.append(("publish_group", group_key))
-        self.next_listing += 1
-        return str(self.next_listing)
+        if group_key not in self.group_listings:
+            self.next_listing += 1
+            self.group_listings[group_key] = str(self.next_listing)
+        return self.group_listings[group_key]
 
     def publish_offer(self, offer_id):
         self.calls.append(("publish_offer", offer_id))
@@ -946,6 +963,194 @@ class ImageTests(PushTestCase):
         )
 
 
+class RefreshPutsTheListingBackOnSaleTests(PushTestCase):
+    """
+    Refresh has to publish the group, not just rewrite it.
+
+    Withdrawing an offer keeps the offer and leaves its status at
+    UNPUBLISHED, and naming its SKU in the group again does not revive it.
+    A live 123-card listing was found in exactly that state -- group complete,
+    every offer holding the right quantity and pictures, every offer
+    unpublished, one card visible to a buyer. Refresh rebuilt the group and
+    changed nothing anyone could see, because nothing in the app published
+    anything once a listing was already published. Recovery took a script.
+
+    The state is reachable without a bug: ending a card withdraws its offer,
+    and restocking it later produces an update, which never publishes.
+    """
+
+    def live_listing(self):
+        self.add_card("ID1001", "Charizard", "004/102", qty=3)
+        self.add_card("ID1002", "Blastoise", "002/102", qty=3)
+        push_plan(self.db, FakeEbay(), self.approved_plan(),
+                  user_id=SHARED_SCOPE)
+        return self.db.get_managed_listing("Base Set|Near Mint")[
+            "ebay_parent_id"
+        ]
+
+    def test_a_refresh_publishes_the_group(self):
+        listing_id = self.live_listing()
+        api = FakeEbay()
+        result = refresh_listing(
+            self.db, api, listing_id, user_id=SHARED_SCOPE
+        )
+
+        self.assertIn("publish_group", api.kinds())
+        self.assertIs(result["republished"], True)
+        # And it happens after the group write: publishing a group eBay has
+        # not been given yet would publish the old contents.
+        kinds = api.kinds()
+        self.assertLess(
+            kinds.index("upsert_group"), kinds.index("publish_group"),
+            "the group must be written before it is published",
+        )
+
+    def test_republishing_does_not_move_the_listing(self):
+        """
+        The same group publishes to the same listing, so the mirror stands.
+        """
+        listing_id = self.live_listing()
+        api = FakeEbay()
+        result = refresh_listing(
+            self.db, api, listing_id, user_id=SHARED_SCOPE
+        )
+
+        self.assertIs(result["republished"], True)
+        self.assertEqual(
+            self.db.get_managed_listing("Base Set|Near Mint")
+                   ["ebay_parent_id"],
+            listing_id,
+            "republishing the same group must not repoint the mirror",
+        )
+        self.assertEqual(
+            [entry["level"] for entry in result["logs"]
+             if entry["level"] == "ERROR"], [],
+            "a normal republish is not an error",
+        )
+        self.assertTrue(
+            any(entry["level"] == "SUCCESS" for entry in result["logs"])
+        )
+
+    def test_a_refused_publish_is_not_reported_as_a_success(self):
+        """
+        Publishing is all-or-nothing, so one invalid card blocks the group.
+
+        The items and the group were still written, so this is not a failed
+        refresh -- it is a refresh that could not put the result back on
+        sale, and saying SUCCESS over it is the thing that hid the original
+        damage for days.
+        """
+        listing_id = self.live_listing()
+
+        class RefusingEbay(FakeEbay):
+            def publish_group(self, group_key):
+                self.calls.append(("publish_group", group_key))
+                raise RuntimeError("25002: offer for ID1002 has no price")
+
+        api = RefusingEbay()
+        result = refresh_listing(
+            self.db, api, listing_id, user_id=SHARED_SCOPE
+        )
+
+        self.assertIs(result["republished"], False)
+        self.assertEqual(result["failed"], 0, "the re-send itself worked")
+        levels = [entry["level"] for entry in result["logs"]]
+        self.assertIn("ERROR", levels)
+        self.assertNotIn(
+            "SUCCESS", levels,
+            "a listing left off sale must not be summarised as a success",
+        )
+        # eBay's own message names the card, so it must survive into the log.
+        self.assertTrue(
+            any("ID1002" in entry["message"] for entry in result["logs"]),
+            f"the blocking card should be named: {result['logs']}",
+        )
+
+    def test_a_publish_landing_on_another_listing_is_an_error(self):
+        """
+        A different listing id means eBay made a second listing.
+
+        The mirror follows eBay, because leaving it on the old id would send
+        every later write to a listing eBay no longer associates with these
+        offers -- but this is still an error, not a success, because there are
+        now two listings for one group and only the owner can decide which
+        one to end.
+        """
+        listing_id = self.live_listing()
+
+        class MovingEbay(FakeEbay):
+            def publish_group(self, group_key):
+                self.calls.append(("publish_group", group_key))
+                return "999888777666"
+
+        api = MovingEbay()
+        result = refresh_listing(
+            self.db, api, listing_id, user_id=SHARED_SCOPE
+        )
+
+        levels = [entry["level"] for entry in result["logs"]]
+        self.assertIn("ERROR", levels)
+        self.assertNotIn("SUCCESS", levels)
+        self.assertTrue(
+            any("999888777666" in entry["message"]
+                for entry in result["logs"]),
+            "the new listing id has to be in the log to be actionable",
+        )
+        self.assertEqual(
+            self.db.get_managed_listing("Base Set|Near Mint")
+                   ["ebay_parent_id"],
+            "999888777666",
+            "the mirror must follow eBay to where the group now lives",
+        )
+
+    def test_a_restocked_card_can_be_put_back_on_sale_by_a_refresh(self):
+        """
+        The cycle that reaches this state with nothing going wrong.
+
+        Ending a card withdraws its offer. Restocking it later produces an
+        update against the offer that still exists, and an update never
+        publishes -- so the card sits in the group, with stock, off sale.
+        Refresh is the way back, and this is the regression that matters,
+        because it needs no incident to happen.
+        """
+        listing_id = self.live_listing()
+
+        # End one card, which withdraws its offer rather than deleting it.
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        self.db.add_plan_items(plan_id, [{
+            "manifest_id": "ID1002",
+            "group_key": "Base Set|Near Mint",
+            "action": ACTION_END,
+            "proposed_qty": 0,
+            "proposed_price": None,
+        }])
+        approve_plan(self.db, plan_id, approved_by=1)
+        ending = FakeEbay()
+        push_plan(self.db, ending, plan_id, user_id=SHARED_SCOPE)
+        self.assertTrue(
+            ending.withdrawn, "ending a card should withdraw its offer"
+        )
+
+        # Restocked later. The push updates the surviving offer and rewrites
+        # the group, and publishes nothing -- which is the gap.
+        self.db.set_manifest_quantity("ID1002", 4)
+        restock = FakeEbay()
+        push_plan(self.db, restock, self.approved_plan(),
+                  user_id=SHARED_SCOPE)
+        self.assertNotIn(
+            "publish_group", restock.kinds(),
+            "a push to a live listing does not publish, which is why "
+            "Refresh has to",
+        )
+
+        api = FakeEbay()
+        result = refresh_listing(
+            self.db, api, listing_id, user_id=SHARED_SCOPE
+        )
+        self.assertIs(result["republished"], True)
+        self.assertIn("publish_group", api.kinds())
+
+
 class RefreshTests(PushTestCase):
     def test_a_live_listing_can_be_repaired_without_moving_stock_or_price(self):
         """
@@ -974,9 +1179,17 @@ class RefreshTests(PushTestCase):
         self.assertEqual(result["failed"], 0)
         self.assertIn("upsert_items", api.kinds())
         self.assertIn("upsert_group", api.kinds())
-        # Nothing that could change what is on sale.
+        # Nothing that could change the stock or the money.
         self.assertNotIn("update_price_quantity", api.kinds())
-        self.assertNotIn("publish_group", api.kinds())
+        # Publishing, on the other hand, is now expected, and this
+        # expectation was the opposite until a live listing proved it wrong.
+        # It used to assert publish_group was *not* called, on the reasoning
+        # that a repair must not change what is on sale. But publishing does
+        # not change what is on sale: it puts the offers the group already
+        # names back on sale holding the quantities and prices they already
+        # hold. What the old expectation actually protected was a listing
+        # stuck off sale, with no route back through the app.
+        self.assertIn("publish_group", api.kinds())
         self.assertEqual(
             api.items["ID1001"]["availability"]
                ["shipToLocationAvailability"]["quantity"],

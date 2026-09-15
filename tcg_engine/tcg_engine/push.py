@@ -1423,6 +1423,9 @@ def refresh_listing(
 
     cover_sent = None
     cover_verified = None
+    # None when eBay was never asked to publish -- a single listing, or a
+    # refresh with nothing left to send. True or False only when it was.
+    republished = None
 
     if not single and refreshed:
         set_name, _, condition = group_key.partition("|")
@@ -1449,13 +1452,78 @@ def refresh_listing(
             api, ebay_group_key, cover_sent, record
         )
 
+        # Put the group back on sale, which is the other half of "re-send
+        # what this listing is made of".
+        #
+        # Withdrawing an offer keeps the offer and leaves its status at
+        # UNPUBLISHED, and naming its SKU in the group again does not revive
+        # it. A live 123-card listing was found in exactly that state: the
+        # group named all 123, every offer held the right quantity and the
+        # right pictures, every offer was unpublished, and a buyer saw one
+        # card. Refresh rebuilt the group and changed nothing a buyer could
+        # see, because nothing here published anything. Recovery needed a
+        # script.
+        #
+        # That state is also reachable with no bug involved: ending a card
+        # withdraws its offer, and restocking it later produces an update,
+        # which never publishes. So Refresh owns this -- it is the button
+        # whose job is making eBay match us.
+        #
+        # Published unconditionally rather than after reading every offer's
+        # status to find out whether it is needed: this is one call against
+        # one per card, and republishing a group that is already on sale is
+        # a no-op that returns the id it already has. The cost of asking
+        # first is the thing being avoided.
+        try:
+            listing_id = api.publish_group(ebay_group_key)
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            # The items and the group were written, so this is not a failed
+            # refresh; it is a refresh that could not put the result on sale.
+            # Publishing is all-or-nothing, so one invalid card blocks the
+            # whole group -- and eBay's message names it.
+            republished = False
+            record("ERROR", (
+                f"the variations were re-sent but could not be put back on "
+                f"sale: {exc}"
+            ))
+        else:
+            republished = True
+            if str(listing_id) != str(ebay_parent_id):
+                # eBay published the group somewhere other than the listing
+                # it belonged to, which means there may now be two. The
+                # mirror follows eBay, because leaving it on the old id would
+                # send every later write to a listing eBay no longer
+                # associates with these offers.
+                db.upsert_managed_listing(
+                    group_key, ebay_parent_id=str(listing_id), pushed=True
+                )
+                record("ERROR", (
+                    f"eBay published this group as #{listing_id}, not "
+                    f"#{ebay_parent_id}, so there may now be two listings "
+                    f"for it. Check both before pushing again."
+                ))
+
     # Only real failures downgrade the summary. An unconfirmed cover has
     # already said so on its own line, and is usually eBay lagging.
-    level = "SUCCESS" if not failures else "WARN"
+    # Anything that recorded an ERROR costs the SUCCESS, whatever else the
+    # refresh managed to do. Derived from what was actually logged rather than
+    # from a list of the ways it can go wrong, because the list kept missing
+    # one: a publish that landed on a *different* listing reported the
+    # duplicate as an error and then summarised the run as a success, which
+    # is the same false reassurance that hid the original damage.
+    #
+    # An unconfirmed cover is deliberately not an error -- it says so on its
+    # own line and is usually eBay lagging.
+    level = "SUCCESS" if not failures and not any(
+        entry["level"] == "ERROR" for entry in logs
+    ) else "WARN"
     record(
         level,
         f"Listing #{ebay_parent_id}: refreshed {refreshed} variation(s)"
-        + (f", {len(failures)} failed" if failures else ""),
+        + (f", {len(failures)} failed" if failures else "")
+        # What eBay was asked and what it answered -- not a claim about what
+        # a buyer can now see, which has not been read back.
+        + (", and eBay accepted the publish" if republished else ""),
     )
     return {
         "ebay_parent_id": str(ebay_parent_id),
@@ -1465,5 +1533,8 @@ def refresh_listing(
         # nothing left to send. True or False only when eBay was asked.
         "cover_sent": cover_sent,
         "cover_verified": cover_verified,
+        # True when eBay accepted a publish, False when it refused one, None
+        # when it was never asked.
+        "republished": republished,
         "logs": logs,
     }

@@ -257,11 +257,21 @@ def create_or_replace_inventory_item_group(
     Create or overwrite the group that becomes a variation listing.
 
     Note what this does once the group is published: it **updates the live
-    listing immediately**, with no separate publish step. Adding a SKU to the
-    group's ``variantSKUs`` puts that card on sale; removing one takes it off.
-    That makes this the single most consequential call in the module, and the
-    reason the drafts page exists -- there is no staged state on eBay's side
-    to inspect before it takes effect.
+    listing immediately**, with no separate publish step. Removing a SKU from
+    ``variantSKUs`` takes that card off sale. That makes this the single most
+    consequential call in the module, and the reason the drafts page exists --
+    there is no staged state on eBay's side to inspect before it takes effect.
+
+    Adding a SKU is **not** the mirror image of removing one, and this
+    docstring used to claim it was. Naming a SKU whose offer has been
+    withdrawn does not put it back on sale: the offer keeps its data and its
+    status stays ``UNPUBLISHED``, and only
+    ``publish_offer_by_inventory_item_group`` revives it. A live 123-card
+    listing was found in that state -- group complete, every offer holding the
+    right quantity and pictures, every offer unpublished, one card visible to
+    a buyer -- and republishing the group restored all 123 at the same listing
+    id. Whether a never-published offer behaves the same way has not been
+    established; assume it needs publishing too.
     """
     transport.put(
         f"{INVENTORY_BASE}/inventory_item_group/{group_key}", payload
