@@ -1198,6 +1198,120 @@ class TestWebApp(unittest.TestCase):
             deps._ebay_clients.update(saved_client)
             ebay_routes.EBAY_NOTIFICATION_ENDPOINT = saved_endpoint
 
+    def test_39z_a_cover_photo_too_small_for_ebay_is_refused_on_the_draft(self):
+        """
+        Measured when it is chosen, not when eBay refuses it.
+
+        eBay wants 500 pixels on the longest side and re-checks every picture
+        on a listing whenever anything changes, so an undersized cover blocks
+        later price and quantity updates to the whole listing -- and the
+        refusal names eBay's own copy of the image, which cannot be traced
+        back to what was pasted in. A 169x360 picture reached a live listing
+        and surfaced weeks later as a 400 on a bulk price update.
+
+        Refusing it on a draft is the cheapest catch of all: publishing a
+        group fails as a whole, so one bad picture would fail a listing of
+        hundreds of cards, after approval.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        groups = self.client.get(f"/api/plans/{plan_id}").json()["groups"]
+        if not groups:
+            self.skipTest("no groups in the current draft")
+        group_key = groups[0]["group_key"]
+
+        # 169x360, the size of the picture that actually caused this.
+        small = (b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+                 + (169).to_bytes(4, "big") + (360).to_bytes(4, "big"))
+        with mock.patch("ebay_client.pictures._fetch_header",
+                        return_value=small):
+            res = self.client.post(
+                f"/api/plans/{plan_id}/cover",
+                json={
+                    "group_key": group_key,
+                    "cover_image_url": "https://cdn.example.com/tiny.png",
+                },
+            )
+
+        self.assertEqual(res.status_code, 400, res.text)
+        detail = res.json()["detail"]
+        self.assertIn("169x360", detail)
+        self.assertIn("500", detail)
+        # And it was not stored: a refused picture must leave no trace, or the
+        # next push would send it anyway.
+        staged = next(
+            g for g in self.client.get(f"/api/plans/{plan_id}").json()["groups"]
+            if g["group_key"] == group_key
+        )
+        self.assertNotEqual(
+            staged.get("cover_image_url"), "https://cdn.example.com/tiny.png"
+        )
+
+    def test_39y_a_cover_photo_that_cannot_be_measured_is_stored_with_a_note(self):
+        """
+        Our fetch failing is not proof eBay's will.
+
+        So an unmeasurable picture is accepted -- refusing it would make an
+        image in an unhandled format unusable -- but the reply says it was not
+        checked. Silence there would read as a pass, which is the failure this
+        whole check exists to prevent.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        groups = self.client.get(f"/api/plans/{plan_id}").json()["groups"]
+        if not groups:
+            self.skipTest("no groups in the current draft")
+        group_key = groups[0]["group_key"]
+
+        with mock.patch("ebay_client.pictures._fetch_header",
+                        return_value=None):
+            res = self.client.post(
+                f"/api/plans/{plan_id}/cover",
+                json={
+                    "group_key": group_key,
+                    "cover_image_url": "https://cdn.example.com/unknown.tiff",
+                },
+            )
+
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIn("could not be measured", res.json()["picture_note"])
+        staged = next(
+            g for g in res.json()["groups"] if g["group_key"] == group_key
+        )
+        self.assertEqual(
+            staged["cover_image_url"], "https://cdn.example.com/unknown.tiff",
+            "an unmeasurable picture is still the owner's choice",
+        )
+
+    def test_39x_a_large_cover_photo_is_accepted_without_a_note(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        plan_id = self.client.post(
+            "/api/plans/build", json={"source": "manual"}
+        ).json()["plan_id"]
+        groups = self.client.get(f"/api/plans/{plan_id}").json()["groups"]
+        if not groups:
+            self.skipTest("no groups in the current draft")
+        group_key = groups[0]["group_key"]
+
+        big = (b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+               + (800).to_bytes(4, "big") + (800).to_bytes(4, "big"))
+        with mock.patch("ebay_client.pictures._fetch_header",
+                        return_value=big):
+            res = self.client.post(
+                f"/api/plans/{plan_id}/cover",
+                json={
+                    "group_key": group_key,
+                    "cover_image_url": "https://cdn.example.com/big.png",
+                },
+            )
+
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["picture_note"], "")
+
     def test_39a_a_draft_cover_photo_is_staged_not_applied(self):
         """
         A cover chosen in a draft must not reach ebay_listing_overrides until

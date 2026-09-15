@@ -236,10 +236,25 @@ def set_plan_cover(
             detail="A cover photo must be an http:// or https:// URL that eBay can fetch.",
         )
 
+    # Checked here as well as on a live listing, and for a better reason:
+    # this one is staged, so catching it now means the draft cannot carry a
+    # picture that will fail at push time -- when it would fail the whole
+    # group, after approval, with nobody watching.
+    #
+    # A sync endpoint, so FastAPI already runs this in a threadpool and the
+    # fetch inside the check does not block the event loop.
+    picture_note = ""
+    if url:
+        verdict = deps.check_picture(url)
+        if verdict["ok"] is False:
+            raise HTTPException(status_code=400, detail=verdict["reason"])
+        picture_note = verdict["reason"] if verdict["ok"] is not True else ""
+
     inv.set_plan_group_cover(plan_id, req.group_key, url)
     return {
         "success": True,
         "groups": inv.get_plan_groups(plan_id),
+        "picture_note": picture_note,
     }
 
 @router.post("/api/plans/{plan_id}/approve")

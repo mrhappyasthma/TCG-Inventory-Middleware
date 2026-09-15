@@ -89,6 +89,7 @@ try:
     )
     from app.ebay_push import InventoryApiAdapter
     from app.ebay_orders import project_order_lines
+    from ebay_client import pictures as ebay_pictures
     from ebay_client.orders import (
         ORDER_HISTORY_DAYS,
         OrderPageError,
@@ -115,6 +116,7 @@ except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
         """
 
     EbayClient = None
+    ebay_pictures = None
     project_order_lines = get_orders = None
     OrderPageError = _EbayUnavailable
     ORDER_HISTORY_DAYS = 90
@@ -154,6 +156,29 @@ except ImportError as _ebay_import_error:  # pragma: no cover - packaging fault
 _ebay_clients: Dict[int, Any] = {}
 
 _ebay_client_lock = threading.Lock()
+
+
+def check_picture(url: str) -> Dict[str, Any]:
+    """
+    Judge one image URL against eBay's picture policy.
+
+    Fetches the image's header, so it is a network call and belongs off the
+    event loop in an async endpoint.
+
+    ``ok`` is three-valued -- True, False, or None for "not established" --
+    and None must not be read as a pass. A missing eBay library produces None
+    for the same reason an unreachable URL does: nothing was checked, and
+    saying otherwise is the failure this exists to prevent.
+    """
+    if ebay_pictures is None:
+        return {
+            "ok": None, "width": None, "height": None, "longest": None,
+            "reason": (
+                "The eBay library is not available, so the picture could not "
+                "be checked against eBay's 500-pixel minimum."
+            ),
+        }
+    return ebay_pictures.check(url)
 
 def get_ebay_client(user_id: int):
     """

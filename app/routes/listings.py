@@ -124,6 +124,19 @@ async def set_listing_cover(
             detail="The cover photo must be a full http:// or https:// URL that eBay can fetch.",
         )
 
+    # Measured before it is stored, not after eBay refuses it.
+    #
+    # eBay wants 500 pixels on the longest side and re-checks every picture
+    # on a listing whenever anything about that listing changes. So an
+    # undersized cover does not just look wrong: it blocks later price and
+    # quantity updates to the whole listing, and the refusal names eBay's own
+    # copy of the image rather than this URL. One 169x360 picture surfaced as
+    # a 400 on a bulk price update weeks later, which is an expensive way to
+    # find out. The check costs a few kilobytes here.
+    verdict = await run_in_threadpool(deps.check_picture, url)
+    if verdict["ok"] is False:
+        raise HTTPException(status_code=400, detail=verdict["reason"])
+
     known = {l["ebay_parent_id"] for l in inv.get_ebay_listings()}
     if item_id not in known:
         raise HTTPException(
@@ -132,6 +145,10 @@ async def set_listing_cover(
         )
 
     saved = inv.set_listing_cover_image(item_id, url)
+    # Carried on every reply below: a picture that could not be measured is
+    # stored, because our fetch failing is not proof eBay's will -- but the
+    # page has to say so rather than implying it passed.
+    picture_note = verdict["reason"] if verdict["ok"] is not True else ""
 
     # The choice is recorded first, so that a failure to apply it still leaves
     # it stored and retryable with the listing's Refresh button.
@@ -146,6 +163,7 @@ async def set_listing_cover(
                 "so there is no way to apply it. Sync from eBay, then press "
                 "Refresh on the listing."
             ),
+            "picture_note": picture_note,
         }
 
     client = deps.get_ebay_client(user["id"])
@@ -159,6 +177,7 @@ async def set_listing_cover(
                 "Saved, but eBay is not connected, so it has not been applied "
                 "yet. Connect the account and press Refresh on the listing."
             ),
+            "picture_note": picture_note,
         }
 
     adapter = InventoryApiAdapter(client)
@@ -182,6 +201,7 @@ async def set_listing_cover(
         "ebay_parent_id": item_id,
         "cover_image_url": saved,
         "applied": True,
+        "picture_note": picture_note,
         "refreshed": result.get("refreshed", 0),
         # The refresh underneath this also publishes the group, and it can be
         # refused. Passed through so the page can say so rather than

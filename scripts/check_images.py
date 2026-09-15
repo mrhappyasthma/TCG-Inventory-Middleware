@@ -47,93 +47,23 @@ Touches eBay not at all, and writes nothing anywhere.
 
 import argparse
 import os
-import struct
 import sys
-import urllib.request
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for path in (REPO_ROOT, os.path.join(REPO_ROOT, "tcg_engine")):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+from ebay_client.pictures import (  # noqa: E402
+    MIN_LONGEST_SIDE as EBAY_MIN_LONGEST_SIDE,
+    WIDE_ASPECT_RATIO,
+    measure as image_dimensions,
+)
 from tcg_engine.db import Database  # noqa: E402
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
 
-# eBay's published minimum for the longest side of a listing image.
-EBAY_MIN_LONGEST_SIDE = 500
-# Enough to reach a JPEG's Start Of Frame past EXIF and an embedded thumbnail.
-IMAGE_HEADER_BYTES = 131072
-# Past this, an image letterboxes badly in eBay's square gallery thumbnail.
-WIDE_ASPECT_RATIO = 2.0
-USER_AGENT = "TCG-Inventory-Middleware/1.0 (image size check)"
-
 COVER_LABEL = "cover photo"
-
-
-def image_dimensions(url):
-    """
-    (width, height) of an image, read from its header alone.
-
-    Returns None when the fetch fails or the format is not one of the four
-    handled here. A caller must report that as "unknown" and never as "fine":
-    the entire purpose is to find images eBay will reject, and eBay has to
-    fetch the URL too, so a fetch that fails for us may well fail for it.
-    """
-    try:
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request, timeout=20) as response:
-            head = response.read(IMAGE_HEADER_BYTES)
-    except Exception:
-        return None
-
-    if head.startswith(b"\x89PNG\r\n\x1a\n") and len(head) >= 24:
-        return struct.unpack(">II", head[16:24])
-    if head[:6] in (b"GIF87a", b"GIF89a") and len(head) >= 10:
-        return struct.unpack("<HH", head[6:10])
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        if head[12:16] == b"VP8X" and len(head) >= 30:
-            return (int.from_bytes(head[24:27], "little") + 1,
-                    int.from_bytes(head[27:30], "little") + 1)
-        if head[12:16] == b"VP8 " and len(head) >= 30:
-            return (int.from_bytes(head[26:28], "little") & 0x3FFF,
-                    int.from_bytes(head[28:30], "little") & 0x3FFF)
-        return None
-    if head[:2] == b"\xff\xd8":
-        return _jpeg_dimensions(head)
-    return None
-
-
-def _jpeg_dimensions(head):
-    """
-    Walk a JPEG's marker chain to the frame header that states its size.
-
-    Not at a fixed offset: EXIF, an ICC colour profile and an embedded
-    thumbnail can all precede it, which is why this is a loop and not an
-    unpack.
-    """
-    index = 2
-    # "<=", not "<": a frame header ending exactly at the last byte of the
-    # buffer is still one, and a minimal JPEG is nothing but the two markers.
-    while index + 9 <= len(head):
-        if head[index] != 0xFF:
-            index += 1
-            continue
-        marker = head[index + 1]
-        # Markers that carry no length: padding, and the restart series.
-        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-            index += 2
-            continue
-        length = int.from_bytes(head[index + 2:index + 4], "big")
-        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
-            height = int.from_bytes(head[index + 5:index + 7], "big")
-            width = int.from_bytes(head[index + 7:index + 9], "big")
-            return (width, height)
-        if length <= 0:
-            return None
-        index += 2 + length
-    return None
 
 
 def mediawiki_original(url):

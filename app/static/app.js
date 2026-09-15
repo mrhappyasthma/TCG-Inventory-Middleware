@@ -3146,6 +3146,7 @@ async function saveCoverPhoto(e) {
                 + (data.republished === false
                     ? " eBay would not put the listing back on sale, though -- see the log above."
                     : ""));
+            if (data.picture_note) logToTerminal("WARN", data.picture_note);
         } else {
             logToTerminal("SUCCESS", `Cover photo recorded for eBay #${id}.`);
             logToTerminal("WARN", data.reason
