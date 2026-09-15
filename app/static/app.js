@@ -552,7 +552,16 @@ async function refreshMarketPrices() {
         const res = await fetch("/api/pricing/refresh", {
             method: "POST", body: form,
         });
-        const data = await res.json();
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            logToTerminal("WARN", (
+                `The connection dropped while prices were being refreshed (a ${res.status} `
+                + "page came back instead of a result). It is probably still running; "
+                + "reload in a minute rather than starting it again."
+            ));
+            status.innerText = "Connection dropped; probably still running";
+            return;
+        }
         if (!res.ok) throw new Error(data.detail || "Refresh failed");
 
         (data.logs || []).forEach(l => logToTerminal(l.level, `[PRICES] ${l.message}`));
@@ -1451,7 +1460,16 @@ async function handleBatchUpload(file, mode = "normal") {
             method: "POST",
             body: formData
         });
-        const data = await res.json();
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            logToTerminal("WARN", (
+                `The connection dropped while the upload was being processed (a ${res.status} `
+                + "page came back instead of a result). It is probably still running; "
+                + "reload in a minute and check the inventory before uploading again, "
+                + "because a second upload would add the same copies twice."
+            ));
+            return;
+        }
         if (!res.ok) throw new Error(data.detail || "Failed to process batch");
 
         // Display logs
@@ -1539,7 +1557,15 @@ async function handleSyncUpload(file) {
             method: "POST",
             body: formData
         });
-        const data = await res.json();
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            logToTerminal("WARN", (
+                `The connection dropped while listings were being synced (a ${res.status} `
+                + "page came back instead of a result). It is probably still running; "
+                + "reload in a minute rather than syncing again."
+            ));
+            return;
+        }
         if (!res.ok) throw new Error(data.detail || "Failed to sync listings");
 
         if (data.logs) {
@@ -2739,7 +2765,20 @@ async function syncFromEbay(trigger) {
     }
     try {
         const res = await fetch("/api/ebay/sync", { method: "POST" });
-        const data = await res.json();
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            logToTerminal("WARN", (
+                "The connection dropped while the eBay sync was running "
+                + `(a ${res.status} page came back instead of a result). `
+                + "The sync itself is probably still going: eBay builds the report on "
+                + "its own schedule and the reverse proxy stops waiting first. "
+                + "Give it a minute and reload rather than syncing again."
+            ));
+            if (box) {
+                box.innerHTML = `<p class="text-amber-300">The connection dropped waiting for eBay, so the result never arrived. The sync is probably still running &mdash; give it a minute, then reload.</p>`;
+            }
+            return;
+        }
         if (!res.ok) throw new Error(data.detail || "The sync failed");
 
         for (const entry of data.logs || []) {
@@ -2968,6 +3007,7 @@ async function refreshListingContents(itemId, button) {
         }
         if (!res.ok) throw new Error(data.detail || "Could not refresh the listing");
         (data.logs || []).forEach(e => logToTerminal(e.level, e.message));
+        if (typeof fetchEbayListings === "function") fetchEbayListings();
         const trouble = data.failed || data.republished === false
             || (data.logs || []).some(e => e.level === "ERROR");
         logToTerminal(trouble ? "WARN" : "SUCCESS",
@@ -4073,6 +4113,8 @@ async function followPushJob(jobId, planId, opts) {
         expandPlanListingsFor = planId;
         await fetchDraftPlan();
         if (typeof fetchEbayListings === "function") fetchEbayListings();
+        // The header totals come from the mirror, which the push just wrote.
+        if (typeof fetchStats === "function") fetchStats();
     };
 
     tick();
