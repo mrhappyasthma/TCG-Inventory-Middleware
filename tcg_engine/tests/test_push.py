@@ -30,6 +30,7 @@ from tcg_engine.plans import (
     build_plan,
 )
 from tcg_engine.push import (
+    _apply_price_quantity,
     is_single,
     PushError,
     inventory_group_key,
@@ -66,6 +67,10 @@ class FakeEbay:
         self.items = {}
         self.offers = {}
         self.groups = {}
+        # Every price/quantity request as sent, so a test can assert which
+        # destination a quantity was addressed to rather than only that a
+        # call happened.
+        self.price_quantity_requests = []
         # group key -> the listing id it was published at, so republishing
         # returns the same id the way eBay does.
         self.group_listings = {}
@@ -133,7 +138,19 @@ class FakeEbay:
         ]
 
     def update_price_quantity(self, requests):
+        """
+        Apply an update the way eBay does, field by field.
+
+        Faithful rather than a bare acknowledgement, because the bug this
+        guards against is a request eBay *accepts* while the listing goes on
+        selling the old quantity. A fake that only answered 200 asserted our
+        intent and proved nothing: quantity was being set on the inventory
+        item alone, and a published listing serves the quantity held on its
+        offer. So both destinations are recorded separately here, and
+        ``offer_quantity`` reads back the one a buyer sees.
+        """
         self.calls.append(("update_price_quantity", [r["sku"] for r in requests]))
+        self.price_quantity_requests.extend(requests)
         rows = []
         for request in requests:
             sku = request["sku"]
@@ -142,9 +159,33 @@ class FakeEbay:
                     "sku": sku, "statusCode": 400,
                     "errors": [{"longMessage": self.fail_skus[sku]}],
                 })
-            else:
-                rows.append({"sku": sku, "statusCode": 200})
+                continue
+            ship_to = request.get("shipToLocationAvailability")
+            if ship_to is not None and sku in self.items:
+                self.items[sku].setdefault("availability", {})[
+                    "shipToLocationAvailability"
+                ] = dict(ship_to)
+            for entry in request.get("offers") or []:
+                offer = self.offers.get(str(entry.get("offerId")))
+                if offer is None:
+                    continue
+                if "availableQuantity" in entry:
+                    offer["availableQuantity"] = entry["availableQuantity"]
+                if "price" in entry:
+                    offer["price"] = entry["price"]
+            rows.append({"sku": sku, "statusCode": 200})
         return rows
+
+    def offer_quantity(self, sku):
+        """
+        What ``getOffers`` would report for this SKU, or None if it has no
+        offer. This is the number the live listing sells from, and the one
+        ``scripts/inspect_listing.py`` prints as ``eBay qty``.
+        """
+        for payload in self.offers.values():
+            if payload.get("sku") == sku:
+                return payload.get("availableQuantity")
+        return None
 
     def upsert_group(self, group_key, payload):
         self.calls.append(("upsert_group", group_key))
@@ -1376,6 +1417,255 @@ class PartialPushKeepsTheWholeListingTests(PushTestCase):
         push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
         group = list(api.groups.values())[0]
         self.assertEqual(sorted(group["variantSKUs"]), ["ID1001", "ID1002"])
+
+
+class QuantityReachesTheOfferTests(PushTestCase):
+    """
+    A quantity change has to arrive where eBay serves it from: the offer.
+
+    Setting only the inventory item's ``shipToLocationAvailability`` fails in
+    the worst available way. eBay accepts the request, answers 200 for every
+    SKU, and the live listing goes on selling the previous quantity -- so the
+    push logs a clean success, the mirror records the new number as eBay's,
+    and the next draft is empty because our two figures now agree with each
+    other and not with eBay.
+
+    Observed on a live 64-card listing: eight quantity changes reported
+    "8 card(s) pushed, 0 failed", and ``getOffers`` afterwards still reported
+    all eight of the old numbers. The 56 cards nobody had touched agreed only
+    because their offers still carried what they were created with.
+    ``scripts/inspect_listing.py`` prints that field as ``eBay qty``, and its
+    own module docstring already said quantity lives on the offer.
+    """
+
+    def live_listing(self):
+        """Two cards at two copies each, pushed and published."""
+        self.add_card("ID1001", "Charizard", "004/102", qty=2)
+        self.add_card("ID1002", "Blastoise", "009/102", qty=2)
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+        return api
+
+    def test_a_changed_quantity_reaches_the_offer(self):
+        api = self.live_listing()
+        self.assertEqual(api.offer_quantity("ID1002"), 2)
+
+        self.db.set_manifest_quantity("ID1002", 7)
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        self.assertEqual(
+            api.offer_quantity("ID1002"), 7,
+            "the offer is the quantity a buyer sees; an inventory-item-only "
+            "update is accepted by eBay and changes nothing",
+        )
+        # And the card the plan never mentioned keeps what it had.
+        self.assertEqual(api.offer_quantity("ID1001"), 2)
+
+    def test_both_destinations_travel_in_one_request(self):
+        """
+        Both, not either. The item-level figure is what a Refresh re-sends
+        and what ``getInventoryItem`` reports, so letting the two drift would
+        leave a later repair pushing a stale quantity back onto the listing.
+        """
+        api = self.live_listing()
+        self.db.set_manifest_quantity("ID1002", 7)
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        sent = [
+            r for r in api.price_quantity_requests if r["sku"] == "ID1002"
+        ]
+        self.assertEqual(len(sent), 1, "one call, not two")
+        self.assertEqual(sent[0]["shipToLocationAvailability"]["quantity"], 7)
+        self.assertEqual(sent[0]["offers"][0]["availableQuantity"], 7)
+
+    def test_a_zero_out_sends_the_quantity_but_still_no_price(self):
+        api = self.live_listing()
+        self.db.set_manifest_quantity("ID1002", 0)
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        self.assertEqual(api.offer_quantity("ID1002"), 0)
+        sent = [
+            r for r in api.price_quantity_requests if r["sku"] == "ID1002"
+        ]
+        self.assertNotIn(
+            "price", sent[0]["offers"][0],
+            "out of stock is not a sale: a price on this row would reprice a "
+            "card on its way off the shelf",
+        )
+
+    def test_a_card_with_no_offer_is_deferred_rather_than_sent(self):
+        """
+        Without an offer id there is no way to move what the listing sells,
+        so the request must not be sent at all. Sending the item half alone
+        is the silent no-op this class exists for, and it would be counted a
+        success.
+
+        Reached directly: ``_push_group`` creates a missing offer before this
+        runs, so the guard is defence against that order changing.
+        """
+        api = self.live_listing()
+        self.db.set_manifest_quantity("ID1002", 7)
+        plan_id = self.approved_plan()
+        item = next(
+            row for row in self.db.get_plan_items(plan_id)
+            if row["manifest_id"] == "ID1002"
+        )
+        item = dict(item, offer_id=None)
+
+        counts = {"pushed": 0, "failed": 0, "deferred": 0}
+        logs = []
+        _apply_price_quantity(
+            self.db, api, [item], counts,
+            lambda level, message: logs.append((level, message)),
+        )
+
+        self.assertEqual(counts["deferred"], 1)
+        self.assertEqual(api.price_quantity_requests, [])
+        self.assertEqual(item["status"], STATUS_DEFERRED)
+        persisted = {
+            row["manifest_id"]: row["status"]
+            for row in self.db.get_plan_items(plan_id)
+        }
+        self.assertEqual(persisted["ID1002"], STATUS_DEFERRED)
+        self.assertTrue(logs, "a card that could not be sent must say so")
+        self.assertEqual(logs[0][0], "WARN")
+        self.assertIn("offer", logs[0][1])
+
+
+class PushKeepsTheListingsCoverTests(PushTestCase):
+    """
+    A push must not replace the cover photo of a listing it is updating.
+
+    Writing the inventory item group is a full replace, so the cover is
+    decided on every push whether or not anybody asked for one. With no cover
+    staged on the draft, the push fell straight through to the first card's
+    scan -- so approving eight quantity changes replaced the gallery image of
+    a live 64-card listing, silently, on a run whose log said success.
+
+    ``refresh_listing`` had already been given the right precedence after the
+    same thing happened to it, in ``_cover_for_refresh``. The push shares the
+    group write and did not, and the cover recorded against a listing had
+    exactly one reader in the codebase: the refresh.
+    """
+
+    def live_listing_with_a_cover(self):
+        """One card, pushed with a cover staged on the drafts page."""
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        self.db.set_plan_group_cover(plan_id, "Base Set|Near Mint", COVER)
+        approve_plan(self.db, plan_id, approved_by=1)
+        api = FakeEbay()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+        self.assertEqual(self.db.get_listing_cover_image(listing_id), COVER)
+        return api
+
+    def test_a_quantity_only_push_keeps_the_recorded_cover(self):
+        self.live_listing_with_a_cover()
+
+        self.db.set_manifest_quantity("ID1002", 7)
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        group = list(api.groups.values())[0]
+        self.assertEqual(
+            group["imageUrls"], [COVER],
+            "the cover recorded against the listing must survive a push "
+            "that was never about pictures",
+        )
+
+    def test_a_push_keeps_a_cover_only_ebay_knows_about(self):
+        """
+        The same question the refresh asks. A cover set in Seller Hub, or by
+        a build predating any record of it, is still the listing's cover --
+        and eBay is the only place it exists.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        push_plan(self.db, FakeEbay(), self.approved_plan(),
+                  user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+        self.assertEqual(self.db.get_listing_cover_image(listing_id), "")
+
+        seller_cover = "https://cdn.example.com/seller-set.jpg"
+
+        class WithCover(FakeEbay):
+            def get_group(self, group_key):
+                return {"imageUrls": [seller_cover]}
+
+        self.db.set_manifest_quantity("ID1002", 7)
+        api = WithCover()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        group = api.groups[next(iter(api.groups))]
+        self.assertEqual(group["imageUrls"], [seller_cover])
+        # Learned, so the next write need not ask again.
+        self.assertEqual(
+            self.db.get_listing_cover_image(listing_id), seller_cover
+        )
+
+    def test_a_staged_cover_still_wins(self):
+        # The one case where replacing it is the whole point: somebody chose
+        # a new cover for this listing on the drafts page.
+        self.live_listing_with_a_cover()
+        chosen = "https://cdn.example.com/chosen.png"
+
+        self.db.set_manifest_quantity("ID1002", 7)
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        self.db.set_plan_group_cover(plan_id, "Base Set|Near Mint", chosen)
+        approve_plan(self.db, plan_id, approved_by=1)
+        api = FakeEbay()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+
+        group = list(api.groups.values())[0]
+        self.assertEqual(group["imageUrls"], [chosen])
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+        self.assertEqual(
+            self.db.get_listing_cover_image(listing_id), chosen,
+            "and the new choice replaces the recorded one",
+        )
+
+    def test_the_account_default_does_not_override_one_listings_cover(self):
+        """
+        The account-wide cover is a default for listings being *created*.
+        Letting it win here would rewrite every listing's own cover on the
+        next push that touched it -- which is the opposite of what the eBay
+        Listings tab offers it for.
+        """
+        self.live_listing_with_a_cover()
+        self.db.set_listing_settings(
+            {"cover_image_url": "https://cdn.example.com/account-wide.png"},
+            user_id=SHARED_SCOPE,
+        )
+
+        self.db.set_manifest_quantity("ID1002", 7)
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        group = list(api.groups.values())[0]
+        self.assertEqual(group["imageUrls"], [COVER])
+
+    def test_a_new_listing_still_takes_the_account_default(self):
+        self.db.set_listing_settings(
+            {"cover_image_url": "https://cdn.example.com/account-wide.png"},
+            user_id=SHARED_SCOPE,
+        )
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        group = list(api.groups.values())[0]
+        self.assertEqual(
+            group["imageUrls"], ["https://cdn.example.com/account-wide.png"]
+        )
 
 
 class CoverVerificationTests(PushTestCase):

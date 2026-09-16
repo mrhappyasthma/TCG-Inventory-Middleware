@@ -592,7 +592,13 @@ def push_plan(
                 marketplace_id=marketplace_id,
                 title_template=title_template,
                 option_template=option_template,
-                cover_image_url=covers.get(group_key) or account_cover,
+                # Kept apart on purpose. The staged cover is a decision
+                # somebody made on the drafts page for *this* listing; the
+                # account-wide one is a default for listings being created.
+                # Collapsing them here is what let a push overwrite the
+                # cover recorded against a live listing.
+                cover_image_url=covers.get(group_key) or "",
+                account_cover_url=account_cover,
                 counts=counts,
                 record=record,
             )
@@ -676,11 +682,17 @@ def _push_group(
     title_template: str,
     option_template: str,
     cover_image_url: str,
+    account_cover_url: str = "",
     counts: Dict[str, int],
     record: Callable[[str, str], None],
 ) -> Tuple[int, int]:
     """
     Push one listing's worth of cards. Returns (created, updated).
+
+    ``cover_image_url`` is the cover **staged on this plan** for this listing,
+    and nothing else. ``account_cover_url`` is the account-wide default, which
+    applies to a listing being created. An update to a listing that already
+    exists resolves its own cover instead -- see the cover note at step 4.
 
     Ordered so that dying partway through leaves eBay and our records
     agreeing: items and offers are written and recorded before the group that
@@ -862,6 +874,32 @@ def _push_group(
 
     kept = sorted(keep.values(), key=variation_sort_key)
     entries = [(card, _sku_for(card)) for card in kept]
+
+    # The cover, in order of how much it is known.
+    #
+    # Writing the group is a full replace, so a push that guesses at the
+    # cover does not leave the listing's gallery image alone -- it replaces
+    # it. A staged choice wins, because somebody made it for this listing.
+    # Otherwise an *existing* listing resolves its own cover exactly the way
+    # a refresh does: what we recorded, then what eBay currently has, read
+    # back rather than assumed. Only a listing being created falls through to
+    # the account default and then to the first card's photo.
+    #
+    # Until this existed, a push with no staged cover went straight to
+    # `_first_image`, so approving eight quantity changes replaced the cover
+    # on a live 64-card listing with the first card's scan. `refresh_listing`
+    # had been given this precedence after the same thing happened there; the
+    # push had not, and shares the group write with it.
+    if cover_image_url:
+        cover_sent = cover_image_url
+    elif published and (managed or {}).get("ebay_parent_id"):
+        cover_sent = _cover_for_refresh(
+            db, api, str(managed["ebay_parent_id"]), ebay_group_key,
+            kept, settings, record,
+        )
+    else:
+        cover_sent = account_cover_url or _first_image(kept)
+
     api.upsert_group(ebay_group_key, _group_payload(
         ebay_group_key,
         entries,
@@ -871,7 +909,7 @@ def _push_group(
         description=description,
         # Both from the full set, for the same reason: a one-card plan was
         # narrowing the listing-level aspects and could blank the cover.
-        cover_image_url=cover_image_url or _first_image(kept),
+        cover_image_url=cover_sent,
         aspects=_uniform_aspects(kept, settings),
     ))
     db.upsert_managed_listing(
@@ -1049,26 +1087,63 @@ def _apply_price_quantity(
     counts: Dict[str, int],
     record: Callable[[str, str], None],
 ) -> None:
-    """Send the price and quantity changes, then read the per-SKU verdicts."""
+    """
+    Send the price and quantity changes, then read the per-SKU verdicts.
+
+    **Quantity goes on the offer as well as on the inventory item**, and the
+    offer is the one that matters. A published listing serves the quantity
+    held on its offer, so an update that sets only
+    ``shipToLocationAvailability`` is accepted by eBay -- 200 per SKU, no
+    warning, nothing to see -- and changes nothing a buyer can see. That is
+    not hypothetical: a push of eight quantity changes onto a live 64-card
+    listing reported eight cards pushed and zero failed, while
+    ``getOffers`` went on reporting every one of the eight old numbers. The
+    listing kept selling stock at the previous count for as long as it took
+    somebody to notice.
+
+    Both fields are sent in the same request, which is the shape eBay's own
+    documented example uses, so the item and its offer cannot drift apart.
+    The item-level figure still matters: it is what a Refresh re-sends and
+    what ``getInventoryItem`` reports.
+    """
     if not updates:
         return
     requests = []
+    sendable: List[Dict[str, Any]] = []
     for item in updates:
-        request: Dict[str, Any] = {
-            "sku": _sku_for(item),
-            "shipToLocationAvailability": {
-                "quantity": int(item.get("proposed_qty") or 0)
-            },
+        sku = _sku_for(item)
+        quantity = int(item.get("proposed_qty") or 0)
+        offer_id = str(item.get("offer_id") or "").strip()
+        if not offer_id:
+            # No offer means nothing here can move what the listing sells, so
+            # this must not be sent and reported as done. An item-only update
+            # is exactly the silent no-op described above.
+            reason = (
+                "no offer is on record for this card, and a published "
+                "listing serves its quantity from the offer -- so this "
+                "change could not be applied. Run a sync, or use Refresh on "
+                "the eBay Listings tab, to recover the offer id."
+            )
+            _mark(db, item, STATUS_DEFERRED, counts, reason)
+            record("WARN", f"{sku}: {reason}")
+            continue
+        offer: Dict[str, Any] = {
+            "offerId": offer_id,
+            "availableQuantity": quantity,
         }
         price = item.get("proposed_price")
         # A zero-out leaves the price alone: the card is out of stock, not on
         # sale. An omitted field is how eBay is told to leave one untouched.
         if price is not None and item["action"] == ACTION_UPDATE:
-            request["offers"] = [{
-                "offerId": str(item["offer_id"]),
-                "price": {"value": f"{float(price):.2f}", "currency": "USD"},
-            }]
-        requests.append(request)
+            offer["price"] = {
+                "value": f"{float(price):.2f}", "currency": "USD"
+            }
+        requests.append({
+            "sku": sku,
+            "shipToLocationAvailability": {"quantity": quantity},
+            "offers": [offer],
+        })
+        sendable.append(item)
 
     failed: Dict[str, str] = {}
     for start in range(0, len(requests), BULK_LIMIT):
@@ -1085,7 +1160,7 @@ def _apply_price_quantity(
         for sku, message in api.failures(rows):
             failed[sku] = message
 
-    for item in updates:
+    for item in sendable:
         sku = _sku_for(item)
         if sku in failed:
             _mark(db, item, STATUS_FAILED, counts, failed[sku])

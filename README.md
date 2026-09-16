@@ -741,6 +741,30 @@ the repricer would decide, each with its reason. On the NAS:
 docker compose exec tcg-middleware python scripts/explain_price.py "Rare Candy"
 ```
 
+### A quantity is served from the offer
+
+A published listing sells from the quantity held on its **offer**. The
+inventory item carries a quantity too, and setting only that one is the most
+convincing way to change nothing: eBay accepts the call, answers `200` for
+every SKU, and the listing goes on selling the previous count. That happened
+to eight cards on a live 64-card listing — the push logged *"8 card(s)
+pushed, 0 failed"* and `getOffers` still reported all eight old numbers
+afterwards.
+
+A push now sends both figures in the same request, so they cannot drift.
+Two consequences worth keeping in mind:
+
+* **Refresh cannot restock.** It writes the inventory items and the group and
+  never touches offers, which is deliberate — a repair must not move stock —
+  but it means Refresh is not the tool for a quantity that did not take.
+* **A silent miss hides itself.** A confirmed push writes the quantity into
+  the mirror as eBay's, so the catalogue and the mirror then agree with each
+  other and not with eBay, and the card stops appearing in drafts. Run a
+  **Module B sync** to put eBay's real figures back before rebuilding.
+
+`scripts/inspect_listing.py <item id>` prints eBay's own number per card as
+`eBay qty`, which is the way to settle it.
+
 ### Restoring a listing a partial push narrowed
 
 Writing an inventory item group is a **full replace**: a SKU absent from
@@ -1602,6 +1626,15 @@ matters more than it sounds: a later Refresh rewrites the group, finds no cover
 recorded, and would substitute the first card's photo. It did exactly that
 once.
 
+**A push with no cover staged leaves the live listing's cover alone.** Because
+the group is rewritten in full, the cover is decided on every push whether or
+not you asked for one — so a draft of pure quantity changes used to replace a
+listing's gallery image with the first card's scan, silently. It now resolves
+the same way Refresh does: your staged choice, else the cover recorded for
+that listing, else whatever eBay currently has, read back rather than guessed.
+Only a listing being **created** falls through to the account-wide default and
+then to the first card's picture.
+
 **Blockers gate the approve button.** eBay refuses an entire variation listing
 when any single one of its offers is invalid, and it only says so *after* you
 have approved — by which point whoever approved it has walked away. So the
@@ -1764,7 +1797,10 @@ recorded and the dialog says why, so nothing is silently lost.
   it, and `--all` finds any already in place.
 * This is stored **per listing**, separately from the global **Cover photo URL**
   in Listing Rules — that one is the default applied to *new* listings, whereas
-  this overrides one specific live listing. A re-sync does not disturb it.
+  this overrides one specific live listing. A re-sync does not disturb it,
+  and neither does a push: writing the listing again keeps the cover recorded
+  here, falling back to whatever eBay currently has rather than to a card
+  photo. The account-wide default never overrides this one.
 
 ---
 
