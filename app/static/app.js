@@ -3057,6 +3057,9 @@ function openCoverModal(itemId) {
     }
     document.getElementById("coverUrlInput").value =
         listing ? (listing.cover_image_url || "") : "";
+    // Cleared before measuring again, so a refusal from the last time this
+    // dialog was opened cannot leave the button dead for a different URL.
+    setCoverSizeNote(null);
     updateCoverPreview();
 
     document.getElementById("coverModal").classList.remove("hidden");
@@ -3072,6 +3075,11 @@ function closeCoverModal() {
 
 // Loading the URL in the browser is a cheap sanity check: if it will not render
 // here, eBay is unlikely to be able to fetch it either.
+// eBay's minimum for the longest side of a listing picture. Duplicated
+// from the server rather than fetched, because it is a published eBay rule
+// and a round trip to learn it would defeat the point of checking here.
+const EBAY_MIN_LONGEST_SIDE = 500;
+
 function updateCoverPreview() {
     const url = document.getElementById("coverUrlInput").value.trim();
     const wrap = document.getElementById("coverPreviewWrap");
@@ -3080,16 +3088,100 @@ function updateCoverPreview() {
 
     if (!/^https?:\/\//i.test(url)) {
         wrap.classList.add("hidden");
+        setCoverSizeNote(null);
         return;
     }
     err.classList.add("hidden");
+    setCoverSizeNote(null);
     img.style.display = "";
     img.onerror = () => {
         img.style.display = "none";
         err.classList.remove("hidden");
+        setCoverSizeNote(null);
     };
+    // The image is in the browser by the time this fires, so its true size
+    // costs nothing to read -- and it is the only thing that decides whether
+    // eBay will take it.
+    img.onload = () => setCoverSizeNote({
+        width: img.naturalWidth,
+        height: img.naturalHeight,
+    });
     img.src = url;
     wrap.classList.remove("hidden");
+}
+
+// The affordance the terminal was standing in for. Until this existed the
+// only sign of a picture eBay would refuse was a line in the log after
+// pressing Save -- or, worse, a 400 on an unrelated price update weeks
+// later. A cover too small also disables the button: the server refuses it,
+// so offering to send it would be offering a round trip that cannot work.
+// The size of an image, measured by the browser, or null if it could not
+// be established. Null is not a pass: it means the question was not
+// answered, and the server still checks. Used by flows that have no preview
+// element to read naturalWidth from -- the drafts page asks for a URL in a
+// prompt, so there is nothing on screen to measure.
+function measureImageInBrowser(url) {
+    return new Promise(resolve => {
+        if (!/^https?:/i.test(url)) { resolve(null); return; }
+        const probe = new Image();
+        // Whichever settles first wins; the rest are ignored. The timeout is
+        // there because a URL that never loads and never errors would
+        // otherwise hold up the dialog indefinitely.
+        probe.onload = () => resolve({
+            width: probe.naturalWidth, height: probe.naturalHeight,
+        });
+        probe.onerror = () => resolve(null);
+        setTimeout(() => resolve(null), 8000);
+        probe.src = url;
+    });
+}
+
+// One wording for a refused picture, so the dialog, the drafts prompt and
+// the log all say the same thing.
+function tooSmallMessage(size) {
+    return `${size.width} × ${size.height} is too small for eBay, which needs `
+        + `${EBAY_MIN_LONGEST_SIDE} pixels on the longest side.`
+        + "\n\n"
+        + `It would also block later price and quantity updates to this `
+        + `listing: eBay re-checks every picture whenever anything about a `
+        + `listing changes, and reports it as an error naming its own copy of `
+        + `the file, which is hard to trace back.`;
+}
+
+function setCoverSizeNote(size) {
+    const note = document.getElementById("coverSizeNote");
+    const submit = document.getElementById("coverModalSubmit");
+    if (!note) return;
+
+    if (!size || !size.width || !size.height) {
+        note.classList.add("hidden");
+        note.textContent = "";
+        if (submit) {
+            submit.disabled = false;
+            submit.removeAttribute("title");
+        }
+        return;
+    }
+
+    const longest = Math.max(size.width, size.height);
+    const tooSmall = longest < EBAY_MIN_LONGEST_SIDE;
+    note.classList.remove("hidden");
+    note.className = "text-[11px] mt-1.5 "
+        + (tooSmall ? "text-rose-400 font-semibold" : "text-emerald-400");
+    note.textContent = tooSmall
+        ? `${size.width} × ${size.height} — too small. eBay needs `
+          + `${EBAY_MIN_LONGEST_SIDE} pixels on the longest side, and it `
+          + `re-checks every picture whenever the listing changes, so this `
+          + `would also block later price and quantity updates.`
+        : `${size.width} × ${size.height} — large enough for eBay.`;
+    if (submit) {
+        submit.disabled = tooSmall;
+        if (tooSmall) {
+            submit.title = "eBay would reject this picture.";
+        } else {
+            submit.removeAttribute("title");
+        }
+    }
 }
 
 document.getElementById("coverUrlInput")?.addEventListener("input", updateCoverPreview);
@@ -3570,6 +3662,20 @@ async function openDraftCoverPrompt(button) {
     );
     if (entered === null) return;
 
+    // Checked here, before the round trip. The server refuses this too, but
+    // its refusal only reached the terminal -- so choosing a picture eBay
+    // would reject looked like it had worked.
+    const chosen = entered.trim();
+    if (chosen) {
+        const size = await measureImageInBrowser(chosen);
+        if (size && Math.max(size.width, size.height) < EBAY_MIN_LONGEST_SIDE) {
+            const why = tooSmallMessage(size);
+            alert(why);
+            logToTerminal("ERROR", `[DRAFTS] Cover photo not staged. ${why}`);
+            return;
+        }
+    }
+
     try {
         const res = await fetch(`/api/plans/${currentDraftPlan.plan.id}/cover`, {
             method: "POST",
@@ -3584,8 +3690,12 @@ async function openDraftCoverPrompt(button) {
                 ? `[DRAFTS] Cover staged for ${groupKey}`
                 : `[DRAFTS] Cover choice cleared for ${groupKey}`
         );
+        if (data.picture_note) logToTerminal("WARN", data.picture_note);
         await fetchDraftPlan();
     } catch (err) {
+        // On screen as well as in the log: this flow is driven by a prompt,
+        // so there is no panel for it to fail quietly in.
+        alert(err.message);
         logToTerminal("ERROR", `[DRAFTS] Cover photo failed: ${err.message}`);
     }
 }

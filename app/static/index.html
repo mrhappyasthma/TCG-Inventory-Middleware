@@ -1140,6 +1140,18 @@
                     <p class="text-[11px] text-slate-400 mb-1.5">Preview</p>
                     <img id="coverPreview" alt="Cover preview" class="max-h-40 rounded-lg border border-slate-700 bg-dark-900">
                     <p id="coverPreviewError" class="hidden text-[11px] text-amber-300 mt-1.5">That URL did not load in the browser. eBay may not be able to fetch it either.</p>
+                    <!--
+                        The browser has already downloaded the image to show
+                        the preview, so its real dimensions are free here.
+                        Worth saying out loud: eBay needs 500 pixels on the
+                        longest side, and it re-checks every picture on a
+                        listing whenever anything changes -- so a small cover
+                        blocks later price and quantity updates, weeks later,
+                        in an error naming eBay's own copy of the file. The
+                        server refuses one too, but being told at the moment
+                        of choosing beats being refused on submit.
+                    -->
+                    <p id="coverSizeNote" class="hidden text-[11px] mt-1.5"></p>
                 </div>
 
                 <!--
