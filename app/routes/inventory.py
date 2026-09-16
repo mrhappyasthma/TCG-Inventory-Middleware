@@ -95,6 +95,28 @@ class RemarkUpdateRequest(BaseModel):
     # in the inventory table and the packing-slip column.
     remarks: str = Field(default="", max_length=REMARK_MAX_LENGTH)
 
+class BulkRemarkRequest(BaseModel):
+    """
+    Set one bin/remark across every card matching an inventory filter.
+
+    The filter fields mirror the inventory list's query parameters exactly,
+    because the rows written have to be the rows the person was looking at.
+
+    ``expect_count`` is the safety interlock. The caller sends the number of
+    cards it believes it is about to change, and the request is refused if the
+    server counts something else. It guards the failure that matters here: a
+    filter field dropped, renamed or mistyped between the page and the server
+    makes the WHERE clause match *everything*, which would silently relabel
+    the entire catalogue and cannot be undone from the page. A count is cheap
+    to send and turns that from a disaster into a 409.
+    """
+
+    remarks: str = Field(default="", max_length=REMARK_MAX_LENGTH)
+    search: Optional[str] = None
+    set_name: Optional[str] = None
+    below_target: bool = False
+    expect_count: int = Field(ge=0, le=100000)
+
 class ManualCardAddRequest(BaseModel):
     product_name: str
     set_name: str
@@ -339,6 +361,77 @@ def set_card_remark(
         "previous": result["previous"],
         "current": result["current"],
     }
+
+@router.post("/api/inventory/bulk-remarks")
+def bulk_set_remarks_endpoint(
+    req: BulkRemarkRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Set the bin/remark on every card matching a filter, in one write.
+
+    Answers "put everything in this set, or everything matching this search,
+    on shelf B" without touching eight hundred cards by hand.
+
+    A **local label only**, exactly as for a single card: a bin reaches eBay
+    only encoded in a variation's SKU, and a SKU cannot be renamed once its
+    listing exists. Nothing here is pushed, no listing changes, and no plan is
+    needed.
+
+    Two things make it safe to hand a filter a write like this. The filter is
+    resolved by the same builder the inventory list uses, so the rows written
+    are the rows shown; and ``expect_count`` must match what the server
+    counts, so a filter that silently widened is refused rather than applied.
+    """
+    inv = inventory_for(user)
+    # The same default the list was rendered against, since below_target is
+    # defined in terms of it -- a different value here would select a
+    # different set of cards than the page counted.
+    target_default = inv.get_target_quantity_default(user_id=user["id"])
+
+    matched = inv.get_inventory_count(
+        search=req.search,
+        set_name=req.set_name,
+        below_target=req.below_target,
+        target_default=target_default,
+    )
+    if matched != req.expect_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This would have changed {matched} card(s), but the page "
+                f"expected {req.expect_count}. Nothing was written. Reload "
+                f"the inventory and try again -- the filter or the catalogue "
+                f"changed in between."
+            ),
+        )
+    if matched == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="No cards match that filter, so there is nothing to set.",
+        )
+
+    result = inv.bulk_set_manifest_remarks(
+        req.remarks,
+        search=req.search,
+        set_name=req.set_name,
+        below_target=req.below_target,
+        target_default=target_default,
+    )
+    # Recorded because it is the one edit here that touches many cards at
+    # once: the console is the only place to see afterwards what a bulk
+    # relabel actually did, and which filter it was aimed at.
+    where = req.set_name or req.search or ("below target" if req.below_target
+                                           else "the whole catalogue")
+    record_logs(inv, [{
+        "level": "INFO",
+        "message": (
+            f"Bulk bin/remark over {where}: {result['changed']} of "
+            f"{result['matched']} card(s) set to "
+            + (f"'{result['remarks']}'" if result["remarks"] else "no remark")
+        ),
+    }], "inventory")
+    return {"success": True, **result}
 
 @router.get("/api/stats")
 def get_stats_endpoint(user: Dict[str, Any] = Depends(require_active_user)):

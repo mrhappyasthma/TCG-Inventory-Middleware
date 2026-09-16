@@ -2894,5 +2894,223 @@ class TestWebApp(unittest.TestCase):
         ))
 
 
+    # -- bulk bin/remark ---------------------------------------------------
+
+    BULK_SET = "Bulk Edit Test Set"
+
+    def seed_bulk_cards(self):
+        """
+        Three cards in a set of their own.
+
+        Isolated deliberately: this suite shares one database across
+        order-dependent tests, and a bulk edit aimed at the shared fixtures
+        would change rows other tests assert on.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        for name in ("Bulk Alpha", "Bulk Beta", "Bulk Gamma"):
+            res = self.client.post(
+                "/api/inventory/add",
+                json={"product_name": name, "set_name": self.BULK_SET,
+                      "quantity": 2},
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+        return self.client.get(
+            "/api/inventory", params={"set_name": self.BULK_SET}
+        ).json()
+
+    def test_90_bulk_remark_sets_every_card_matching_the_filter(self):
+        listing = self.seed_bulk_cards()
+        self.assertEqual(listing["total"], 3)
+
+        res = self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Shelf B", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertEqual(body["matched"], 3)
+        self.assertEqual(body["changed"], 3)
+        self.assertEqual(body["remarks"], "Shelf B")
+
+        after = self.client.get(
+            "/api/inventory", params={"set_name": self.BULK_SET}
+        ).json()["items"]
+        self.assertTrue(all(c["remarks"] == "Shelf B" for c in after), after)
+
+    def test_91_bulk_remark_leaves_cards_outside_the_filter_alone(self):
+        """
+        The filter is the safety boundary, so this is the assertion that
+        matters most: a card in another set must be untouched.
+        """
+        self.seed_bulk_cards()
+        others = self.client.get(
+            "/api/inventory", params={"search": "Deerling"}
+        ).json()["items"]
+        if not others:
+            self.skipTest("no card outside the bulk set to compare against")
+        before = others[0]["remarks"]
+
+        self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Shelf C", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+
+        again = self.client.get(
+            "/api/inventory", params={"search": "Deerling"}
+        ).json()["items"][0]
+        self.assertEqual(
+            again["remarks"], before,
+            "a bulk edit must not reach outside its filter",
+        )
+
+    def test_92_a_count_that_disagrees_refuses_the_write(self):
+        """
+        The interlock. A filter field dropped or mistyped between the page
+        and the server makes the WHERE match everything, which would relabel
+        the whole catalogue with no way back. The count the page saw is sent
+        with the request precisely so that cannot happen quietly.
+        """
+        self.seed_bulk_cards()
+        self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Known", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+
+        res = self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Should not apply", "set_name": self.BULK_SET,
+                  "expect_count": 99},
+        )
+        self.assertEqual(res.status_code, 409, res.text)
+        detail = res.json()["detail"]
+        self.assertIn("3", detail)
+        self.assertIn("99", detail)
+
+        after = self.client.get(
+            "/api/inventory", params={"set_name": self.BULK_SET}
+        ).json()["items"]
+        self.assertTrue(
+            all(c["remarks"] == "Known" for c in after),
+            "a refused bulk edit must write nothing",
+        )
+
+    def test_93_an_empty_remark_clears_the_bin(self):
+        self.seed_bulk_cards()
+        self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Temporary", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+        res = self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["remarks"], "")
+        after = self.client.get(
+            "/api/inventory", params={"set_name": self.BULK_SET}
+        ).json()["items"]
+        self.assertTrue(all(c["remarks"] == "" for c in after), after)
+
+    def test_94_no_remark_is_treated_as_clearing_it(self):
+        """
+        SortSwift writes "No Remark" to mean none, and the ingest already
+        reads it that way, so typing it must mean the same rather than
+        producing a card whose bin is literally those words.
+        """
+        self.seed_bulk_cards()
+        res = self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "No Remark", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["remarks"], "")
+
+    def test_95_setting_the_same_value_twice_changes_nothing(self):
+        """
+        matched and changed are reported separately so the reply can say
+        "3 matched, 0 changed" rather than implying work was done.
+        """
+        self.seed_bulk_cards()
+        self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Stable", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+        again = self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Stable", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertEqual(again.json()["matched"], 3)
+        self.assertEqual(again.json()["changed"], 0)
+
+    def test_96_a_filter_matching_nothing_is_refused(self):
+        self.seed_bulk_cards()
+        res = self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Nowhere", "set_name": "No Such Set",
+                  "expect_count": 0},
+        )
+        self.assertEqual(res.status_code, 409, res.text)
+        self.assertIn("nothing to set", res.json()["detail"])
+
+    def test_97_bulk_remark_does_not_cross_between_accounts(self):
+        """
+        Every feature is per-user, so one account's bulk edit must not reach
+        another's catalogue even when the filters are identical.
+        """
+        self.seed_bulk_cards()
+        self.client.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Owner shelf", "set_name": self.BULK_SET,
+                  "expect_count": 3},
+        )
+
+        # A second account, in its own client so the two sessions do not
+        # share a cookie jar, with its own card in a set of the same name.
+        other = self.approved_non_admin_client()
+        other.post(
+            "/api/inventory/add",
+            json={"product_name": "Other Alpha", "set_name": self.BULK_SET,
+                  "quantity": 1},
+        )
+        theirs = other.get(
+            "/api/inventory", params={"set_name": self.BULK_SET}
+        ).json()
+        self.assertEqual(theirs["total"], 1, "accounts must not share cards")
+
+        # The same filter, the same wording, a different catalogue.
+        applied = other.post(
+            "/api/inventory/bulk-remarks",
+            json={"remarks": "Second shelf", "set_name": self.BULK_SET,
+                  "expect_count": 1},
+        )
+        self.assertEqual(applied.status_code, 200, applied.text)
+        self.assertEqual(applied.json()["changed"], 1)
+
+        owner = self.client.get(
+            "/api/inventory", params={"set_name": self.BULK_SET}
+        ).json()["items"]
+        self.assertEqual(len(owner), 3)
+        self.assertTrue(
+            all(c["remarks"] == "Owner shelf" for c in owner),
+            f"the other account's edit leaked in: {owner}",
+        )
+        still = other.get(
+            "/api/inventory", params={"set_name": self.BULK_SET}
+        ).json()["items"]
+        self.assertEqual(
+            [c["remarks"] for c in still], ["Second shelf"],
+            "and the owner's catalogue must not have overwritten theirs",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

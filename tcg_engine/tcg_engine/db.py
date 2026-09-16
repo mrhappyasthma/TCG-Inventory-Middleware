@@ -3694,6 +3694,105 @@ class Database:
             value = int(DEFAULT_TARGET_QUANTITY)
         return max(0, min(999, value))
 
+    @staticmethod
+    def _clean_remark(remarks: Optional[str]) -> str:
+        """
+        The stored form of a typed bin/remark.
+
+        Shared by the single-card and bulk setters so the two cannot disagree
+        about what "none" means. "No Remark" is SortSwift's own way of writing
+        empty and the ingest already treats it so; typing it by hand means the
+        same thing, rather than a card whose bin is literally those words.
+        """
+        cleaned = str(remarks or "").strip()
+        if cleaned.lower() in ("no remark", "none", "-"):
+            return ""
+        return cleaned
+
+    def bulk_set_manifest_remarks(
+        self,
+        remarks: Optional[str],
+        *,
+        search: Optional[str] = None,
+        set_name: Optional[str] = None,
+        below_target: bool = False,
+        target_default: int = 4,
+    ) -> Dict[str, Any]:
+        """
+        Set the bin/remark on every card matching an inventory filter.
+
+        The filter comes from ``_build_where``, the same builder
+        ``get_inventory`` and ``get_inventory_count`` use, and that is the
+        point rather than a convenience: a bulk write whose idea of "matching"
+        differs from the list the person was looking at would edit rows they
+        never saw. One builder means the rows written are the rows shown.
+
+        ``matched`` and ``changed`` are both reported and are usually
+        different -- a card already holding the target value is matched and not
+        changed -- because "47 cards matched, 3 changed" is the answer to
+        "did that do what I meant", and a single number is not.
+
+        Local only, like the single-card setter: a bin reaches eBay only
+        encoded in a variation's SKU, and a SKU cannot be renamed once its
+        listing exists. So this writes nothing to eBay and needs no push.
+        """
+        cleaned = self._clean_remark(remarks)
+        where_clause, params = self._build_where(
+            search, set_name, below_target, target_default
+        )
+        select = f"""
+            SELECT m.manifest_id, COALESCE(m.remarks, '') AS remarks,
+                   m.product_name, COALESCE(m.card_number, '') AS card_number
+            FROM manifest m
+            LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
+            {where_clause}
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(select, params)
+            rows = [dict(row) for row in cursor.fetchall()]
+            changing = [r for r in rows if str(r["remarks"] or "") != cleaned]
+
+            if changing:
+                # Written by id rather than by re-running the filter as an
+                # UPDATE ... WHERE: the ids were just read under this filter,
+                # so the write cannot drift from the count that was reported,
+                # and a filter referencing the joined table stays legal.
+                ids = [r["manifest_id"] for r in changing]
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start:start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    cursor.execute(
+                        f"""
+                        UPDATE manifest
+                           SET remarks = ?,
+                               remarks_edited_at = CASE
+                                   WHEN ? = '' THEN NULL
+                                   ELSE CURRENT_TIMESTAMP
+                               END
+                         WHERE manifest_id IN ({placeholders})
+                        """,
+                        [cleaned or None, cleaned, *chunk],
+                    )
+                conn.commit()
+
+        return {
+            "remarks": cleaned,
+            "matched": len(rows),
+            "changed": len(changing),
+            # A few of the cards actually written, so the reply can show what
+            # was touched rather than only how many.
+            "sample": [
+                {
+                    "manifest_id": r["manifest_id"],
+                    "product_name": r["product_name"],
+                    "card_number": r["card_number"],
+                    "previous": str(r["remarks"] or ""),
+                }
+                for r in changing[:10]
+            ],
+        }
+
     def set_manifest_remarks(
         self, manifest_id: str, remarks: Optional[str]
     ) -> Optional[Dict[str, Any]]:
@@ -3711,12 +3810,7 @@ class Database:
         be renamed once the listing exists -- eBay returns Success and
         changes nothing.
         """
-        cleaned = str(remarks or "").strip()
-        # "No Remark" is SortSwift's own way of writing "none", and the
-        # ingest already treats it as empty. Typing it here means the same
-        # thing, rather than a card whose bin is literally the words.
-        if cleaned.lower() in ("no remark", "none", "-"):
-            cleaned = ""
+        cleaned = self._clean_remark(remarks)
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(

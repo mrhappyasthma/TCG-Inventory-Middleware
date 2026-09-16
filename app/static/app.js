@@ -1752,6 +1752,8 @@ async function fetchInventory() {
         }
         renderInventoryTable(data.items, data.total, offset);
         renderRestockSummary(data);
+        lastInventoryTotal = Number(data.total) || 0;
+        updateBulkRemarkButton();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="14" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
     }
@@ -2105,6 +2107,138 @@ function renderInventoryTable(items, total, offset) {
 function toggleBelowTarget() {
     currentPage = 1;
     fetchInventory();
+}
+
+// How many cards the current filters select, from the same response that
+// drew the table. A bulk edit acts on exactly this set, so this number is
+// what the button advertises and what the request is checked against.
+let lastInventoryTotal = 0;
+
+// A sentence describing the filters in force, for a dialog that has to say
+// what it is about to change before it changes it.
+function currentInventoryScope() {
+    const parts = [];
+    if (currentSetFilter) parts.push(`set “${currentSetFilter}”`);
+    if (currentSearch) parts.push(`search “${currentSearch}”`);
+    if (belowTargetOnly()) parts.push("held below target");
+    return parts.length ? parts.join(", ") : "your whole catalogue";
+}
+
+function updateBulkRemarkButton() {
+    const label = document.getElementById("btnOpenBulkRemarkLabel");
+    const button = document.getElementById("btnOpenBulkRemark");
+    if (label) {
+        label.textContent = lastInventoryTotal
+            ? `Set bin (${lastInventoryTotal.toLocaleString()})`
+            : "Set bin";
+    }
+    if (button) {
+        button.disabled = !lastInventoryTotal;
+        button.title = lastInventoryTotal
+            ? `Set the bin/remark on all ${lastInventoryTotal} card(s) `
+              + `matching ${currentInventoryScope()}`
+            : "No cards match the current filters";
+    }
+}
+
+function openBulkRemarkModal() {
+    if (!lastInventoryTotal) return;
+    const scope = document.getElementById("bulkRemarkScope");
+    if (scope) {
+        scope.innerHTML = `This will set the bin on `
+            + `<span class="font-bold text-white">${lastInventoryTotal.toLocaleString()}</span> `
+            + `card(s) &mdash; ${escapeHtml(currentInventoryScope())}.`;
+    }
+    // The rows on this page, as a concrete sample of what is being edited.
+    // Only a sample: the edit covers the whole filtered set, not one page,
+    // and saying so matters more than listing it.
+    const sample = document.getElementById("bulkRemarkSample");
+    if (sample) {
+        const shown = (lastInventoryItems || []).slice(0, 5);
+        sample.innerHTML = shown.length
+            ? `<p class="text-slate-500">For example:</p>`
+              + shown.map(card => `<p>${escapeHtml(card.product_name)}
+                  ${escapeHtml(card.card_number || "")}
+                  <span class="text-slate-500">${card.remarks
+                      ? "is in “" + escapeHtml(card.remarks) + "”"
+                      : "has no bin"}</span></p>`).join("")
+              + (lastInventoryTotal > shown.length
+                  ? `<p class="text-slate-500">… and ${(lastInventoryTotal - shown.length).toLocaleString()} more.</p>`
+                  : "")
+            : "";
+    }
+    const input = document.getElementById("bulkRemarkInput");
+    if (input) input.value = "";
+    document.getElementById("bulkRemarkModal").classList.remove("hidden");
+    syncModalScrollLock();
+    if (input) input.focus();
+}
+
+function closeBulkRemarkModal() {
+    document.getElementById("bulkRemarkModal").classList.add("hidden");
+    syncModalScrollLock();
+}
+
+async function submitBulkRemark(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    const input = document.getElementById("bulkRemarkInput");
+    const remarks = input ? input.value.trim() : "";
+    // Clearing is the one direction that destroys information rather than
+    // replacing it, so it asks. It also hands the field back to the export,
+    // which is a change of ownership and not just of value.
+    if (!remarks && !confirm(
+        `Clear the bin on ${lastInventoryTotal} card(s)?`
+        + "\n\nThey will follow your SortSwift export again."
+    )) {
+        return;
+    }
+
+    const button = document.getElementById("bulkRemarkSubmit");
+    const wasLabel = button ? button.textContent : null;
+    if (button) { button.disabled = true; button.textContent = "Setting…"; }
+    try {
+        const res = await fetch("/api/inventory/bulk-remarks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                remarks,
+                search: currentSearch || null,
+                set_name: currentSetFilter || null,
+                below_target: belowTargetOnly(),
+                // The count this page showed. The server refuses the write if
+                // it disagrees, so a filter that widened in between cannot
+                // quietly relabel everything.
+                expect_count: lastInventoryTotal,
+            }),
+        });
+        const data = await readJsonResponse(res);
+        if (data === null) {
+            closeBulkRemarkModal();
+            logToTerminal("WARN", (
+                `The connection dropped while the bins were being set (a `
+                + `${res.status} page came back instead of a result). It may `
+                + `have gone through -- reload the inventory to see.`
+            ));
+            return;
+        }
+        if (!res.ok) throw new Error(data.detail || "Could not set the bins");
+
+        closeBulkRemarkModal();
+        logToTerminal(
+            data.changed ? "SUCCESS" : "INFO",
+            `${data.changed} of ${data.matched} card(s) set to `
+            + (data.remarks ? `“${data.remarks}”` : "no bin")
+            + (data.changed === 0 ? " -- they already held that value." : "")
+        );
+        fetchInventory();
+    } catch (err) {
+        // On screen, not only in the log: this is a bulk write and the
+        // dialog is where the person is looking.
+        alert(err.message);
+        logToTerminal("ERROR", `Bulk bin failed: ${err.message}`);
+    } finally {
+        if (button) { button.disabled = false; button.textContent = wasLabel; }
+    }
 }
 
 function belowTargetOnly() {

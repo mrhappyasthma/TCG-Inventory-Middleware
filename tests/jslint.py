@@ -278,3 +278,49 @@ def _resume_template(source: str, i: int):
             return i + 1, "", False
         i += 1
     return i, "a ` template reached end of file", False
+
+
+def _main(argv: List[str]) -> int:
+    """
+    Check the dashboard's JavaScript from the command line.
+
+    This module is consumed by ``tests/test_deployment.py``, which is where
+    the check is enforced. It gained a command line because running
+    ``python tests/jslint.py`` looked like it validated something and did
+    not: with no ``__main__`` block the file imported cleanly, printed
+    nothing and exited 0. Anyone reaching for it as a quick check -- which is
+    exactly when it is wanted, after editing app.js with a script -- got a
+    silent pass regardless of the file's state, which is worse than having no
+    command at all.
+    """
+    import glob
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    paths = argv or sorted(
+        glob.glob(os.path.join(root, "app", "static", "*.js"))
+    )
+    if not paths:
+        print("no JavaScript found to check")
+        return 1
+
+    total = 0
+    for path in paths:
+        with open(path, encoding="utf-8") as handle:
+            problems = check_javascript(handle.read())
+        name = os.path.relpath(path, root)
+        for problem in problems:
+            total += 1
+            print(f"{name}:{problem.line}: {problem.kind}: {problem.detail}")
+        if not problems:
+            print(f"{name}: ok")
+    if total:
+        print(f"{total} problem(s) found")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(_main(sys.argv[1:]))
