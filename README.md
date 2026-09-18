@@ -741,6 +741,37 @@ the repricer would decide, each with its reason. On the NAS:
 docker compose exec tcg-middleware python scripts/explain_price.py "Rare Candy"
 ```
 
+### Why a draft shows the wrong condition
+
+A draft block is headed `<set> · <condition>`, and that condition is the one
+stored on the cards in it — nothing on the drafts page shows a per-card
+condition, so a block headed **LP** means those cards are catalogued as LP.
+
+The condition is taken **verbatim from the export's `Condition` column** and is
+never inferred, so the first thing to check is that column rather than the
+`CD:Card Condition` descriptor beside it: they are different fields, and only
+the plain one becomes the card's condition.
+
+Two things produce a surprising heading, and they need different remedies:
+
+```bash
+python scripts/explain_condition.py "Ascended Heroes"
+python scripts/explain_condition.py            # every set, one line each
+```
+
+* **A card at the minority grade.** Named individually, because the fix is per
+  card: correct it in SortSwift, re-export, re-upload.
+* **A twin.** Condition is part of a card's identity (name + set + condition +
+  printing), so importing the same card at a second grade creates a *second
+  card* rather than correcting the first. One set then shows two blocks, the
+  older of which holds the stock and the eBay link. The script names both
+  manifest ids and when each was catalogued, so a card that predates the
+  import being blamed is obvious.
+
+Note the page orders blocks by group key, so `…|LP` sorts **above** `…|NM` — a
+one-card LP block sits on top of the large NM one, which reads at a glance as
+though the whole set came in at the wrong grade.
+
 ### A quantity is served from the offer
 
 A published listing sells from the quantity held on its **offer**. The
