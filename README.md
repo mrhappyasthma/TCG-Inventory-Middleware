@@ -1638,7 +1638,8 @@ will publish it, with one row per card. On each row you can:
 
 * adjust the **quantity** or **price**;
 * **move the card into another variation listing**, or give it a single of its
-  own, from the Listing dropdown;
+  own, from the Listing dropdown — only listings of the **same condition** are
+  offered, because eBay applies one condition to a whole listing;
 * **leave it out** of the push entirely.
 
 The value eBay is currently known to hold appears struck through beside each
@@ -1675,6 +1676,13 @@ category, no postal code (an Add without an item location is rejected with error
 80-character limit, or **no item specifics on record for a card being listed for
 the first time**. Fix the card or leave it out; leaving it out is eBay's own
 documented way to unblock the rest of a group.
+
+One blocker is not about eBay refusing anything: **a listing holding two
+conditions**. eBay accepts that happily and publishes cards under a grade that
+is not theirs, which is worse than a refusal because it is invisible once
+live. Such a block is headed in amber with both grades named. Move the odd
+cards back to their own listing, or
+[correct their condition](#correcting-a-condition-by-hand) and rebuild.
 
 The item-specifics blocker is the one whose remedy is not on this page: eBay
 marks around twenty specifics required on a card listing, and most of them —
@@ -1842,6 +1850,7 @@ recorded and the dialog says why, so nothing is silently lost.
 | **Card Title** | Links to the card on TCGplayer, built from the `TCGplayer Id` in your export. Cards added manually have no ID, so they render as plain text. |
 | **Card #** | Sorted numerically (`4/198` before `133/198`), prefixed numbering after the plain numbers. |
 | **eBay Item #** | Links to the live listing. Only present once Module B has linked it. |
+| **Condition** | Click to correct a mis-scanned grade (see below). It decides which listing the card belongs to. |
 | **Bin / Remark** | Click to edit it (see below). |
 | **Quantity** | Click to adjust it (see below). |
 | **Target** | Copies you aim to hold. Four unless the card has its own. Click to change it. |
@@ -1904,6 +1913,45 @@ not a question a page can answer.
 > this tells you to top up the cards you stock, not to complete a set against
 > its checklist. Doing the latter would mean importing each set's full product
 > list from TCGCSV, which the market-price refresh reaches but does not store.
+
+### Correcting a condition by hand
+
+Clicking a card's **Condition** badge opens a dialog for it. This is for a
+grade that was wrong in your export — a mis-scanned card — and it had no
+remedy before: the grade is passed through verbatim, and re-exporting it
+corrected creates a **second card**, because condition is part of a card's
+identity (name + set + condition + printing).
+
+It matters more than a label, because **the condition decides which listing
+the card belongs to**. eBay applies one ConditionID to an entire listing, so
+cards of two grades cannot share one. Rebuild the draft after saving.
+
+Three things the dialog will tell you:
+
+* **A card that already exists at that grade is named, not merged into.**
+  Two cards cannot share one identity, and merging would have to reconcile
+  both stock counts and any eBay link — so it says which card already holds
+  that identity and how many copies, and leaves both alone. Move the copies
+  across with the On Hand dialog and zero the other.
+* **A card already on eBay is changed with a warning.** The live listing still
+  states the old grade in its title and condition descriptor, and
+  [a variation cannot be moved between listings](#-a-variations-sku-cannot-be-renamed),
+  so the next draft will propose taking the card off that listing and adding
+  it to one for its new grade.
+* **Your export still owns the field.** Correct it in SortSwift too, or the
+  next upload mentioning the card re-creates it at the old grade.
+
+It is stored exactly as typed. The suggestions in the dialog are suggestions
+only — there is deliberately no translation table, so a vocabulary of our own
+would be a third one that can disagree with both SortSwift's and eBay's.
+
+> **The drafts page will not do this for you.** Its **Listing** dropdown only
+> offers listings of the card's own grade, and the server refuses a
+> cross-condition move whatever the page offers. Moving a card into a listing
+> of another grade used to be a click, and it produced one block holding both
+> — headed with whichever grade sorted first, which read as though the whole
+> set had come in wrong. A draft still carrying such a group is flagged in
+> amber and blocks approval.
 
 ### Editing a bin by hand
 

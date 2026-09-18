@@ -2038,9 +2038,9 @@ function renderInventoryTable(items, total, offset) {
                 ${cardThumbnailCell(item, "py-2 px-4")}
                 <td class="py-3 px-4 text-slate-400">${escapeHtml(item.set_name)}</td>
                 <td class="py-3 px-4">
-                    <span class="px-2 py-0.5 rounded text-[10px] font-medium ${conditionBadge}">
+                    <button onclick="openConditionModal('${item.manifest_id}')" title="Click to correct the grade. It decides which listing this card belongs to." class="px-2 py-0.5 rounded text-[10px] font-medium ${conditionBadge} hover:ring-1 hover:ring-brand-500 transition-all cursor-pointer">
                         ${escapeHtml(item.condition)}
-                    </span>
+                    </button>
                 </td>
                 <td class="py-3 px-4">
                     <span class="px-2 py-0.5 rounded text-[10px] bg-dark-900 border border-slate-700 text-slate-300">
@@ -2472,6 +2472,80 @@ async function saveRemark(e) {
         } else {
             logToTerminal("INFO",
                 `Bin for [${id}] cleared. Your SortSwift export owns it again.`);
+        }
+        fetchInventory();
+    } catch (err) {
+        alert(err.message);
+    }
+}
+
+// -------------------------------------------------------------------
+// CONDITION EDIT
+//
+// The grade is passed through from the export verbatim, so this is for a
+// grade that was wrong in the file. It is here rather than on the drafts page
+// because it is a fact about the card, not about one proposed change -- and
+// because the drafts page's Listing dropdown was being used for it instead,
+// which merges two grades onto one listing and eBay cannot represent that.
+// -------------------------------------------------------------------
+
+let conditionEditManifestId = null;
+
+function openConditionModal(manifestId) {
+    const row = (lastInventoryItems || []).find(i => i.manifest_id === manifestId);
+    conditionEditManifestId = manifestId;
+
+    requireElement("conditionModalCard").innerText = row
+        ? `[${row.manifest_id}] ${row.product_name}`
+          + `${row.card_number ? " #" + row.card_number : ""} - ${row.set_name}`
+        : `[${manifestId}]`;
+    const input = requireElement("conditionInput");
+    input.value = row ? (row.condition || "") : "";
+
+    requireElement("conditionModal").classList.remove("hidden");
+    syncModalScrollLock();
+    input.focus();
+    input.select();
+}
+
+function closeConditionModal() {
+    requireElement("conditionModal").classList.add("hidden");
+    syncModalScrollLock();
+    conditionEditManifestId = null;
+}
+
+async function saveCondition(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!conditionEditManifestId) return;
+
+    const condition = (requireElement("conditionInput").value || "").trim();
+    if (!condition) {
+        alert("A condition cannot be empty: a row missing one is skipped rather than guessed at.");
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/inventory/${encodeURIComponent(conditionEditManifestId)}/condition`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ condition })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to update the condition");
+
+        const id = conditionEditManifestId;
+        closeConditionModal();
+        if (data.changed) {
+            logToTerminal("SUCCESS",
+                `Condition for [${id}] set to "${data.current}"`
+                + (data.previous ? ` (was "${data.previous}")` : "") + ".");
+            // Each note is a consequence rather than a caveat: which listing
+            // the card now belongs to, what eBay still says, and who owns the
+            // field next time.
+            for (const note of data.notes || []) logToTerminal("WARN", note);
+        } else {
+            logToTerminal("INFO",
+                `Condition for [${id}] is already "${data.current}"; nothing changed.`);
         }
         fetchInventory();
     } catch (err) {
@@ -3547,6 +3621,15 @@ function isSingleGroup(groupKey) {
     return typeof groupKey === "string" && groupKey.startsWith("single:");
 }
 
+// The condition half of a variation group key, "<set>|<condition>". The key is
+// what the listing title is rendered from, so it is what a card joining that
+// listing has to agree with. Mirrors tcg_engine.plans.group_condition.
+function groupConditionOf(groupKey) {
+    if (typeof groupKey !== "string" || isSingleGroup(groupKey)) return "";
+    const bar = groupKey.indexOf("|");
+    return bar === -1 ? "" : groupKey.slice(bar + 1).trim().toLowerCase();
+}
+
 function draftGroupTitle(group, items) {
     if (isSingleGroup(group.group_key)) {
         const first = items[0];
@@ -3556,7 +3639,17 @@ function draftGroupTitle(group, items) {
     }
     const set = group.set_name || "(no set)";
     const condition = group.condition || "(no condition)";
-    return `${escapeHtml(set)} · ${escapeHtml(condition)}`;
+    // Amber when the cards in the block disagree, rather than showing one of
+    // the values as though it were the answer. The eBay Listings tab has
+    // always done this for a listing spanning several sets or conditions;
+    // this is the same rule one step earlier, and it is how a mixed group
+    // becomes visible instead of being labelled with whichever grade sorted
+    // first. A mixed condition also blocks approval: eBay applies one
+    // ConditionID to a whole listing.
+    const mixed = (group.condition_count || 0) > 1 || (group.set_count || 0) > 1;
+    const title = `${escapeHtml(set)} · ${escapeHtml(condition)}`;
+    if (!mixed) return title;
+    return `<span class="text-amber-300" title="The cards in this listing do not agree on their set or condition. eBay applies one condition to a whole listing, so this cannot be approved until they do.">⚠ ${title}</span>`;
 }
 
 async function fetchDraftPlan() {
@@ -3854,9 +3947,24 @@ function draftItemRow(item, moveTargets) {
     // The listing selector carries group keys as option values rather than
     // interpolating them into an inline handler: a group key is built from a
     // set name that came out of an uploaded CSV.
+    // Only listings this card may legally join. eBay applies one condition to
+    // a whole listing, so a target of a different grade is not a choice --
+    // moving the one LP card of a set into that set's NM listing produced a
+    // 152-card block headed LP, and approving it would have published 151
+    // near-mint cards described as lightly played. The server refuses it too;
+    // this is so the option is not offered in the first place.
+    //
+    // The card's *current* group is always kept, even if it disagrees: a
+    // draft built before this existed can be carrying such a move, and
+    // dropping the selected option would silently show it sitting somewhere
+    // it is not.
+    const own = String(item.condition || "").trim().toLowerCase();
+    const legal = moveTargets.filter(t =>
+        t.key === item.group_key || !own || groupConditionOf(t.key) === own
+    );
     const options = [
         `<option value="single:${escapeHtml(item.manifest_id)}"${isSingleGroup(item.group_key) ? " selected" : ""}>Own single listing</option>`,
-        ...moveTargets.map(t =>
+        ...legal.map(t =>
             `<option value="${escapeHtml(t.key)}"${t.key === item.group_key ? " selected" : ""}>${escapeHtml(t.label)}</option>`
         ),
     ].join("");

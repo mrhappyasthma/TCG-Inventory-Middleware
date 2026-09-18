@@ -19,7 +19,7 @@ stock target that drives the restock filter.
 
 import csv
 import io
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -94,6 +94,14 @@ class RemarkUpdateRequest(BaseModel):
     # label, not a field for prose, and an unbounded string here would end up
     # in the inventory table and the packing-slip column.
     remarks: str = Field(default="", max_length=REMARK_MAX_LENGTH)
+
+class ConditionUpdateRequest(BaseModel):
+    # The grade, as your export spells it -- "NM", "Near Mint", whatever
+    # SortSwift exports. It is stored verbatim and there is deliberately no
+    # translation table, so this is not a closed set: a value from one
+    # vocabulary would disagree with both SortSwift's and eBay's. Capped
+    # because it is rendered into a listing title.
+    condition: str = Field(min_length=1, max_length=40)
 
 class BulkRemarkRequest(BaseModel):
     """
@@ -360,6 +368,76 @@ def set_card_remark(
         "manifest_id": manifest_id,
         "previous": result["previous"],
         "current": result["current"],
+    }
+
+@router.post("/api/inventory/{manifest_id}/condition")
+def set_card_condition(
+    manifest_id: str,
+    req: ConditionUpdateRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Correct a card's condition by hand.
+
+    The grade comes verbatim from the export and is never inferred, so this is
+    for a grade that was wrong in the file. There was previously no way to fix
+    one at all: re-uploading a corrected export creates a *second* card,
+    because condition is part of a card's identity. People used the drafts
+    page's Listing dropdown instead, moving the odd card into the listing they
+    wanted -- which eBay cannot represent, since one ConditionID covers a
+    whole listing.
+
+    Two answers are refusals rather than errors, and both are shown to the
+    person: a card that already exists at the target grade is named rather
+    than merged into, and a card eBay already holds is changed with a warning,
+    because the live listing still describes the old grade.
+    """
+    inv = inventory_for(user)
+    result = inv.set_manifest_condition(manifest_id, req.condition)
+
+    if result["status"] == "missing":
+        raise HTTPException(status_code=404, detail="Card not found.")
+    if result["status"] == "twin":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{result['twin_id']} is already this card at "
+                f"{req.condition.strip()}, holding {result['twin_quantity']} "
+                f"cop{'y' if result['twin_quantity'] == 1 else 'ies'}. Two "
+                f"cards cannot share one identity, and merging them would "
+                f"have to reconcile both stock counts and any eBay link, so "
+                f"it is not done for you: move the copies onto "
+                f"{result['twin_id']} with the On Hand dialog and set this "
+                f"card to zero."
+            ),
+        )
+
+    notes: List[str] = []
+    if result["changed"]:
+        notes.append(
+            "Rebuild the draft to re-group this card: its listing is chosen "
+            "from its condition."
+        )
+        if result["was_live"]:
+            notes.append(
+                "eBay already holds this card on a listing describing the "
+                "old grade, and a variation cannot be moved between "
+                "listings. The next draft will propose taking it off that "
+                "listing and adding it to one for its new grade."
+            )
+        notes.append(
+            "Your export still owns this field, so correct it in SortSwift "
+            "too -- otherwise the next upload mentioning this card "
+            "re-creates it at the old grade."
+        )
+
+    return {
+        "success": True,
+        "manifest_id": manifest_id,
+        "previous": result["previous"],
+        "current": result["current"],
+        "changed": result["changed"],
+        "notes": notes,
     }
 
 @router.post("/api/inventory/bulk-remarks")

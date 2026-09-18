@@ -28,8 +28,10 @@ from tcg_engine.plans import (
     approve_plan,
     build_plan,
     derive_plan_items,
+    group_condition,
     group_key_for,
     is_single,
+    move_problem,
     plan_blockers,
     revalidate_item,
     single_group_key,
@@ -337,6 +339,175 @@ class PlanPersistenceTests(unittest.TestCase):
         self.db.update_plan_item(item_id, group_key=single_group_key("ID1001"))
         groups = self.db.get_plan_groups(plan_id)
         self.assertTrue(is_single(groups[0]["group_key"]))
+
+
+class OneConditionPerListingTests(unittest.TestCase):
+    """
+    eBay applies one ConditionID to a whole listing, which makes a
+    cross-condition move a false statement rather than a preference.
+
+    Reported from a live draft: a 152-card Ascended Heroes import was 151 NM
+    cards and one genuinely LP card, so it correctly produced two blocks.
+    Moving the LP card into the NM listing via the Listing dropdown merged
+    them into one block headed **LP** -- because the heading was
+    ``MIN(condition)`` over the group and 'LP' sorts first -- and approving it
+    would have published 151 near-mint cards under a listing describing them
+    as lightly played. Nothing warned.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "plans.db"))
+        self.db.set_listing_settings(COMPLETE_SETTINGS, user_id=SHARED_SCOPE)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def add_card(self, manifest_id, name, condition="Near Mint", quantity=4):
+        self.db.insert_manifest(
+            manifest_id, name, "ME: Ascended Heroes", condition, "Normal",
+            card_number="001/217",
+        )
+        self.db.set_manifest_quantity(manifest_id, quantity)
+        # What cataloguing an eBay-flavoured export leaves behind. Without it
+        # every card carries the item-specifics blocker and these tests would
+        # be asserting against that instead of the grouping.
+        self.db.set_manifest_ebay_fields(manifest_id, {
+            "item_specifics": {
+                "C:Game": "Pokémon TCG",
+                "C:Card Type": "Trainer",
+                "C:Manufacturer": "Nintendo",
+                "C:Graded": "No",
+            },
+        })
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE manifest SET price = 1.99 WHERE manifest_id = ?",
+                (manifest_id,),
+            )
+            conn.commit()
+
+    def test_a_cross_condition_move_is_refused(self):
+        problem = move_problem(
+            {"condition": "Near Mint"}, "ME: Ascended Heroes|LP"
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("Near Mint", problem)
+        self.assertIn("LP", problem)
+        self.assertIn("one condition to a whole listing", problem)
+
+    def test_a_same_condition_move_is_allowed(self):
+        # Moving between sets is deliberately still permitted: eBay imposes
+        # nothing there, and a spanning group is surfaced on screen instead.
+        self.assertIsNone(
+            move_problem({"condition": "LP"}, "Some Other Set|LP")
+        )
+
+    def test_case_and_spacing_do_not_make_a_false_mismatch(self):
+        self.assertIsNone(
+            move_problem({"condition": " near mint "}, "Base Set|Near Mint")
+        )
+
+    def test_a_single_of_its_own_is_always_allowed(self):
+        # A single is titled from the card, so it cannot disagree with it.
+        self.assertIsNone(move_problem({"condition": "LP"}, "single:ID1001"))
+        self.assertIsNone(move_problem({"condition": "LP"}, ""))
+
+    def test_group_condition_reads_the_key(self):
+        self.assertEqual(group_condition("ME: Ascended Heroes|NM"), "NM")
+        self.assertEqual(group_condition("single:ID1001"), "")
+        self.assertEqual(group_condition(""), "")
+
+    def test_a_group_holding_two_grades_blocks_approval(self):
+        """
+        Caught at approval as well as at the move, because a draft built
+        before the move was refused can still be carrying one -- and eBay
+        accepts such a listing happily, so nothing downstream would object.
+        """
+        self.add_card("ID1001", "Acerola's Mischief", "NM")
+        self.add_card("ID1002", "Bayleef", "NM")
+        self.add_card("ID1003", "Iono's Wattrel", "LP")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+
+        # As the dropdown used to allow: the LP card joins the NM listing.
+        lp_item = next(
+            row for row in self.db.get_plan_items(plan_id)
+            if row["manifest_id"] == "ID1003"
+        )
+        self.db.update_plan_item(
+            lp_item["id"], group_key="ME: Ascended Heroes|NM"
+        )
+
+        blockers = plan_blockers(self.db, plan_id)
+        mixed = [
+            problem["problem"]
+            for entry in blockers if entry["group_key"] == "ME: Ascended Heroes|NM"
+            for problem in entry["problems"]
+        ]
+        self.assertTrue(mixed, "a mixed-condition listing must block approval")
+        named = [m for m in mixed if "2 conditions" in m]
+        self.assertTrue(named, f"no mixed-condition blocker in {mixed}")
+        self.assertIn("LP, NM", named[0])
+
+        with self.assertRaises(PlanError):
+            approve_plan(self.db, plan_id, approved_by=1)
+
+    def test_a_group_of_one_grade_does_not_block(self):
+        # The healthy case must stay silent, or every draft carries a warning.
+        self.add_card("ID1001", "Acerola's Mischief", "NM")
+        self.add_card("ID1002", "Bayleef", "NM")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+
+        self.assertEqual(plan_blockers(self.db, plan_id), [])
+
+    def test_the_group_summary_states_every_grade_present(self):
+        """
+        The heading must not report one value as though the group agreed.
+
+        This is the display half of the bug: MIN() returned 'LP' for a group
+        of 151 NM cards and one LP card, which reads as a fact and was one.
+        """
+        self.add_card("ID1001", "Acerola's Mischief", "NM")
+        self.add_card("ID1002", "Iono's Wattrel", "LP")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        lp_item = next(
+            row for row in self.db.get_plan_items(plan_id)
+            if row["manifest_id"] == "ID1002"
+        )
+        self.db.update_plan_item(
+            lp_item["id"], group_key="ME: Ascended Heroes|NM"
+        )
+
+        groups = {g["group_key"]: g for g in self.db.get_plan_groups(plan_id)}
+        merged = groups["ME: Ascended Heroes|NM"]
+        self.assertEqual(merged["item_count"], 2)
+        self.assertEqual(merged["condition_count"], 2)
+        self.assertEqual(merged["condition"], "LP, NM")
+        # And a group that does agree still reads as one plain value.
+        self.add_card("ID1003", "Bayleef", "MP")
+        other = build_plan(self.db, user_id=1)["plan_id"]
+        agreed = {
+            g["group_key"]: g for g in self.db.get_plan_groups(other)
+        }["ME: Ascended Heroes|MP"]
+        self.assertEqual(agreed["condition"], "MP")
+        self.assertEqual(agreed["condition_count"], 1)
+        self.assertEqual(agreed["set_count"], 1)
+
+    def test_a_plan_item_carries_its_cards_condition(self):
+        """
+        The move check reads the card's own condition off the item, and the
+        single-item lookup did not select it -- which reads as "this card has
+        no condition" and would refuse every move rather than the wrong ones.
+        """
+        self.add_card("ID1001", "Acerola's Mischief", "NM")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        item_id = self.db.get_plan_items(plan_id)[0]["id"]
+
+        item = self.db.get_plan_item(item_id)
+        self.assertEqual(item["condition"], "NM")
+        self.assertEqual(item["set_name"], "ME: Ascended Heroes")
+        self.assertIsNone(move_problem(item, "ME: Ascended Heroes|NM"))
+        self.assertIsNotNone(move_problem(item, "ME: Ascended Heroes|LP"))
 
 
 class ApprovalTests(unittest.TestCase):

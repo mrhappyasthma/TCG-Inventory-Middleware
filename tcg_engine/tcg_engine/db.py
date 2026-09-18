@@ -99,6 +99,21 @@ CONDITION_KEY_ALIASES = {
 }
 
 
+def _joined_distinct(concatenated) -> str:
+    """
+    Tidy SQLite's ``GROUP_CONCAT(DISTINCT x)`` into a readable list.
+
+    It returns the values comma-separated in no particular order, and with no
+    way to choose a separator when DISTINCT is used. Sorted here so a group
+    reads the same way twice, and blanks dropped so a card with no value does
+    not contribute a stray comma.
+    """
+    parts = sorted(
+        {p.strip() for p in str(concatenated or "").split(",") if p.strip()}
+    )
+    return ", ".join(parts)
+
+
 def normalize_condition_key(condition) -> str:
     """
     Fold a condition string onto a canonical multiplier key.
@@ -3448,10 +3463,32 @@ class Database:
             return cursor.rowcount > 0
 
     def get_plan_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        """
+        One plan item, joined to the card it describes.
+
+        The join matches ``get_plan_items``, and is not decoration: a caller
+        holding a single item needs the card's own condition to judge whether
+        a move is legal, and the version without it returned None for that
+        field -- which reads as "this card has no condition" and would refuse
+        every move rather than only the wrong ones.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM listing_plan_item WHERE id = ?", (int(item_id),)
+                """
+                SELECT i.*,
+                       m.product_name, m.set_name, m.condition, m.printing,
+                       m.card_number, m.language
+                FROM listing_plan_item i
+                -- LEFT, so deleting a card from the catalogue while a draft
+                -- is open does not make its item vanish from this lookup.
+                -- The endpoints distinguish "no such item" from "item whose
+                -- card is gone", and turning one into the other would answer
+                -- 404 for a row that is really still there.
+                LEFT JOIN manifest m ON m.manifest_id = i.manifest_id
+                WHERE i.id = ?
+                """,
+                (int(item_id),),
             )
             row = cursor.fetchone()
             return dict(row) if row else None
@@ -3514,8 +3551,19 @@ class Database:
                                  AND TRIM(i.validation) != '' THEN 1 ELSE 0 END)
                            AS invalid_count,
                        SUM(COALESCE(i.proposed_qty, 0)) AS proposed_copies,
-                       MIN(m.set_name) AS set_name,
-                       MIN(m.condition) AS condition,
+                       -- Both are reported as *every* distinct value, not a
+                       -- sample. MIN() reads as a fact and is one: moving the
+                       -- single LP card of a set into that set's NM listing
+                       -- made MIN() return 'LP' -- alphabetically first --
+                       -- and the drafts page then headed all 152 cards "LP"
+                       -- with nothing to say the group disagreed with itself.
+                       -- The eBay Listings tab already states a spanning
+                       -- listing's values rather than showing the first; this
+                       -- is the same rule one step earlier.
+                       GROUP_CONCAT(DISTINCT m.set_name) AS set_names,
+                       COUNT(DISTINCT m.set_name) AS set_count,
+                       GROUP_CONCAT(DISTINCT m.condition) AS conditions,
+                       COUNT(DISTINCT m.condition) AS condition_count,
                        -- The listing this group maps onto, when it already
                        -- exists. NULL means the plan would create it, and a
                        -- cover then applies at creation rather than as a
@@ -3552,7 +3600,19 @@ class Database:
                 """,
                 (int(plan_id),),
             )
-            return [dict(row) for row in cursor.fetchall()]
+            rows = []
+            for row in cursor.fetchall():
+                group = dict(row)
+                # ``set_name`` and ``condition`` stay in the response because
+                # every caller reads them, but they now carry the truth: one
+                # value when the group agrees, and all of them, listed, when
+                # it does not. A caller that renders them is therefore honest
+                # without knowing about this at all, and one that wants to
+                # flag the disagreement has the counts.
+                group["set_name"] = _joined_distinct(group.pop("set_names"))
+                group["condition"] = _joined_distinct(group.pop("conditions"))
+                rows.append(group)
+            return rows
 
     def set_manifest_price(
         self, manifest_id: str, price: float
@@ -3835,6 +3895,111 @@ class Database:
             )
             conn.commit()
         return {"previous": previous, "current": cleaned}
+
+    def set_manifest_condition(
+        self, manifest_id: str, condition: str
+    ) -> Dict[str, Any]:
+        """
+        Correct a card's condition by hand.
+
+        The condition normally comes verbatim from the export and is never
+        inferred, so this is for the case where the export itself was wrong --
+        a mis-scanned grade. It exists because there was no way to fix one:
+        re-uploading a corrected export creates a *second* card, since
+        condition is part of a card's identity, and the drafts page's Listing
+        dropdown was being used instead to shove the odd card into the right
+        listing, which eBay cannot represent.
+
+        Returns a verdict dict rather than raising, because two of the three
+        outcomes are answers the caller has to show a person:
+
+        ``ok``
+            Changed. ``previous`` and ``current`` say what moved, and
+            ``was_live`` warns that eBay already holds this card under the old
+            grade.
+        ``twin``
+            Another card already has this identity at the target condition,
+            named in ``twin_id``. **Refused rather than merged**: merging
+            means reconciling two stock counts and possibly two live eBay
+            links, and a wrong merge silently destroys a listing's link to
+            its card. Adjusting the two quantities by hand is the safe
+            remedy, and it is a decision rather than a mechanism.
+        ``missing``
+            No such card.
+
+        The export still owns the field. A corrected card whose export is
+        unchanged will be re-created at its old grade by the next upload that
+        mentions it, so the caller is expected to say so.
+        """
+        card_id = str(manifest_id).strip()
+        wanted = self._normalize(condition)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM manifest WHERE manifest_id = ?", (card_id,)
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return {"status": "missing"}
+            card = dict(row)
+            previous = str(card["condition"] or "")
+            if previous.casefold() == wanted.casefold():
+                return {
+                    "status": "ok", "previous": previous, "current": previous,
+                    "changed": False, "was_live": False,
+                }
+
+            cursor.execute(
+                """
+                SELECT manifest_id, COALESCE(quantity, 0) AS quantity
+                  FROM manifest
+                 WHERE manifest_id != ?
+                   AND LOWER(product_name) = LOWER(?)
+                   AND LOWER(set_name) = LOWER(?)
+                   AND LOWER(condition) = LOWER(?)
+                   AND LOWER(COALESCE(printing, '')) = LOWER(COALESCE(?, ''))
+                 LIMIT 1
+                """,
+                (
+                    card_id, card["product_name"], card["set_name"], wanted,
+                    card["printing"],
+                ),
+            )
+            twin = cursor.fetchone()
+            if twin is not None:
+                return {
+                    "status": "twin",
+                    "previous": previous,
+                    "current": previous,
+                    "twin_id": twin["manifest_id"],
+                    "twin_quantity": twin["quantity"],
+                }
+
+            # Whether eBay already holds this card, which the caller must
+            # mention: the listing it is on states the *old* grade in its
+            # title and condition descriptor, and a variation cannot be moved
+            # between listings -- so correcting the grade here means the next
+            # draft proposes taking it off that listing and putting it on
+            # another.
+            cursor.execute(
+                """
+                SELECT TRIM(COALESCE(ebay_parent_id, '')) AS parent
+                  FROM ebay_variations WHERE manifest_id = ?
+                """,
+                (card_id,),
+            )
+            live_row = cursor.fetchone()
+            was_live = bool(live_row and live_row["parent"])
+
+            cursor.execute(
+                "UPDATE manifest SET condition = ? WHERE manifest_id = ?",
+                (wanted, card_id),
+            )
+            conn.commit()
+        return {
+            "status": "ok", "previous": previous, "current": wanted,
+            "changed": True, "was_live": was_live,
+        }
 
     def set_manifest_ebay_fields(
         self, manifest_id: str, fields: Optional[Dict[str, Any]]

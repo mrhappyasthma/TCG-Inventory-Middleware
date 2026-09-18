@@ -103,6 +103,61 @@ def is_single(group_key: Optional[str]) -> bool:
     return bool(group_key) and group_key.startswith(SINGLE_PREFIX)
 
 
+def group_condition(group_key: Optional[str]) -> str:
+    """
+    The condition half of a variation group key, or "" if it has none.
+
+    The key is authoritative about the listing's grade -- it is what the title
+    is rendered from -- so this is what a card joining the listing has to
+    agree with.
+    """
+    if not group_key or is_single(group_key):
+        return ""
+    _, _, condition = str(group_key).partition("|")
+    return condition.strip()
+
+
+def move_problem(card: Dict[str, Any], group_key: Optional[str]) -> Optional[str]:
+    """
+    Why this card may not be moved into that listing, or None if it may.
+
+    **eBay applies one ConditionID to an entire listing.** That is the whole
+    reason the grouping key is (set, condition) rather than set alone, and it
+    makes a cross-condition move not a preference but a false statement: the
+    listing's title, its ConditionID and its condition descriptor would all
+    claim a grade that one of its variations does not have.
+
+    It was reachable from the drafts page, whose Listing dropdown offered
+    every group in the plan. Moving the one LP card of a set into that set's
+    NM listing merged 152 cards into a block headed **LP** -- because a
+    group's heading is derived from the cards in it, and with two grades
+    present the derivation picked one. Nothing warned, and approving it would
+    have published 151 near-mint cards under a listing describing them as
+    lightly played.
+
+    Moving between *sets* is left alone deliberately: eBay imposes nothing
+    there, the drafts page has always offered it, and a group holding more
+    than one set is surfaced on screen instead.
+    """
+    if not group_key or is_single(group_key):
+        # A single of the card's own is always allowed: it is titled from the
+        # card, so it cannot disagree with it.
+        return None
+    target = group_condition(group_key)
+    if not target:
+        return None
+    own = str(card.get("condition") or "").strip()
+    if own.casefold() == target.casefold():
+        return None
+    return (
+        f"this card is {own or '(no condition)'} and that listing is "
+        f"{target}. eBay applies one condition to a whole listing, so the "
+        f"two cannot share one -- its title and condition descriptor would "
+        f"describe this card wrongly. To list them together, correct the "
+        f"card's condition on the Live Inventory tab and rebuild the draft."
+    )
+
+
 def desired_price(card: Dict[str, Any]) -> Optional[float]:
     """
     The price we want the card listed at.
@@ -460,9 +515,15 @@ def plan_blockers(db: Database, plan_id: int) -> List[Dict[str, Any]]:
                 "group_key": group_key,
                 "set_name": item.get("set_name"),
                 "condition": item.get("condition"),
+                # Every grade actually present, because the fields above are
+                # whichever card arrived first and a group is not guaranteed
+                # to agree. The title check below reads `condition`, so on a
+                # mixed group it would validate a title nobody gets.
+                "conditions": set(),
                 "problems": [],
             },
         )
+        entry["conditions"].add(str(item.get("condition") or "").strip())
         for problem in json.loads(item["validation"] or "[]"):
             entry["problems"].append(
                 {
@@ -474,9 +535,28 @@ def plan_blockers(db: Database, plan_id: int) -> List[Dict[str, Any]]:
             )
 
     for group_key, entry in by_group.items():
-        for problem in validate_group_title(
-            group_key, entry.get("set_name") or "", entry.get("condition") or "", settings
-        ):
+        problems = list(validate_group_title(
+            group_key, entry.get("set_name") or "", entry.get("condition") or "",
+            settings,
+        ))
+        # A listing carries one ConditionID, so a group holding two grades
+        # publishes cards under a description that is wrong for some of them.
+        # Blocked rather than flagged: eBay accepts it happily, the mistake is
+        # invisible once live, and it is not recoverable by editing -- a
+        # variation cannot be moved between listings after publication.
+        #
+        # Caught here as well as at the move, because a draft built before the
+        # move was refused can still be carrying one.
+        grades = sorted(g for g in entry.pop("conditions", set()) if g)
+        if len(grades) > 1 and not is_single(group_key):
+            problems.append(
+                f"this listing holds {len(grades)} conditions "
+                f"({', '.join(grades)}), and eBay applies one condition to a "
+                f"whole listing. Move the odd cards back to their own "
+                f"listing, or correct their condition on the Live Inventory "
+                f"tab and rebuild the draft."
+            )
+        for problem in problems:
             entry["problems"].append(
                 {
                     "item_id": None,

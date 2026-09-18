@@ -2518,6 +2518,101 @@ class HandEditedRemarkTests(unittest.TestCase):
         self.assertIsNone(self.db.set_manifest_remarks("ID9999", "Bin A-12"))
 
 
+class ConditionCorrectionTests(unittest.TestCase):
+    """
+    Correcting a grade the export got wrong.
+
+    Condition is passed through verbatim and is part of a card's identity, so
+    a wrong grade could not be fixed at all: a corrected export creates a
+    second card rather than changing the first. The drafts page's Listing
+    dropdown was used instead, which puts two grades on one listing -- and
+    eBay applies one ConditionID to an entire listing.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "cond.db"))
+        self.db.insert_manifest(
+            "ID1001", "Iono's Wattrel", "ME: Ascended Heroes", "LP", "Normal"
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_a_grade_is_corrected_and_stored_verbatim(self):
+        result = self.db.set_manifest_condition("ID1001", "  NM  ")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["previous"], "LP")
+        self.assertEqual(result["current"], "NM")
+        self.assertTrue(result["changed"])
+        self.assertEqual(
+            self.db.get_manifest_by_id("ID1001")["condition"], "NM"
+        )
+
+    def test_setting_the_same_grade_changes_nothing(self):
+        result = self.db.set_manifest_condition("ID1001", "lp")
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["changed"])
+        # And the stored spelling is left as it was rather than re-cased.
+        self.assertEqual(
+            self.db.get_manifest_by_id("ID1001")["condition"], "LP"
+        )
+
+    def test_a_collision_is_refused_and_names_the_other_card(self):
+        """
+        Merging would have to reconcile two stock counts and possibly two
+        live eBay links, and getting that wrong destroys a listing's link to
+        its card. So it is a refusal with an answer, not a guess.
+        """
+        self.db.insert_manifest(
+            "ID1002", "Iono's Wattrel", "ME: Ascended Heroes", "NM", "Normal"
+        )
+        self.db.set_manifest_quantity("ID1002", 7)
+
+        result = self.db.set_manifest_condition("ID1001", "NM")
+        self.assertEqual(result["status"], "twin")
+        self.assertEqual(result["twin_id"], "ID1002")
+        self.assertEqual(result["twin_quantity"], 7)
+        self.assertEqual(
+            self.db.get_manifest_by_id("ID1001")["condition"], "LP",
+            "a refused change must leave the card alone",
+        )
+
+    def test_a_different_printing_is_not_a_collision(self):
+        # Printing is part of the identity too, so a reverse holo at NM is a
+        # different card and does not stand in the way.
+        self.db.insert_manifest(
+            "ID1002", "Iono's Wattrel", "ME: Ascended Heroes", "NM",
+            "Reverse Holofoil",
+        )
+        result = self.db.set_manifest_condition("ID1001", "NM")
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["changed"])
+
+    def test_a_card_ebay_already_holds_is_changed_with_a_warning(self):
+        """
+        The live listing still states the old grade in its title and its
+        condition descriptor, and a variation cannot be moved between
+        listings -- so this is a fact the caller has to surface, not a
+        reason to refuse.
+        """
+        self.db.upsert_variation("ID1001", "227523705068", 4,
+                                 custom_label="ID1001")
+        result = self.db.set_manifest_condition("ID1001", "NM")
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["was_live"])
+
+    def test_a_card_not_on_ebay_carries_no_such_warning(self):
+        result = self.db.set_manifest_condition("ID1001", "NM")
+        self.assertFalse(result["was_live"])
+
+    def test_an_unknown_card_is_reported_rather_than_created(self):
+        self.assertEqual(
+            self.db.set_manifest_condition("ID9999", "NM"),
+            {"status": "missing"},
+        )
+
+
 class StockTargetTests(unittest.TestCase):
     """
     How many copies of a card to aim to hold, and what is still missing.

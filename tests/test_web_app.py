@@ -1526,6 +1526,135 @@ class TestWebApp(unittest.TestCase):
         )
         self.assertEqual(long_one.status_code, 422)
 
+    def test_39g_a_cards_condition_can_be_corrected_by_hand(self):
+        """
+        The grade comes verbatim from the export, so a wrong one had no remedy:
+        re-uploading a corrected export creates a *second* card, because
+        condition is part of a card's identity. People used the drafts page's
+        Listing dropdown instead, which puts two grades on one listing -- and
+        eBay applies one ConditionID to the whole listing.
+
+        The response carries consequences rather than a bare success: which
+        listing the card now belongs to, and who owns the field next time.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        rows = self.client.get("/api/inventory").json()["items"]
+        manifest_id = rows[0]["manifest_id"]
+
+        res = self.client.post(
+            f"/api/inventory/{manifest_id}/condition", json={"condition": "LP"}
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertEqual(body["current"], "LP")
+        self.assertTrue(body["changed"])
+        self.assertTrue(
+            any("SortSwift" in note for note in body["notes"]),
+            "the export still owns the field and the answer must say so",
+        )
+        self.assertTrue(
+            any("Rebuild" in note for note in body["notes"]),
+            "the card's listing is chosen from its condition",
+        )
+
+        row = next(
+            r for r in self.client.get("/api/inventory").json()["items"]
+            if r["manifest_id"] == manifest_id
+        )
+        self.assertEqual(row["condition"], "LP")
+
+        # Setting it to what it already is is not an error, and says so.
+        again = self.client.post(
+            f"/api/inventory/{manifest_id}/condition", json={"condition": "LP"}
+        )
+        self.assertEqual(again.status_code, 200)
+        self.assertFalse(again.json()["changed"])
+
+    def test_39h_a_condition_that_would_collide_is_refused_not_merged(self):
+        """
+        Two cards cannot share one identity, and merging them would have to
+        reconcile two stock counts and any eBay link -- which is a decision,
+        not a mechanism. So it names the other card instead of guessing.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        from app import deps
+
+        inv = deps.owner_inventory()
+        inv.insert_manifest(
+            "ID8001", "Twinned Card", "Test Set", "NM", "Normal"
+        )
+        inv.insert_manifest(
+            "ID8002", "Twinned Card", "Test Set", "LP", "Normal"
+        )
+        inv.set_manifest_quantity("ID8002", 5)
+
+        res = self.client.post(
+            "/api/inventory/ID8001/condition", json={"condition": "LP"}
+        )
+        self.assertEqual(res.status_code, 409, res.text)
+        self.assertIn("ID8002", res.json()["detail"])
+        self.assertIn("5 copies", res.json()["detail"])
+        # And nothing moved.
+        self.assertEqual(
+            inv.get_manifest_by_id("ID8001")["condition"], "NM"
+        )
+
+    def test_39i_an_unknown_card_and_an_empty_condition_are_refused(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        missing = self.client.post(
+            "/api/inventory/ID999999/condition", json={"condition": "NM"}
+        )
+        self.assertEqual(missing.status_code, 404)
+
+        rows = self.client.get("/api/inventory").json()["items"]
+        blank = self.client.post(
+            f"/api/inventory/{rows[0]['manifest_id']}/condition",
+            json={"condition": ""},
+        )
+        self.assertEqual(blank.status_code, 422)
+
+    def test_39j_a_cross_condition_move_is_refused_by_the_endpoint(self):
+        """
+        The dropdown is not the control. A listing carries one ConditionID, so
+        the server has to refuse this whatever the page offers -- and the page
+        that offered it shipped.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        from app import deps
+
+        inv = deps.owner_inventory()
+        inv.insert_manifest("ID8101", "Mixed NM", "Mix Set", "NM", "Normal")
+        inv.insert_manifest("ID8102", "Mixed LP", "Mix Set", "LP", "Normal")
+        inv.set_manifest_quantity("ID8101", 4)
+        inv.set_manifest_quantity("ID8102", 4)
+
+        built = self.client.post("/api/plans/build", json={"source": "manual"})
+        self.assertEqual(built.status_code, 200, built.text)
+        plan_id = built.json()["plan_id"]
+        items = {
+            row["manifest_id"]: row for row in inv.get_plan_items(plan_id)
+        }
+
+        refused = self.client.patch(
+            f"/api/plans/items/{items['ID8102']['id']}",
+            json={"group_key": "Mix Set|NM"},
+        )
+        self.assertEqual(refused.status_code, 400, refused.text)
+        self.assertIn("one condition", refused.json()["detail"])
+        # Unmoved.
+        self.assertEqual(
+            inv.get_plan_item(items["ID8102"]["id"])["group_key"],
+            "Mix Set|LP",
+        )
+
+        # A move to a listing of its own grade still works.
+        allowed = self.client.patch(
+            f"/api/plans/items/{items['ID8102']['id']}",
+            json={"group_key": f"single:ID8102"},
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+
     # -- connecting the eBay account ---------------------------------------
 
     def signed_in_second_user(self):

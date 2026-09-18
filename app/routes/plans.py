@@ -38,6 +38,7 @@ from tcg_engine.plans import (
     PlanError,
     approve_plan,
     build_plan,
+    move_problem,
     plan_blockers,
     revalidate_item,
 )
@@ -189,6 +190,18 @@ def update_plan_item_endpoint(
             status_code=400,
             detail="Price must be above zero; eBay rejects a zero-price listing.",
         )
+    # Refused here rather than only being left out of the dropdown, because
+    # the dropdown is not the control: a listing carries one ConditionID, so
+    # a cross-condition move publishes cards under a grade that is not
+    # theirs. Checked against the *card* the item describes, not against the
+    # group it is leaving.
+    if "group_key" in changes:
+        problem = move_problem(item, changes["group_key"])
+        if problem:
+            raise HTTPException(
+                status_code=400,
+                detail=f"That card cannot join that listing: {problem}",
+            )
 
     inv.update_plan_item(item_id, **changes)
     # Re-validate straight away so the page never shows a blocker for a
