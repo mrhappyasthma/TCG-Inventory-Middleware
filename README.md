@@ -796,6 +796,26 @@ Two consequences worth keeping in mind:
 `scripts/inspect_listing.py <item id>` prints eBay's own number per card as
 `eBay qty`, which is the way to settle it.
 
+### When some cards fail a push
+
+A push reports per card, because eBay does: a bulk call answers HTTP 200 and
+carries a verdict for each SKU in the body. So `151 card(s) pushed, 5 failed`
+is a normal outcome, not a half-broken one — the listing went up with the 147
+cards eBay accepted, and the plan is left **partial** rather than pushed.
+
+Press **Listings** on the plan to see which cards, each with eBay's own
+message. A retry re-attempts **only** those: a card already live is skipped,
+so pressing Push again cannot duplicate anything or re-list what worked.
+
+| Message | What it means |
+|---|---|
+| *A system error has occurred* / *Core Inventory Service internal error* | eBay's side, and usually transient. The rest of the same batch succeeding is the evidence that the request was fine. **Push again.** |
+| Anything naming a field, an aspect or a policy | A real fault in that card. Fix the card and rebuild the draft. |
+| *no offer on record for this card* | The quantity could not be applied because the offer id is unknown. Run a sync, or use Refresh on the eBay Listings tab. |
+
+A card that keeps failing can be left out of the draft; excluding a broken
+card is eBay's own documented way to unblock the rest of a group.
+
 ### Restoring a listing a partial push narrowed
 
 Writing an inventory item group is a **full replace**: a SKU absent from

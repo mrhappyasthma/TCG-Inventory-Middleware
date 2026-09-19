@@ -1632,6 +1632,46 @@ class TestWebApp(unittest.TestCase):
         })
         self.assertEqual(ok.status_code, 200, ok.text)
 
+    def test_39g4_a_failed_push_leaves_the_reason_readable_per_card(self):
+        """
+        Which cards a push could not send, and why, without the console.
+
+        The reason has always been stored against the item -- `_mark` writes
+        eBay's own message into `validation` -- but nothing served it back to
+        the page, so after a 156-card push reported "151 pushed, 5 failed"
+        the five ids existed only in a log that scrolls. This pins the
+        contract the Listings panel reads.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        from app import deps
+
+        inv = deps.owner_inventory()
+        inv.insert_manifest("ID8201", "Rolycoly", "Fail Set", "NM", "Normal")
+        inv.set_manifest_quantity("ID8201", 4)
+        built = self.client.post("/api/plans/build", json={"source": "manual"})
+        plan_id = built.json()["plan_id"]
+        item = next(
+            row for row in inv.get_plan_items(plan_id)
+            if row["manifest_id"] == "ID8201"
+        )
+
+        # What a refused bulk record leaves behind.
+        inv.update_plan_item(
+            item["id"], status="failed",
+            validation=json.dumps([
+                "A system error has occurred. Core Inventory Service "
+                "internal error"
+            ]),
+        )
+
+        detail = self.client.get(f"/api/plans/{plan_id}").json()
+        failed = [i for i in detail["items"] if i["status"] == "failed"]
+        self.assertTrue(failed, "a failed card must be visible in the plan")
+        row = next(i for i in failed if i["manifest_id"] == "ID8201")
+        self.assertIn("Core Inventory Service", row["validation"])
+        # And the card's name, so the list reads as cards rather than ids.
+        self.assertEqual(row["product_name"], "Rolycoly")
+
     def test_39h_a_condition_that_would_collide_is_refused_not_merged(self):
         """
         Two cards cannot share one identity, and merging them would have to

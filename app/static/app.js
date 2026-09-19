@@ -4244,6 +4244,48 @@ async function loadPlanListings(planId) {
         const items = data.items || [];
         const pushedCount = items.filter(i => i.status === "pushed").length;
 
+        // The cards a push could not send, with eBay's own words for why.
+        //
+        // `_mark` has always stored the reason against the item, but nothing
+        // read it back: the only place a failure appeared was the console,
+        // which scrolls and is cleared. After a 156-card push reported "151
+        // pushed, 5 failed" the five ids existed solely in that log, so
+        // knowing which cards to chase meant scrolling back through it.
+        const stuck = items.filter(
+            i => i.status === "failed" || i.status === "deferred"
+        );
+        const reasonOf = (item) => {
+            try {
+                const parsed = JSON.parse(item.validation || "[]");
+                if (parsed.length) return parsed.join("; ");
+            } catch (err) {
+                // A reason that will not parse is still a reason: show it
+                // raw rather than dropping the only explanation there is.
+                if (item.validation) return String(item.validation);
+            }
+            return "no reason was recorded";
+        };
+        const stuckBlock = stuck.length
+            ? `<div class="rounded-lg border border-rose-900/60 bg-rose-950/20 p-2 mt-1.5 space-y-1">
+                   <p class="text-rose-300 font-semibold">${stuck.length} card(s) did not reach eBay</p>
+                   <ul class="space-y-1">${stuck.map(i => `
+                       <li>
+                           <span class="font-mono text-slate-300">${escapeHtml(i.manifest_id)}</span>
+                           <span class="text-slate-400">${escapeHtml(i.product_name || "")}</span>
+                           <span class="block text-rose-200/80 leading-snug">${escapeHtml(reasonOf(i))}</span>
+                       </li>`).join("")}</ul>
+                   <p class="text-slate-400 leading-snug pt-0.5">
+                       Pushing this listing again retries <em>only</em> these
+                       &mdash; a card already live is skipped, so a retry cannot
+                       duplicate one. <strong class="text-slate-300">Core Inventory
+                       Service internal error</strong> and other
+                       <em>system error</em> messages are eBay&rsquo;s own and are
+                       usually transient: the rest of the same batch went through,
+                       which is the evidence that the request was fine.
+                   </p>
+               </div>`
+            : "";
+
         // One row per listing with its own Push button. A create cannot be
         // undone by pressing the button again, so the only sane way to start
         // is one small listing, checked in Seller Hub, before several hundred
@@ -4267,6 +4309,7 @@ async function loadPlanListings(planId) {
             <div class="rounded-lg border border-slate-700 bg-dark-900/60 p-2.5 text-[11px] space-y-1.5">
                 <p class="text-slate-400">Push one listing at a time:</p>
                 ${rows}
+                ${stuckBlock}
                 ${pushedCount
                     ? `<p class="text-sky-300/90 pt-1">${pushedCount} card(s) in this plan are already live on eBay.</p>`
                     : ""}
