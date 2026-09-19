@@ -816,6 +816,19 @@ so pressing Push again cannot duplicate anything or re-list what worked.
 A card that keeps failing can be left out of the draft; excluding a broken
 card is eBay's own documented way to unblock the rest of a group.
 
+A card **added to a listing that already exists** is published as part of the
+push, which is a separate call from writing the variation set. Naming a card
+in the group does not put it on sale — an offer's status is its own, and a
+new one starts unpublished, which eBay hides. That step used to be missing,
+so five cards retried onto a live 147-card listing joined the group, were
+recorded as pushed, and left the listing still showing 147.
+
+If eBay refuses that publish, those cards are reported as **failed**, not
+pushed: they are in the listing and unbuyable, so calling them live would put
+stock in the mirror that eBay is not selling. Publishing is all-or-nothing,
+so the culprit may be a different card in the same listing — **Refresh** on
+the eBay Listings tab retries it.
+
 Rebuilding the draft is also fine: the cards that succeeded now match what
 eBay holds, so the new draft contains only the ones that did not. Such a
 listing shows **→ #item number** rather than **new** — it already exists and

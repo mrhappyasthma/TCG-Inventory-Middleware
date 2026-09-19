@@ -768,9 +768,13 @@ def _push_group(
     #    second offer for the same SKU is an error, and the offer id is the
     #    only handle that can change a price.
     description = _group_description(group_items, single)
+    # Held on to, because a card that needed a *new* offer is a card whose
+    # offer is UNPUBLISHED until something publishes it -- and on an existing
+    # listing, nothing here used to. See the publish below.
+    needed_offers = [item for item in live if not item.get("offer_id")]
     _create_offers(
         db, api,
-        [item for item in live if not item.get("offer_id")],
+        needed_offers,
         settings=settings,
         category_id=category_id,
         marketplace_id=marketplace_id,
@@ -933,9 +937,94 @@ def _push_group(
             f"{group_key}: updated listing #{listing_id}, which now carries "
             f"{len(entries)} variation(s)"
         ))
+        # A card added to a listing that already exists needs its offer
+        # published, and writing the group does not do it.
+        #
+        # This is the trap the module's own notes describe from the other
+        # direction: naming a SKU in `variantSKUs` does not put it on sale,
+        # because an offer's status is its own. A new offer starts
+        # UNPUBLISHED, so five cards retried onto a live 147-card listing
+        # went into the group, were recorded as pushed, and left the listing
+        # still showing 147 -- eBay hides a variation whose offer is not
+        # published. Nothing failed and the log said success.
+        #
+        # Deliberately narrow. Publishing is all-or-nothing, so one invalid
+        # card would start failing pushes that work today, which is why this
+        # is not done unconditionally: it runs only when this push created an
+        # offer, which is exactly when something needs publishing.
+        fresh = [
+            item for item in needed_offers
+            if item["status"] != STATUS_FAILED and item.get("offer_id")
+        ]
+        if fresh:
+            problem = _publish_added_offers(
+                db, api, group_key, ebay_group_key, str(listing_id), record
+            )
+            if problem:
+                # In the listing, not on sale. Failed rather than pushed:
+                # the mirror must not record eBay as holding stock a buyer
+                # cannot buy, and a retry then re-attempts exactly these.
+                for item in fresh:
+                    _mark(db, item, STATUS_FAILED, counts, problem)
+                live = [i for i in live if i["status"] != STATUS_FAILED]
 
     _confirm(db, live, listing_id, counts)
     return (0 if published else 1, 1 if published else 0)
+
+
+def _publish_added_offers(
+    db: Database,
+    api: Any,
+    group_key: str,
+    ebay_group_key: str,
+    ebay_parent_id: str,
+    record: Callable[[str, str], None],
+) -> str:
+    """
+    Put newly created offers on sale. Returns "" on success, else the reason.
+
+    ``publishOfferByInventoryItemGroup`` is the only call that publishes a
+    variation listing's offers, and it publishes the whole group -- which is
+    what makes it right here and wrong as a routine step. Republishing a
+    group already on sale is a no-op that returns the id it already has,
+    confirmed against a live 123-card listing.
+    """
+    try:
+        published_as = api.publish_group(ebay_group_key)
+    except Exception as exc:  # noqa: BLE001 - attributed to the cards below
+        record("ERROR", (
+            f"{group_key}: the new card(s) were added to listing "
+            f"#{ebay_parent_id} but could not be put on sale: {exc}. They are "
+            f"in the listing and invisible to buyers until it is published -- "
+            f"use Refresh on the eBay Listings tab."
+        ))
+        return (
+            f"added to listing #{ebay_parent_id} but not on sale: eBay "
+            f"refused the publish ({exc}). Publishing is all-or-nothing, so "
+            f"another card in this listing may be what it objected to. "
+            f"Refresh on the eBay Listings tab retries it."
+        )
+
+    if str(published_as) != str(ebay_parent_id):
+        # The same check the refresh makes: a group published somewhere
+        # other than the listing it belonged to means there may now be two,
+        # and the mirror has to follow eBay or every later write goes to a
+        # listing eBay no longer associates with these offers.
+        db.upsert_managed_listing(
+            group_key, ebay_parent_id=str(published_as), pushed=True
+        )
+        record("ERROR", (
+            f"eBay published this group as #{published_as}, not "
+            f"#{ebay_parent_id}, so there may now be two listings for it. "
+            f"Check both before pushing again."
+        ))
+        return ""
+
+    record("INFO", (
+        f"{group_key}: eBay accepted the publish, so the new variation(s) "
+        f"are on sale"
+    ))
+    return ""
 
 
 def _create_offers(

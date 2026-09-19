@@ -1419,6 +1419,127 @@ class PartialPushKeepsTheWholeListingTests(PushTestCase):
         self.assertEqual(sorted(group["variantSKUs"]), ["ID1001", "ID1002"])
 
 
+class AddingToALiveListingTests(PushTestCase):
+    """
+    A card added to a listing that already exists has to be put on sale.
+
+    Naming a SKU in ``variantSKUs`` does not publish its offer -- an offer's
+    status is its own, and a new one starts UNPUBLISHED. eBay then hides the
+    variation, so the listing goes on showing the cards it already had.
+
+    Seen in production: five cards failed a 152-card push with an eBay system
+    error, the draft was rebuilt, the retry put them in the group and marked
+    them pushed, and the live listing still showed 147 variations. Nothing
+    failed and the log said success. `refresh_listing` had been given this
+    publish after the same thing happened there; the push had not.
+    """
+
+    def live_listing(self):
+        """A published two-card listing, as the starting state."""
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        api = FakeEbay()
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+        self.assertIn("publish_group", api.kinds())
+        return api
+
+    def test_a_card_added_later_is_published(self):
+        api = self.live_listing()
+        api.calls.clear()
+
+        self.add_card("ID1003", "Venusaur", "015/102")
+        result = push_plan(
+            self.db, api, self.approved_plan(), user_id=SHARED_SCOPE
+        )
+
+        self.assertEqual(result["pushed"], 1)
+        self.assertEqual(result["failed"], 0)
+        # No second listing: the group is republished, which returns the id
+        # it already has.
+        self.assertEqual(result["listings_created"], 0)
+        self.assertIn(
+            "publish_group", api.kinds(),
+            "a new variation is invisible until its offer is published",
+        )
+        group = list(api.groups.values())[0]
+        self.assertEqual(len(group["variantSKUs"]), 3)
+
+    def test_an_update_alone_does_not_republish(self):
+        """
+        Narrow on purpose. Publishing is all-or-nothing, so doing it on every
+        push would let one invalid card start failing pushes that work today.
+        A quantity change creates no offer and needs no publish.
+        """
+        api = self.live_listing()
+        api.calls.clear()
+
+        self.db.set_manifest_quantity("ID1002", 9)
+        push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
+
+        self.assertNotIn("publish_group", api.kinds())
+        self.assertIn("update_price_quantity", api.kinds())
+
+    def test_a_refused_publish_fails_the_cards_rather_than_claiming_them(self):
+        """
+        The card is in the listing but nobody can buy it, so recording it as
+        pushed would put stock in the mirror that does not exist at eBay --
+        and the next draft would suppress the very change that is missing.
+        """
+        api = self.live_listing()
+
+        class RefusesPublish(FakeEbay):
+            def publish_group(self, group_key):
+                self.calls.append(("publish_group", group_key))
+                raise RuntimeError("25002: another card in this group is invalid")
+
+        retry = RefusesPublish()
+        retry.groups = api.groups
+        retry.group_listings = api.group_listings
+        self.add_card("ID1003", "Venusaur", "015/102")
+        plan_id = self.approved_plan()
+        result = push_plan(self.db, retry, plan_id, user_id=SHARED_SCOPE)
+
+        self.assertEqual(result["pushed"], 0)
+        self.assertEqual(result["failed"], 1)
+        item = next(
+            row for row in self.db.get_plan_items(plan_id)
+            if row["manifest_id"] == "ID1003"
+        )
+        self.assertEqual(item["status"], STATUS_FAILED)
+        self.assertIn("not on sale", item["validation"])
+        self.assertIn("Refresh", item["validation"])
+        # And the mirror does not claim eBay is holding it.
+        live = {r["manifest_id"] for r in self.db.get_live_variations()}
+        self.assertNotIn("ID1003", live)
+
+    def test_a_publish_landing_elsewhere_is_reported(self):
+        # The same check the refresh makes: two listings for one group is
+        # worse than an unpublished offer, and the mirror has to follow eBay.
+        api = self.live_listing()
+
+        class MovesTheListing(FakeEbay):
+            def publish_group(self, group_key):
+                self.calls.append(("publish_group", group_key))
+                return "999999999"
+
+        moved = MovesTheListing()
+        moved.groups = api.groups
+        self.add_card("ID1003", "Venusaur", "015/102")
+        result = push_plan(
+            self.db, moved, self.approved_plan(), user_id=SHARED_SCOPE
+        )
+
+        joined = " ".join(e["message"] for e in result["logs"])
+        self.assertIn("999999999", joined)
+        self.assertIn("two listings", joined)
+        self.assertEqual(
+            self.db.get_managed_listing("Base Set|Near Mint")["ebay_parent_id"],
+            "999999999",
+            "the mirror follows eBay, or every later write goes to the wrong "
+            "listing",
+        )
+
+
 class QuantityReachesTheOfferTests(PushTestCase):
     """
     A quantity change has to arrive where eBay serves it from: the offer.
