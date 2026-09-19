@@ -876,6 +876,25 @@ write means the card's pictures and specifics are unchanged, never that the
 card should stop being sold. (It did drop them once, which turned 19
 transient eBay errors into 14 live variations removed from a listing.)
 
+**A repair does not restock.** It re-sends each card at the quantity eBay is
+*known* to hold, because Refresh exists to fix pictures and specifics without
+moving stock. That has a consequence worth knowing after a listing has been
+damaged: if a Module B sync ran while a card was missing from the listing,
+the mirror learned **zero** for that card, and the repair faithfully puts it
+back at zero — the variation returns and eBay still sells none of it, because
+a zero-quantity variation is hidden. The refresh now says so, naming the
+cards and the number of copies:
+
+```
+[WARN] 5 card(s) were re-sent at the quantity eBay is known to hold, which is
+       20 copies short of what your catalogue says: ID2060, ID2063, ...
+       Rebuild the draft and push it to put the quantities back.
+```
+
+Rebuilding the draft is the remedy: the gap between your catalogue and the
+mirror *is* what a draft proposes, so the missing copies come back as an
+ordinary update.
+
 It writes the inventory items and the group and **never touches offers**, so
 whether it is sufficient depends on what eBay did with the offers of the
 cards it removed:

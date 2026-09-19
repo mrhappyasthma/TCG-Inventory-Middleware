@@ -1243,6 +1243,57 @@ class RefreshTests(PushTestCase):
             "a repair must re-send the quantity eBay already holds",
         )
 
+    def test_a_repair_says_when_it_is_restoring_a_card_short(self):
+        """
+        Refresh re-sends what eBay is known to hold, which is right -- a
+        repair must not move stock -- and has a consequence nobody expects
+        after a listing has been damaged. If a sync ran while a card was
+        missing from the listing, the mirror learned zero for it, so the
+        repair faithfully puts the card back at zero: the variation returns
+        and eBay still sells none of it.
+        """
+        self.add_card("ID1001", "Charizard", "004/102", qty=4)
+        push_plan(self.db, FakeEbay(), self.approved_plan(),
+                  user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+
+        # What a sync taken while the card was off the listing leaves behind.
+        self.db.upsert_variation("ID1001", listing_id, 0,
+                                 custom_label="ID1001")
+
+        result = refresh_listing(
+            self.db, FakeEbay(), listing_id, user_id=SHARED_SCOPE
+        )
+
+        warnings = [
+            entry["message"] for entry in result["logs"]
+            if entry["level"] == "WARN"
+        ]
+        joined = " ".join(warnings)
+        self.assertIn("4 copies short", joined)
+        self.assertIn("ID1001", joined)
+        self.assertIn("Rebuild the draft", joined)
+
+    def test_a_repair_in_step_with_ebay_says_nothing_about_stock(self):
+        # The healthy case must stay quiet, or the warning is noise.
+        self.add_card("ID1001", "Charizard", "004/102", qty=4)
+        push_plan(self.db, FakeEbay(), self.approved_plan(),
+                  user_id=SHARED_SCOPE)
+        listing_id = self.db.get_managed_listing(
+            "Base Set|Near Mint"
+        )["ebay_parent_id"]
+
+        result = refresh_listing(
+            self.db, FakeEbay(), listing_id, user_id=SHARED_SCOPE
+        )
+
+        self.assertNotIn(
+            "short of what your catalogue",
+            " ".join(entry["message"] for entry in result["logs"]),
+        )
+
     def test_a_pushed_cover_is_recorded_against_the_listing(self):
         """
         The staged cover has to cross from the plan to the listing.

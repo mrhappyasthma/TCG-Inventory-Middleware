@@ -1682,6 +1682,9 @@ def refresh_listing(
     single = is_single(group_key) or not group_key
     entries: List[Tuple[Dict[str, Any], str]] = []
     payloads = []
+    # (sku, copies) for cards this repair is about to put back on the
+    # listing holding less stock than the catalogue says they have.
+    restocks: List[Tuple[str, int]] = []
     # Card-number order, for the same reason as a create: this is the order
     # the variation dropdown appears in. Sorted here rather than in SQL
     # because a card number is not a number -- "10/132" sorts before "2/132"
@@ -1691,6 +1694,19 @@ def refresh_listing(
         # be: a repair must not become a stock change.
         card = dict(card)
         card["proposed_qty"] = int(card.get("last_known_qty") or 0)
+        # Noted, not corrected. Re-sending what eBay is known to hold is the
+        # right rule -- Refresh exists to fix pictures and specifics without
+        # touching stock -- but it has a consequence nobody expects after a
+        # listing has been damaged: if a Module B sync ran while a card was
+        # missing from the listing, the mirror learned zero for it, and this
+        # faithfully restores the card at zero. The listing gets its
+        # variation back and eBay still sells none of it, which reads on eBay
+        # as a repair that only half worked.
+        if int(card.get("quantity") or 0) > card["proposed_qty"]:
+            restocks.append((
+                _sku_for(card),
+                int(card.get("quantity") or 0) - card["proposed_qty"],
+            ))
         sku = _sku_for(card)
         option_name = build_variation_option_name(
             card.get("product_name") or "", card.get("card_number") or "",
@@ -1715,6 +1731,19 @@ def refresh_listing(
         for sku, message in api.failures(rows):
             failures[sku] = message
             record("ERROR", f"{sku}: {message}")
+
+    if restocks:
+        copies = sum(n for _, n in restocks)
+        shown = ", ".join(sku for sku, _ in restocks[:10])
+        record("WARN", (
+            f"{len(restocks)} card(s) were re-sent at the quantity eBay is "
+            f"known to hold, which is {copies} cop{'y' if copies == 1 else 'ies'} "
+            f"short of what your catalogue says: {shown}"
+            f"{' ...' if len(restocks) > 10 else ''}. A repair deliberately "
+            f"does not move stock. Rebuild the draft and push it to put the "
+            f"quantities back -- until then eBay sells what it currently "
+            f"reports, and a card at zero stays hidden."
+        ))
 
     refreshed = len(payloads) - len(failures)
     if failures:
