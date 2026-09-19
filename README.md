@@ -2095,6 +2095,26 @@ third vocabulary.
 > set had come in wrong. A draft still carrying such a group is flagged in
 > amber and blocks approval.
 
+### Exporting what you are looking at
+
+**Export** writes the rows the table is currently showing, not the whole
+catalogue. Narrow to a set, search within it, tick **Below target**, and the
+file is that shopping list. The button says which it will be — `Export 37`
+with the filters named in its tooltip, or plain `Export` for everything — and
+a filtered file is named `master_catalog_filtered.csv` so it can be told
+apart from a full one later.
+
+It is the table's own query, not a second one written to match. That matters
+more than it sounds: a separate filter would be a second definition of
+"below target" to keep in step, and the way that fails is a file quietly
+disagreeing with the screen it came from. Sorting carries across for the same
+reason, and the row count is never cut to a page — the limit *is* the number
+of matching rows, because a file truncated at 50 looks exactly like a
+complete one.
+
+The CLI's `export-manifest` is unchanged and still writes everything; it has
+no screen to agree with.
+
 ### Editing a bin by hand
 
 Clicking a **Bin / Remark** value opens a dialog for it. A card that moved

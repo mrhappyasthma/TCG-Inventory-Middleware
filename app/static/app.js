@@ -1754,6 +1754,7 @@ async function fetchInventory() {
         renderRestockSummary(data);
         lastInventoryTotal = Number(data.total) || 0;
         updateBulkRemarkButton();
+        updateExportButton();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="14" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
     }
@@ -2122,6 +2123,42 @@ function currentInventoryScope() {
     if (currentSearch) parts.push(`search “${currentSearch}”`);
     if (belowTargetOnly()) parts.push("held below target");
     return parts.length ? parts.join(", ") : "your whole catalogue";
+}
+
+// The export follows the filters, so the button has to say which it is
+// about to write. It stays a plain download link -- the href is rewritten
+// rather than the click intercepted, so the browser downloads it the way it
+// downloads anything, with the session cookie and no blob in memory.
+function updateExportButton() {
+    const link = document.getElementById("btnExportManifest");
+    const label = document.getElementById("btnExportManifestLabel");
+    if (!link) return;
+
+    const params = new URLSearchParams();
+    if (currentSearch) params.set("search", currentSearch);
+    if (currentSetFilter) params.set("set_name", currentSetFilter);
+    if (belowTargetOnly()) params.set("below_target", "true");
+    // Sorted as the table is, because a file that arrives in a different
+    // order from the screen it came from reads as a different file.
+    params.set("sort_by", currentSortBy);
+    params.set("sort_dir", currentSortDir);
+
+    const filtered = Boolean(
+        currentSearch || currentSetFilter || belowTargetOnly()
+    );
+    link.href = `/api/export/manifest?${params.toString()}`;
+    link.download = filtered
+        ? "master_catalog_filtered.csv"
+        : "master_catalog_export.csv";
+    if (label) {
+        label.innerText = filtered
+            ? `Export ${lastInventoryTotal.toLocaleString()}`
+            : "Export";
+    }
+    link.title = filtered
+        ? `Export the ${lastInventoryTotal.toLocaleString()} card(s) matching `
+          + `${currentInventoryScope()} — not the whole catalogue`
+        : "Export the whole catalogue as CSV";
 }
 
 function updateBulkRemarkButton() {

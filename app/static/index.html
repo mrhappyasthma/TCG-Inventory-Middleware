@@ -561,12 +561,20 @@
                         <span>Add Card</span>
                     </button>
 
-                    <!-- Export Catalog Button -->
-                    <a href="/api/export/manifest" download="master_catalog.csv" class="text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5" title="Export CSV">
+                    <!--
+                        Export Catalog Button
+
+                        The href and the label are rewritten by
+                        updateExportButton() whenever the table is fetched,
+                        because this exports what the filters currently
+                        select. A static href here would always export the
+                        whole catalogue while the screen showed one set.
+                    -->
+                    <a id="btnExportManifest" href="/api/export/manifest" download="master_catalog_export.csv" class="text-xs font-semibold px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-all flex items-center gap-1.5" title="Export the whole catalogue as CSV">
                         <svg class="w-4 h-4 text-accent-cyan" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                         </svg>
-                        <span>Export</span>
+                        <span id="btnExportManifestLabel">Export</span>
                     </a>
 
                     <!-- Refresh Button -->

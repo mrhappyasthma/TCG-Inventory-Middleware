@@ -626,10 +626,46 @@ def delete_card_endpoint(
     return {"success": True, "manifest_id": manifest_id}
 
 @router.get("/api/export/manifest")
-def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
-    """Export complete Master Catalog & Live Mirror as CSV download."""
+def export_manifest_endpoint(
+    search: Optional[str] = None,
+    set_name: Optional[str] = None,
+    below_target: bool = False,
+    sort_by: str = "manifest_id",
+    sort_dir: str = "ASC",
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Export the Master Catalog and Live Mirror as a CSV download.
+
+    Takes the **same filters as the inventory table**, so the file is what
+    the screen was showing: narrow to a set, search within it, tick "below
+    target", and the export is that shopping list rather than the whole
+    catalogue. With no filters it is the whole catalogue, as it always was.
+
+    It runs the table's own query rather than a second one of its own. That
+    is the point: a separate WHERE clause would be a second definition of
+    "below target" to keep in step, and the failure mode is a file that
+    quietly disagrees with the screen it was exported from. Ordering follows
+    the table's too, so a sorted view exports sorted.
+    """
     inv = inventory_for(user)
-    items = inv.export_all_manifest()
+    target_default = inv.get_target_quantity_default(user_id=user["id"])
+    # Counted first so the export can never be silently truncated by a page
+    # size: the limit *is* the number of matching rows.
+    total = inv.get_inventory_count(
+        search=search, set_name=set_name,
+        below_target=below_target, target_default=target_default,
+    )
+    items = inv.get_inventory(
+        search=search,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        limit=max(total, 1),
+        offset=0,
+        set_name=set_name,
+        below_target=below_target,
+        target_default=target_default,
+    )
     fieldnames = [
         "manifest_id",
         "product_name",
@@ -651,8 +687,23 @@ def export_manifest_endpoint(user: Dict[str, Any] = Depends(require_active_user)
     )
     output.seek(0)
 
+    # A fixed pair of names, never the set or the search term. Those are
+    # user data, and user data in a response header is how a newline becomes
+    # header injection -- for a filename, which nothing depends on.
+    filtered = bool(
+        (search or "").strip() or (set_name or "").strip() or below_target
+    )
+    filename = (
+        "master_catalog_filtered.csv" if filtered
+        else "master_catalog_export.csv"
+    )
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=master_catalog_export.csv"},
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            # So a saved file can be told apart from a full export later,
+            # when the filters that made it are long forgotten.
+            "X-Export-Rows": str(len(items)),
+        },
     )

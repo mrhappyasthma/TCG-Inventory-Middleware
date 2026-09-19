@@ -746,6 +746,100 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn("text/csv", res.headers["content-type"])
 
+    def test_26b_the_export_follows_the_tables_filters(self):
+        """
+        The file has to be what the screen was showing.
+
+        It runs the table's own query rather than a second one, so "below
+        target" cannot come to mean one thing in the list and another in the
+        export -- and a set filter that narrows the screen to 30 cards no
+        longer hands back the whole catalogue.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        from app import deps
+
+        # Removed again at the end: this suite shares one database across
+        # tests in name order, and a later one builds a plan over whatever
+        # the catalogue holds. Cards with no item specifics would block its
+        # approval and fail a test that has nothing to do with exporting.
+        inv = deps.owner_inventory()
+        added = ["ID7001", "ID7002", "ID7003"]
+        self.addCleanup(
+            lambda: [inv.delete_manifest(m) for m in added]
+        )
+        inv.insert_manifest("ID7001", "Alpha", "Export Set", "NM", "Normal")
+        inv.insert_manifest("ID7002", "Beta", "Export Set", "NM", "Normal")
+        inv.insert_manifest("ID7003", "Gamma", "Other Set", "NM", "Normal")
+        inv.set_manifest_quantity("ID7001", 1)
+        inv.set_manifest_quantity("ID7002", 99)
+        inv.set_manifest_quantity("ID7003", 1)
+
+        def rows_of(query):
+            res = self.client.get(f"/api/export/manifest{query}")
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertIn("text/csv", res.headers["content-type"])
+            lines = [l for l in res.text.splitlines() if l.strip()]
+            return res, [l.split(",")[0] for l in lines[1:]]
+
+        # A set filter exports that set and nothing else.
+        res, ids = rows_of("?set_name=Export%20Set")
+        self.assertIn("ID7001", ids)
+        self.assertIn("ID7002", ids)
+        self.assertNotIn("ID7003", ids)
+        self.assertIn("master_catalog_filtered.csv",
+                      res.headers["content-disposition"])
+
+        # A search combines with it rather than replacing it.
+        _, ids = rows_of("?set_name=Export%20Set&search=Alpha")
+        self.assertEqual(ids, ["ID7001"])
+
+        # Below target is the restock list: Beta holds 99 and is not on it.
+        _, ids = rows_of("?set_name=Export%20Set&below_target=true")
+        self.assertIn("ID7001", ids)
+        self.assertNotIn("ID7002", ids)
+
+        # And with no filters it is still the whole catalogue, under the
+        # name it has always had.
+        res, ids = rows_of("")
+        for manifest_id in ("ID7001", "ID7002", "ID7003"):
+            self.assertIn(manifest_id, ids)
+        self.assertIn("master_catalog_export.csv",
+                      res.headers["content-disposition"])
+
+    def test_26c_the_export_is_never_truncated_to_a_page(self):
+        """
+        The table's query paginates, so borrowing it means the limit has to
+        be the number of matching rows. A file quietly cut to 50 would look
+        exactly like a complete one.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        from app import deps
+
+        inv = deps.owner_inventory()
+        bulk = [f"ID75{n:02d}" for n in range(60)]
+        self.addCleanup(lambda: [inv.delete_manifest(m) for m in bulk])
+        for n, manifest_id in enumerate(bulk):
+            inv.insert_manifest(
+                manifest_id, f"Bulk {n}", "Big Set", "NM", "Normal"
+            )
+
+        res = self.client.get("/api/export/manifest?set_name=Big%20Set")
+        lines = [l for l in res.text.splitlines() if l.strip()]
+        self.assertEqual(len(lines) - 1, 60)
+        self.assertEqual(res.headers["x-export-rows"], "60")
+
+    def test_26d_a_filter_matching_nothing_exports_a_header_only(self):
+        # Not an error, and not the whole catalogue either: an empty answer
+        # to an empty question.
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+
+        res = self.client.get("/api/export/manifest?set_name=No%20Such%20Set")
+        self.assertEqual(res.status_code, 200)
+        lines = [l for l in res.text.splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("manifest_id", lines[0])
+        self.assertEqual(res.headers["x-export-rows"], "0")
+
     def test_27_session_cookie_is_hardened(self):
         """HttpOnly stops script theft; SameSite blocks cross-site writes."""
         with mock.patch("app.auth.verify_google_id_token",
