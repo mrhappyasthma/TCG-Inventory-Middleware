@@ -606,13 +606,14 @@
                                 <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('target_quantity')" title="Copies you aim to hold. Four by default; click a value to set this card's own. A target, not a cap -- holding more is fine.">Target</th>
                                 <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('needed')" title="How many more to buy to reach the target. Blank when there is nothing needed.">Need</th>
                                 <th class="py-3 px-4 text-center cursor-pointer hover:text-slate-200" onclick="handleSort('last_known_qty')" title="Copies eBay reports as available, from your last Active Listings sync or a confirmed push. A gap against On hand is what the draft proposes to change.">On eBay</th>
+                                <th class="py-3 px-4 text-right cursor-pointer hover:text-slate-200" onclick="handleSort('price')" title="What this card would be listed at, from the pricing rules or an eBay Price column in your export. Amber when eBay is known to hold a different price -- that gap is what a draft proposes.">Price</th>
                                 <th class="py-3 px-4 text-right">Action</th>
                             </tr>
                         </thead>
                         <tbody id="inventoryTableBody" class="divide-y divide-slate-800/60 text-slate-300">
                             <!-- Populated dynamically via JS -->
                             <tr>
-                                <td colspan="14" class="py-8 text-center text-slate-500">Loading catalog inventory...</td>
+                                <td colspan="15" class="py-8 text-center text-slate-500">Loading catalog inventory...</td>
                             </tr>
                         </tbody>
                     </table>

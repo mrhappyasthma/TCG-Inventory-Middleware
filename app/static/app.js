@@ -3,6 +3,11 @@ let currentUser = null;
 let googleClientId = "";
 let currentPage = 1;
 const pageSize = 20;
+// Columns in the Live Store Inventory table, for the rows that span it.
+// One constant because the three that needed it had already drifted apart --
+// 14, 14 and 12 -- so a full-width message was quietly not full width.
+const INVENTORY_COLUMN_COUNT = 15;
+
 let currentSearch = "";
 let currentSetFilter = "";
 
@@ -1756,7 +1761,7 @@ async function fetchInventory() {
         updateBulkRemarkButton();
         updateExportButton();
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="14" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="${INVENTORY_COLUMN_COUNT}" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
     }
 }
 
@@ -1865,6 +1870,38 @@ function cardThumbnailCell(item, cellClasses = "py-2 px-4") {
                 class="block h-10 w-auto rounded border ${border} bg-dark-900"
                 onerror="markImageBroken(this, 'h-10 w-7')">
         </td>`;
+}
+
+// The price cell: what we would list this card at.
+//
+// Amber when eBay is known to hold a different one, for the same reason the
+// two quantities are shown side by side -- that gap is exactly what a draft
+// proposes, and it is invisible unless both numbers are on screen. An
+// unknown eBay price is not a disagreement: nothing is suppressed against a
+// value a sync has never told us, so it reads as "not synced" rather than
+// as a difference.
+function priceCell(item) {
+    const ours = Number(item.price || 0);
+    if (!ours) {
+        return `<td class="py-3 px-4 text-right"><span class="text-slate-700" title="No price yet. A card with no price cannot be listed -- the drafts page blocks it.">&mdash;</span></td>`;
+    }
+    const known = item.last_known_price;
+    const hasKnown = known !== null && known !== undefined && known !== "";
+    // A cent of float noise is not a price change.
+    const differs = hasKnown && Math.abs(Number(known) - ours) > 0.005;
+    const cls = differs ? "text-amber-300 font-semibold" : "text-slate-300";
+    const title = differs
+        ? `You would list this at $${ours.toFixed(2)}; eBay is known to hold `
+          + `$${Number(known).toFixed(2)}. Rebuild the draft to push the difference.`
+        : (hasKnown
+            ? `eBay holds this price too.`
+            : `eBay's price is not known yet -- run a Module B sync.`);
+    return `<td class="py-3 px-4 text-right whitespace-nowrap font-mono ${cls}" title="${escapeHtml(title)}">`
+        + `$${ours.toFixed(2)}`
+        + (differs
+            ? `<span class="block text-[10px] text-slate-500 line-through">$${Number(known).toFixed(2)}</span>`
+            : "")
+        + `</td>`;
 }
 
 // The bin / remark cell: click to edit.
@@ -1994,7 +2031,7 @@ function renderInventoryTable(items, total, offset) {
     if (!items || items.length === 0) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="12" class="py-8 text-center text-slate-500">
+                <td colspan="${INVENTORY_COLUMN_COUNT}" class="py-8 text-center text-slate-500">
                     No cards found. Process a SortSwift batch or add a card above.
                 </td>
             </tr>
@@ -2076,6 +2113,7 @@ function renderInventoryTable(items, total, offset) {
                         ${item.last_known_qty}
                     </span>
                 </td>
+                ${priceCell(item)}
                 <td class="py-3 px-4 text-right">
                     <button onclick="deleteCard('${item.manifest_id}')" class="text-slate-500 hover:text-rose-400 p-1 transition-colors" title="Delete Card">
                         <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">

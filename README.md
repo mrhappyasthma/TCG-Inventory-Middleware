@@ -1961,6 +1961,7 @@ recorded and the dialog says why, so nothing is silently lost.
 | **Card #** | Sorted numerically (`4/198` before `133/198`), prefixed numbering after the plain numbers. |
 | **eBay Item #** | Links to the live listing. Only present once Module B has linked it. |
 | **Condition** | Click to correct a mis-scanned grade (see below). It decides which listing the card belongs to. |
+| **Price** | What the card would be listed at. Sortable. Amber, with eBay's figure struck through beneath, when the two disagree — that gap is what a draft proposes. A dash means no price, which blocks listing the card. |
 | **Bin / Remark** | Click to edit it (see below). |
 | **Quantity** | Click to adjust it (see below). |
 | **Target** | Copies you aim to hold. Four unless the card has its own. Click to change it. |

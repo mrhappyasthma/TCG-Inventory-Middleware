@@ -746,6 +746,54 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn("text/csv", res.headers["content-type"])
 
+    def test_26a_the_inventory_carries_a_sortable_price(self):
+        """
+        The price column, and the eBay figure beside it.
+
+        Sorting resolves through a whitelist with a safe default, so a column
+        that is not on it silently sorts by manifest id -- which looks like
+        the click did nothing. Both prices are sent because the gap between
+        them is what a draft proposes, and it is invisible unless the table
+        shows both.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        from app import deps
+
+        inv = deps.owner_inventory()
+        added = ["ID7101", "ID7102", "ID7103"]
+        self.addCleanup(lambda: [inv.delete_manifest(m) for m in added])
+        inv.insert_manifest("ID7101", "Cheap", "Price Set", "NM", "Normal",
+                            price=0.50)
+        inv.insert_manifest("ID7102", "Dear", "Price Set", "NM", "Normal",
+                            price=12.00)
+        inv.insert_manifest("ID7103", "Unpriced", "Price Set", "NM", "Normal")
+        inv.upsert_variation("ID7102", "227000001", 1, last_known_price=9.99)
+
+        def names(direction):
+            res = self.client.get(
+                f"/api/inventory?set_name=Price%20Set&sort_by=price"
+                f"&sort_dir={direction}&limit=50"
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+            return [row["product_name"] for row in res.json()["items"]]
+
+        self.assertEqual(names("ASC"), ["Unpriced", "Cheap", "Dear"])
+        self.assertEqual(names("DESC"), ["Dear", "Cheap", "Unpriced"])
+
+        rows = {
+            row["manifest_id"]: row for row in
+            self.client.get(
+                "/api/inventory?set_name=Price%20Set&limit=50"
+            ).json()["items"]
+        }
+        self.assertEqual(rows["ID7102"]["price"], 12.00)
+        # eBay's own figure, so the table can mark the disagreement.
+        self.assertEqual(rows["ID7102"]["last_known_price"], 9.99)
+        # Never synced is not the same as agreeing.
+        self.assertIsNone(rows["ID7101"]["last_known_price"])
+        # An unpriced card is 0 rather than absent, and renders as a dash.
+        self.assertEqual(rows["ID7103"]["price"], 0)
+
     def test_26b_the_export_follows_the_tables_filters(self):
         """
         The file has to be what the screen was showing.

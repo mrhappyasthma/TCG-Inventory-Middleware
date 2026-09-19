@@ -1576,6 +1576,11 @@ class Database:
         "condition": "m.condition",
         "printing": "m.printing",
         "quantity": "m.quantity",
+        # An unpriced card is 0 rather than NULL -- both writers of this
+        # column coalesce -- so it sorts as the cheapest thing in the
+        # catalogue, which is also how the table renders it: a dash, not
+        # "$0.00".
+        "price": "COALESCE(m.price, 0)",
         "remarks": "m.remarks",
         "sku_id": "m.sku_id",
         "ebay_parent_id": "v.ebay_parent_id",
@@ -1972,6 +1977,12 @@ class Database:
                 m.condition,
                 m.printing,
                 COALESCE(m.quantity, 0) AS quantity,
+                -- What we would list the card at, and what eBay was last
+                -- known to hold for it. Both, for the same reason the two
+                -- quantities are both here: the gap between them is what a
+                -- draft proposes, and it is only visible side by side.
+                COALESCE(m.price, 0) AS price,
+                m.market_price,
                 COALESCE(m.remarks, '') AS remarks,
                 m.remarks_edited_at,
                 -- The card's own target, or NULL when it follows the
@@ -1991,7 +2002,8 @@ class Database:
                 COALESCE(m.stock_image, '') AS stock_image,
                 {CARD_IMAGE_SQL},
                 COALESCE(v.ebay_parent_id, '') AS ebay_parent_id,
-                COALESCE(v.last_known_qty, 0) AS last_known_qty
+                COALESCE(v.last_known_qty, 0) AS last_known_qty,
+                v.last_known_price
             FROM manifest m
             LEFT JOIN ebay_variations v ON m.manifest_id = v.manifest_id
         """
