@@ -1622,6 +1622,14 @@ def refresh_listing(
             record("ERROR", f"{sku}: {message}")
 
     refreshed = len(payloads) - len(failures)
+    if failures:
+        # Said plainly, because the obvious reading of "19 failed" is that 19
+        # cards came off the listing -- which is what used to happen.
+        record("WARN", (
+            f"{len(failures)} card(s) could not be updated, and were kept on "
+            f"the listing exactly as they were. Their pictures, specifics and "
+            f"titles are unchanged; nothing was removed."
+        ))
 
     cover_sent = None
     cover_verified = None
@@ -1635,7 +1643,27 @@ def refresh_listing(
             managed.get("inventory_item_group_key")
             or inventory_group_key(group_key)
         )
-        kept = [(card, sku) for card, sku in entries if sku not in failures]
+        # **Every card the listing holds, including the ones whose item
+        # write just failed.**
+        #
+        # Writing the group is a full replace, so dropping a SKU here takes
+        # that card off the live listing. A failed item write means "this
+        # card's details could not be updated", not "this card should stop
+        # being sold" -- and the errors that cause it are eBay's own
+        # transient system errors, so the response to one was to delist a
+        # card that was live, correct and selling a second earlier.
+        #
+        # That is exactly what happened: a refresh of a 152-card listing hit
+        # 19 "Core Inventory Service internal error" rows, rebuilt the group
+        # from the other 133, and the listing lost 14 live variations. The
+        # push path had this fixed already -- it sends everything the
+        # listing holds and not just what it touched -- and this one, which
+        # shares the group write, did not.
+        #
+        # A card whose *first* write ever failed is a different case, but it
+        # cannot arise here: every entry comes from the mirror's list of
+        # cards already linked to this live listing.
+        kept = entries
         cover_sent = _cover_for_refresh(
             db, api, ebay_parent_id, ebay_group_key,
             [c for c, _ in kept], settings, record,

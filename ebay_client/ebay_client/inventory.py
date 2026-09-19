@@ -28,12 +28,27 @@ and no database.
 """
 
 import json
+import time
 
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import (
+    Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
+)
 
 from .errors import ApiError
 
 INVENTORY_BASE = "/sell/inventory/v1"
+
+# eBay's own "something went wrong here" for a single record inside a bulk
+# call. The transport already retries 429 and the 5xx family, but this
+# arrives as a *per-record* failure inside an otherwise fine response, so
+# nothing above sees a status code to react to.
+TRANSIENT_ERROR_ID = 25001
+
+# Deliberately few and short. This is a courtesy retry for a service having a
+# bad second, not a way to push through a real refusal, and a push already
+# holds a database session while it runs.
+TRANSIENT_RETRIES = 2
+TRANSIENT_BACKOFF_SECONDS = 1.5
 
 # eBay's documented ceilings for the bulk calls. Exceeding one fails the
 # entire request rather than the surplus, so they are enforced here.
@@ -91,8 +106,23 @@ def get_inventory_item(transport, sku: str) -> Dict[str, Any]:
     ) or {}
 
 
+def _bulk_post_with_retry(
+    transport,
+    path: str,
+    records: Sequence[Dict[str, Any]],
+    sleep: Optional[Callable[[float], None]] = None,
+) -> List[Dict[str, Any]]:
+    """One bulk call, re-sending anything eBay failed on its own account."""
+    rows = _bulk_post(transport, path, records)
+    return _retry_transient(
+        transport, path, records, rows, sleep or time.sleep
+    )
+
+
 def bulk_create_or_replace_inventory_item(
-    transport, items: Sequence[Dict[str, Any]]
+    transport,
+    items: Sequence[Dict[str, Any]],
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Create or overwrite up to 25 inventory items in one call.
@@ -110,10 +140,11 @@ def bulk_create_or_replace_inventory_item(
         )
     for entry in items:
         validate_sku(entry.get("sku", ""))
-    return _bulk_post(
+    return _bulk_post_with_retry(
         transport,
         f"{INVENTORY_BASE}/bulk_create_or_replace_inventory_item",
         items,
+        sleep=sleep,
     )
 
 
@@ -314,7 +345,9 @@ def publish_offer_by_inventory_item_group(
 
 
 def bulk_update_price_quantity(
-    transport, requests: Sequence[Dict[str, Any]]
+    transport,
+    requests: Sequence[Dict[str, Any]],
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Change price and/or quantity for up to 25 SKUs in one call.
@@ -331,8 +364,9 @@ def bulk_update_price_quantity(
             f"{len(requests)} updates exceeds eBay's limit of "
             f"{BULK_PRICE_QUANTITY_LIMIT} per call; use chunked()"
         )
-    return _bulk_post(
-        transport, f"{INVENTORY_BASE}/bulk_update_price_quantity", requests
+    return _bulk_post_with_retry(
+        transport, f"{INVENTORY_BASE}/bulk_update_price_quantity", requests,
+        sleep=sleep,
     )
 
 
@@ -373,6 +407,88 @@ def price_quantity_request(
 
 
 # -- reading the per-record outcome of a bulk call -----------------------
+
+
+def is_transient_failure(row: Dict[str, Any]) -> bool:
+    """
+    Whether a failed row is eBay having a bad moment rather than a bad record.
+
+    eBay answers ``25001 / "A system error has occurred"`` -- often naming its
+    Core Inventory Service -- for load and internal faults on its own side.
+    The evidence that it is not our payload: which SKUs get it changes from
+    run to run, the rest of the identical batch succeeds, and the same record
+    goes through on a retry seconds later. One push of 152 cards lost 5 this
+    way and a later refresh of the same listing lost 19, with almost no
+    overlap between them.
+
+    Matched on the message as well as the id, because the id is not always
+    present on a per-record row, and narrowly: anything naming a field, an
+    aspect or a policy is a real fault that a retry would only repeat.
+    """
+    for error in row.get("errors") or []:
+        if str(error.get("errorId") or "") == str(TRANSIENT_ERROR_ID):
+            return True
+        text = str(
+            error.get("longMessage") or error.get("message") or ""
+        ).lower()
+        if "system error" in text or "internal error" in text:
+            return True
+    return False
+
+
+def _retry_transient(
+    transport,
+    path: str,
+    records: Sequence[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
+    sleep: Callable[[float], None],
+) -> List[Dict[str, Any]]:
+    """
+    Re-send only the records eBay failed with a system error of its own.
+
+    Safe to repeat because every bulk call this is used for is idempotent by
+    construction: ``createOrReplaceInventoryItem`` overwrites, and a price or
+    quantity update sets an absolute value. A record eBay reported as failed
+    is one it says it did not apply, so re-sending it cannot double anything.
+
+    Only the failed records go again -- re-sending the whole batch would
+    rewrite records eBay has already accepted, and on a bad day would turn a
+    partial success into a fresh chance to fail.
+    """
+    by_sku = {str(r.get("sku") or ""): r for r in records}
+    outcome = {str(row.get("sku") or ""): row for row in rows}
+
+    for attempt in range(1, TRANSIENT_RETRIES + 1):
+        again = [
+            by_sku[sku] for sku, row in outcome.items()
+            if sku in by_sku and status_failed(row) and is_transient_failure(row)
+        ]
+        if not again:
+            break
+        # Backing off rather than hammering: the error means eBay is
+        # struggling, and the point is to give it a moment.
+        sleep(TRANSIENT_BACKOFF_SECONDS * attempt)
+        try:
+            retried = _bulk_post(transport, path, again)
+        except ApiError:
+            # The whole retry batch was refused with nothing per-record to
+            # read. The original verdicts stand, which is the conservative
+            # answer: the caller already knows those records failed.
+            break
+        for row in retried:
+            sku = str(row.get("sku") or "")
+            if sku in outcome:
+                outcome[sku] = row
+
+    # Rebuilt in the order the caller sent, because a caller may zip these
+    # against its own list.
+    ordered = []
+    for record in records:
+        sku = str(record.get("sku") or "")
+        if sku in outcome:
+            ordered.append(outcome.pop(sku))
+    ordered.extend(outcome.values())
+    return ordered
 
 
 def _bulk_post(transport, path: str, records: Sequence[Dict[str, Any]]):
@@ -478,10 +594,23 @@ def failed_statuses(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def describe_failure(row: Dict[str, Any]) -> str:
-    """A one-line reason for a failed row, safe to store against a card."""
+    """
+    A one-line reason for a failed row, safe to store against a card.
+
+    Repeats are collapsed. eBay returns one error entry per offending
+    *field*, so a single system error on a card with several arrived as the
+    same sentence eleven times over -- a log line long enough to hide the
+    nineteen other cards it was printed beside. Saying it once and counting
+    the rest keeps both facts.
+    """
     errors = row.get("errors") or []
+    seen: Dict[str, int] = {}
+    for error in errors:
+        text = str(error.get("longMessage") or error.get("message") or error)
+        seen[text] = seen.get(text, 0) + 1
     details = "; ".join(
-        str(e.get("longMessage") or e.get("message") or e) for e in errors
+        text if count == 1 else f"{text} (x{count})"
+        for text, count in seen.items()
     )
     sku = row.get("sku") or row.get("offerId") or "?"
     if not details:

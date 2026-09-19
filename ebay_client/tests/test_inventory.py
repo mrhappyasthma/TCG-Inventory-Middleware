@@ -289,9 +289,6 @@ class OfferListingIdTests(unittest.TestCase):
                 self.assertEqual(inventory.offer_listing_id(offer), "")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def refused(status, payload):
     """A non-2xx whose body still carries per-record results."""
@@ -404,3 +401,116 @@ class PartialRefusalTests(unittest.TestCase):
             inventory.bulk_update_price_quantity(
                 transport, [{"sku": "ID1001"}]
             )
+
+
+class TransientRetryTests(unittest.TestCase):
+    """
+    eBay's own system errors arrive per record, where nothing above sees them.
+
+    The transport retries 429 and the 5xx family, but ``25001 / "A system
+    error has occurred"`` comes back *inside* an otherwise fine response, one
+    row among twenty-five. A 152-card push lost five cards that way and a
+    later refresh of the same listing lost nineteen, with almost no overlap:
+    which SKUs get it changes run to run, which is the evidence that it is
+    eBay having a bad moment rather than a bad record.
+    """
+
+    SYSTEM_ERROR = {
+        "errorId": 25001,
+        "longMessage": "A system error has occurred. Core Inventory Service "
+                       "internal error",
+    }
+
+    def records(self, *skus):
+        return [{"sku": sku, "locale": "en_US"} for sku in skus]
+
+    def test_a_system_error_is_recognised_as_transient(self):
+        self.assertTrue(inventory.is_transient_failure(
+            {"sku": "ID1", "statusCode": 400, "errors": [self.SYSTEM_ERROR]}
+        ))
+
+    def test_a_real_fault_is_not_retried(self):
+        # Anything naming a field, an aspect or a policy is a fault a retry
+        # would only repeat, and repeating it costs quota and time.
+        self.assertFalse(inventory.is_transient_failure({
+            "sku": "ID1", "statusCode": 400,
+            "errors": [{"errorId": 25002, "longMessage":
+                        "The item specific Game is missing"}],
+        }))
+
+    def test_only_the_failed_record_goes_again(self):
+        """
+        Re-sending the whole batch would rewrite records eBay has already
+        accepted, and give a struggling service a fresh chance to fail them.
+        """
+        first = ok({"responses": [
+            {"sku": "ID1", "statusCode": 200},
+            {"sku": "ID2", "statusCode": 400, "errors": [self.SYSTEM_ERROR]},
+        ]})
+        second = ok({"responses": [{"sku": "ID2", "statusCode": 200}]})
+        transport, opener = transport_with(first, second)
+
+        rows = inventory.bulk_create_or_replace_inventory_item(
+            transport, self.records("ID1", "ID2"), sleep=lambda _s: None
+        )
+
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(
+            [r["sku"] for r in opener.calls[1]["body"]["requests"]], ["ID2"],
+            "only the record eBay failed should be re-sent",
+        )
+        self.assertEqual(inventory.failed_statuses(rows), [])
+        # And the caller's order is preserved, because callers zip these
+        # against their own list.
+        self.assertEqual([r["sku"] for r in rows], ["ID1", "ID2"])
+
+    def test_it_gives_up_rather_than_hammering(self):
+        failing = {"responses": [
+            {"sku": "ID2", "statusCode": 400, "errors": [self.SYSTEM_ERROR]},
+        ]}
+        transport, opener = transport_with(*[ok(failing) for _ in range(6)])
+
+        rows = inventory.bulk_create_or_replace_inventory_item(
+            transport, self.records("ID2"), sleep=lambda _s: None
+        )
+
+        self.assertEqual(
+            len(opener.calls), inventory.TRANSIENT_RETRIES + 1,
+            "one original call plus a bounded number of retries",
+        )
+        self.assertEqual(len(inventory.failed_statuses(rows)), 1,
+                         "a card that never took must still be reported")
+
+    def test_a_price_quantity_update_is_retried_too(self):
+        first = ok({"responses": [
+            {"sku": "ID9", "statusCode": 500, "errors": [self.SYSTEM_ERROR]},
+        ]})
+        second = ok({"responses": [{"sku": "ID9", "statusCode": 200}]})
+        transport, opener = transport_with(first, second)
+
+        rows = inventory.bulk_update_price_quantity(
+            transport,
+            [{"sku": "ID9", "shipToLocationAvailability": {"quantity": 3}}],
+            sleep=lambda _s: None,
+        )
+
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(inventory.failed_statuses(rows), [])
+
+    def test_a_repeated_message_is_collapsed(self):
+        """
+        eBay returns one error entry per offending field, so a single system
+        error arrived as the same sentence eleven times -- long enough to
+        hide the nineteen other cards logged beside it.
+        """
+        described = inventory.describe_failure({
+            "sku": "ID2016",
+            "statusCode": 400,
+            "errors": [self.SYSTEM_ERROR] * 8,
+        })
+        self.assertEqual(described.count("A system error has occurred"), 1)
+        self.assertIn("(x8)", described)
+
+
+if __name__ == "__main__":
+    unittest.main()

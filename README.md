@@ -809,7 +809,7 @@ so pressing Push again cannot duplicate anything or re-list what worked.
 
 | Message | What it means |
 |---|---|
-| *A system error has occurred* / *Core Inventory Service internal error* | eBay's side, and usually transient. The rest of the same batch succeeding is the evidence that the request was fine. **Push again.** |
+| *A system error has occurred* / *Core Inventory Service internal error* | eBay's side. Each failed record is now re-sent twice with a short pause before you ever see this, so one that still reports is a bad patch rather than a blip — **push again**, and it usually goes. |
 | Anything naming a field, an aspect or a policy | A real fault in that card. Fix the card and rebuild the draft. |
 | *no offer on record for this card* | The quantity could not be applied because the offer id is unknown. Run a sync, or use Refresh on the eBay Listings tab. |
 
@@ -847,9 +847,15 @@ fixed — a group update now sends every card the listing holds — but listings
 already narrowed need restoring.
 
 **Refresh** on the eBay Listings tab rebuilds the group from every card our
-mirror links to the listing, which is the remedy. But it writes the inventory
-items and the group and **never touches offers**, so whether it is sufficient
-depends on what eBay did with the offers of the cards it removed:
+mirror links to the listing, which is the remedy. It sends **every** such
+card, including any whose details it could not update on that run — a failed
+write means the card's pictures and specifics are unchanged, never that the
+card should stop being sold. (It did drop them once, which turned 19
+transient eBay errors into 14 live variations removed from a listing.)
+
+It writes the inventory items and the group and **never touches offers**, so
+whether it is sufficient depends on what eBay did with the offers of the
+cards it removed:
 
 ```bash
 docker compose exec tcg-middleware python scripts/inspect_listing.py 227521446958
