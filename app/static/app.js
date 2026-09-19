@@ -2061,7 +2061,7 @@ function renderInventoryTable(items, total, offset) {
                     </button>
                 </td>
                 <td class="py-3 px-4 text-center whitespace-nowrap">
-                    <button onclick="openQuantityModal('${item.manifest_id}')" title="${escapeHtml(item.target_quantity === null || item.target_quantity === undefined ? "Follows the account default. Click to give this card its own target." : "This card has its own target. Click to change it.")}" class="inline-block min-w-[28px] px-2 py-0.5 rounded text-[11px] font-mono ${item.target_quantity === null || item.target_quantity === undefined ? "text-slate-500 hover:text-slate-300" : "text-brand-300 font-bold"} hover:ring-1 hover:ring-brand-500 transition-all cursor-pointer">
+                    <button onclick="openQuantityModal('${item.manifest_id}', 'target')" title="${escapeHtml(item.target_quantity === null || item.target_quantity === undefined ? "Follows the account default. Click to give this card its own target." : "This card has its own target. Click to change it.")}" class="inline-block min-w-[28px] px-2 py-0.5 rounded text-[11px] font-mono ${item.target_quantity === null || item.target_quantity === undefined ? "text-slate-500 hover:text-slate-300" : "text-brand-300 font-bold"} hover:ring-1 hover:ring-brand-500 transition-all cursor-pointer">
                         ${item.effective_target}
                     </button>
                 </td>
@@ -2299,7 +2299,11 @@ async function deleteCard(manifestId) {
 let quantityEditManifestId = null;
 let quantityEditPrevious = 0;
 
-function openQuantityModal(manifestId) {
+// One dialog, two cells. The field that gets focus is the one whose number
+// was clicked -- clicking Target and landing in On Hand means the first
+// keystroke edits the stock count, which is the more expensive of the two to
+// get wrong.
+function openQuantityModal(manifestId, focusField) {
     const row = (lastInventoryItems || []).find(i => i.manifest_id === manifestId);
     quantityEditManifestId = manifestId;
     quantityEditPrevious = row ? (row.quantity ?? 0) : 0;
@@ -2325,8 +2329,11 @@ function openQuantityModal(manifestId) {
 
     document.getElementById("quantityModal").classList.remove("hidden");
     syncModalScrollLock();
-    document.getElementById("quantityInput").focus();
-    document.getElementById("quantityInput").select();
+    const focused = (focusField === "target" && targetInput)
+        ? targetInput
+        : document.getElementById("quantityInput");
+    focused.focus();
+    focused.select();
 }
 
 function closeQuantityModal() {
