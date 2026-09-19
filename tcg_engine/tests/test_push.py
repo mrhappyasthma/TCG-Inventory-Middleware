@@ -1512,6 +1512,38 @@ class AddingToALiveListingTests(PushTestCase):
         live = {r["manifest_id"] for r in self.db.get_live_variations()}
         self.assertNotIn("ID1003", live)
 
+    def test_a_singles_recreated_offer_is_published_too(self):
+        """
+        The same gap, one card wide: a single whose offer had to be recreated
+        has an UNPUBLISHED offer and nothing else here publishes it.
+        """
+        self.add_card("ID1001", "Charizard", "004/102", price=9.99)
+        api = FakeEbay()
+        plan_id = self.approved_plan()
+        push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        self.assertTrue(
+            is_single(self.db.get_plan_items(plan_id)[0]["group_key"]),
+            "a card above the threshold should be a single",
+        )
+
+        # Our record of the offer is lost, as an interrupted push can leave
+        # it, so the next push creates a new one.
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE ebay_variations SET offer_id = NULL")
+            conn.commit()
+        api.calls.clear()
+
+        self.db.set_manifest_quantity("ID1001", 6)
+        result = push_plan(
+            self.db, api, self.approved_plan(), user_id=SHARED_SCOPE
+        )
+
+        self.assertEqual(result["failed"], 0)
+        self.assertIn(
+            "publish_offer", api.kinds(),
+            "a recreated offer is invisible until it is published",
+        )
+
     def test_a_publish_landing_elsewhere_is_reported(self):
         # The same check the refresh makes: two listings for one group is
         # worse than an unpublished offer, and the mirror has to follow eBay.

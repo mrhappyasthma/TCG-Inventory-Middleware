@@ -836,6 +836,35 @@ def _push_group(
             listing_id = managed["ebay_parent_id"]
             db.upsert_managed_listing(group_key, pushed=True)
             record("INFO", f"{_sku_for(item)}: updated listing #{listing_id}")
+            # The same gap as the group branch below, one card wide. A
+            # single whose offer had to be recreated -- because ours was
+            # lost, or eBay's was ended -- has an UNPUBLISHED offer, and
+            # nothing else here publishes it. Rarer than the variation case
+            # only because a single's offer id is usually still on record.
+            if item in needed_offers and item.get("offer_id"):
+                try:
+                    published_as = api.publish_offer(str(item["offer_id"]))
+                except Exception as exc:  # noqa: BLE001 - attributed below
+                    reason = (
+                        f"its offer was recreated but could not be put on "
+                        f"sale: {exc}. The card is on listing "
+                        f"#{listing_id} and invisible to buyers until it is "
+                        f"published."
+                    )
+                    _mark(db, item, STATUS_FAILED, counts, reason)
+                    record("ERROR", f"{_sku_for(item)}: {reason}")
+                    return (0, 1)
+                if str(published_as) != str(listing_id):
+                    db.upsert_managed_listing(
+                        group_key, ebay_parent_id=str(published_as),
+                        pushed=True
+                    )
+                    record("ERROR", (
+                        f"eBay published this offer as #{published_as}, not "
+                        f"#{listing_id}, so there may now be two listings "
+                        f"for it. Check both before pushing again."
+                    ))
+                    listing_id = published_as
         _confirm(db, live, listing_id, counts)
         return (0 if published else 1, 1 if published else 0)
 
