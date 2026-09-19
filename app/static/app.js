@@ -1760,6 +1760,7 @@ async function fetchInventory() {
         lastInventoryTotal = Number(data.total) || 0;
         updateBulkRemarkButton();
         updateExportButton();
+        updateSortIndicators();
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="${INVENTORY_COLUMN_COUNT}" class="py-6 text-center text-rose-400">Failed to load inventory: ${escapeHtml(err.message)}</td></tr>`;
     }
@@ -2344,7 +2345,40 @@ function handleSort(col) {
         currentSortBy = col;
         currentSortDir = "ASC";
     }
+    // Back to the first page, as every filter does. Re-sorting while on page
+    // three shows the middle of the new order, which reads as the sort
+    // having been ignored -- especially under a filter, where there may be
+    // only two pages and the one you are on no longer exists.
+    currentPage = 1;
     fetchInventory();
+}
+
+// Which column the table is sorted by, marked on the header.
+//
+// Sorting and filtering have always composed -- the query applies the WHERE
+// and the ORDER BY independently, and neither handler clears the other --
+// but nothing on screen said which column was active or in which direction.
+// Under a filter, where a click may reorder a handful of rows, that is
+// indistinguishable from the click doing nothing.
+function updateSortIndicators() {
+    const headers = document.querySelectorAll(
+        "#inventoryTableHead th[data-sort-key]"
+    );
+    headers.forEach(th => {
+        const active = th.dataset.sortKey === currentSortBy;
+        const ascending = currentSortDir === "ASC";
+        const arrow = th.querySelector(".sort-arrow")
+            || th.appendChild(document.createElement("span"));
+        arrow.className = "sort-arrow ml-1 " + (active ? "text-brand-400" : "text-slate-700");
+        // innerText, not innerHTML: nothing here is user data, and keeping
+        // it a text sink means it can never become one.
+        arrow.innerText = active ? (ascending ? "▲" : "▼") : "↕";
+        th.setAttribute(
+            "aria-sort",
+            active ? (ascending ? "ascending" : "descending") : "none"
+        );
+        th.classList.toggle("text-slate-200", active);
+    });
 }
 
 function changePage(delta) {

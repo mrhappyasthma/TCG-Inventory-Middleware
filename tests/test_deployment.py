@@ -227,6 +227,47 @@ class JavaScriptParsesTests(unittest.TestCase):
         self.assertIn('onclick="syncFromEbay(this)"', html)
         self.assertIn('.getElementById("btnListingsSync")', js)
 
+    def test_every_sortable_header_sorts_by_a_column_the_engine_allows(self):
+        """
+        A header whose key is not on the engine's whitelist sorts by manifest
+        id, silently.
+
+        ``get_inventory`` resolves ``sort_by`` through ``_SORTABLE_COLUMNS``
+        with a safe default, which is what stops a request choosing its own
+        ORDER BY -- and it means a typo in the markup is not an error but a
+        column that appears to do nothing when clicked. Sorting and filtering
+        compose, so this tends to be blamed on the filter.
+
+        The indicator reads ``data-sort-key``, so a header that calls
+        handleSort without one also shows no arrow: it sorts, and looks like
+        it did not.
+        """
+        import sys
+
+        sys.path.insert(0, os.path.join(PROJECT_ROOT, "tcg_engine"))
+        from tcg_engine.db import Database
+
+        html = self.source("index.html")
+        clicked = set(re.findall(r"handleSort\('([a-z_]+)'\)", html))
+        keyed = set(re.findall(r'data-sort-key="([a-z_]+)"', html))
+        allowed = set(Database._SORTABLE_COLUMNS)
+
+        self.assertTrue(clicked, "the inventory table should be sortable")
+        self.assertEqual(
+            clicked - allowed, set(),
+            "these headers sort by a column the engine does not allow, so "
+            "clicking them silently sorts by manifest id",
+        )
+        self.assertEqual(
+            clicked - keyed, set(),
+            "these headers sort but carry no data-sort-key, so they never "
+            "show which way the table is ordered",
+        )
+        self.assertEqual(
+            keyed - clicked, set(),
+            "these headers are marked sortable but have no handler",
+        )
+
     def test_no_inline_handler_interpolates_a_quoted_json_string(self):
         """
         An inline handler attribute must not contain JSON.stringify.
