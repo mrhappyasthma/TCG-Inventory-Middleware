@@ -4298,6 +4298,9 @@ async function loadPlanListings(planId) {
                    <li class="flex items-center gap-2">
                        <span class="text-slate-300 truncate">${escapeHtml(g.set_name || g.group_key)}${g.condition ? ` &middot; ${escapeHtml(g.condition)}` : ""}</span>
                        <span class="text-slate-600">${g.item_count - g.excluded_count} card(s)</span>
+                       ${g.ebay_parent_id
+                           ? `<span class="text-slate-500 font-mono text-[10px]" title="These cards are added to the listing that already exists, not published as a new one.">&rarr; #${escapeHtml(g.ebay_parent_id)}</span>`
+                           : ""}
                        <button type="button" onclick="pushPlan(${planId}, this, this.dataset.groupKey)" data-group-key="${escapeHtml(g.group_key)}"
                            class="ml-auto text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-emerald-900/60 hover:bg-emerald-800 border border-emerald-800 text-emerald-200 transition-all">
                            Push${g.ebay_parent_id ? "" : " (new)"}
@@ -4314,7 +4317,7 @@ async function loadPlanListings(planId) {
                     ? `<p class="text-sky-300/90 pt-1">${pushedCount} card(s) in this plan are already live on eBay.</p>`
                     : ""}
                 ${pushable.some(g => !g.ebay_parent_id)
-                    ? `<p class="text-slate-500 pt-1">A listing marked <span class="text-emerald-300">new</span> does not exist on eBay yet, and creating it cannot be undone by pressing the button again. Start with a small one and check it in Seller Hub.</p>`
+                    ? `<p class="text-slate-500 pt-1">A listing marked <span class="text-emerald-300">new</span> does not exist on eBay yet, and creating it cannot be undone by pressing the button again. Start with a small one and check it in Seller Hub. One showing <span class="font-mono">&rarr; #item</span> already exists and is updated in place, however many of its cards this plan touches.</p>`
                     : ""}
             </div>`;
     } catch (err) {

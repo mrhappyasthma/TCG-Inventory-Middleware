@@ -816,6 +816,14 @@ so pressing Push again cannot duplicate anything or re-list what worked.
 A card that keeps failing can be left out of the draft; excluding a broken
 card is eBay's own documented way to unblock the rest of a group.
 
+Rebuilding the draft is also fine: the cards that succeeded now match what
+eBay holds, so the new draft contains only the ones that did not. Such a
+listing shows **→ #item number** rather than **new** — it already exists and
+the cards are added to it in place. That distinction is read from
+`ebay_managed_listing`, the same table the push consults, rather than from
+whether the individual cards happen to be linked yet; deriving it from the
+cards said "new" for a retry of five cards onto a listing of 147.
+
 ### Restoring a listing a partial push narrowed
 
 Writing an inventory item group is a **full replace**: a SKU absent from

@@ -3568,14 +3568,36 @@ class Database:
                        -- exists. NULL means the plan would create it, and a
                        -- cover then applies at creation rather than as a
                        -- revision.
-                       MAX(NULLIF(TRIM(COALESCE(v.ebay_parent_id, '')), ''))
-                           AS ebay_parent_id,
+                       --
+                       -- Read from `ebay_managed_listing` first, because that
+                       -- is the table the push itself consults: `_push_group`
+                       -- treats a group as published when *it* has a parent
+                       -- id, whatever the cards say. Deriving this from the
+                       -- cards' own variation rows disagreed in exactly the
+                       -- case that matters -- a retry of five cards that
+                       -- failed their first push have no variation row of
+                       -- their own, so the group read as new and the page
+                       -- offered "Push (new)" for a listing that already
+                       -- existed and would in fact be updated. The card rows
+                       -- remain the fallback, which is what a File Exchange
+                       -- listing has instead.
+                       COALESCE(
+                           NULLIF(TRIM(COALESCE(ml.ebay_parent_id, '')), ''),
+                           MAX(NULLIF(TRIM(COALESCE(v.ebay_parent_id, '')), ''))
+                       ) AS ebay_parent_id,
                        -- The staged cover if one has been chosen, otherwise
                        -- whatever the live listing already carries, so the
                        -- drafts page shows the current picture rather than an
                        -- empty frame.
+                       -- `ol` before `o` for the same reason as the parent id
+                       -- above: a group whose cards are all new to eBay has
+                       -- no variation row to reach the override through, so
+                       -- the listing's recorded cover would read as absent
+                       -- and the page would show an empty frame for a listing
+                       -- that has one.
                        COALESCE(
                            NULLIF(TRIM(COALESCE(g.cover_image_url, '')), ''),
+                           NULLIF(TRIM(COALESCE(ol.cover_image_url, '')), ''),
                            MAX(NULLIF(TRIM(COALESCE(o.cover_image_url, '')), ''))
                        ) AS cover_image_url,
                        CASE WHEN NULLIF(TRIM(COALESCE(g.cover_image_url, '')), '')
@@ -3591,11 +3613,19 @@ class Database:
                 LEFT JOIN ebay_variations v ON v.manifest_id = i.manifest_id
                 LEFT JOIN ebay_listing_overrides o
                        ON o.ebay_parent_id = v.ebay_parent_id
+                -- The listing this group is *managed* as, which is what the
+                -- push acts on. One row per group key, so grouping by its
+                -- columns adds no rows.
+                LEFT JOIN ebay_managed_listing ml
+                       ON ml.group_key = COALESCE(i.group_key, '')
+                LEFT JOIN ebay_listing_overrides ol
+                       ON ol.ebay_parent_id = ml.ebay_parent_id
                 LEFT JOIN listing_plan_group g
                        ON g.plan_id = i.plan_id
                       AND g.group_key = COALESCE(i.group_key, '')
                 WHERE i.plan_id = ?
-                GROUP BY COALESCE(i.group_key, ''), g.cover_image_url
+                GROUP BY COALESCE(i.group_key, ''), g.cover_image_url,
+                         ml.ebay_parent_id, ol.cover_image_url
                 ORDER BY COALESCE(i.group_key, '')
                 """,
                 (int(plan_id),),

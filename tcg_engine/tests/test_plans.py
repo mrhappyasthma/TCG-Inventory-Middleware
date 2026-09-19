@@ -493,6 +493,69 @@ class OneConditionPerListingTests(unittest.TestCase):
         self.assertEqual(agreed["condition_count"], 1)
         self.assertEqual(agreed["set_count"], 1)
 
+    def test_a_group_maps_onto_the_listing_the_push_would_act_on(self):
+        """
+        "Would this create a listing?" has to be answered from the same table
+        the push asks, which is ``ebay_managed_listing`` keyed by the group.
+
+        Deriving it from the cards' own variation rows disagrees in exactly
+        the case that matters. Five cards failed their first push, so they
+        have no variation row; rebuilding the draft put them in a group whose
+        listing plainly exists, and the page offered "Push (new)" for it. The
+        push itself was right -- it reads the managed listing and updates --
+        but the label said the opposite, and "new" is the warning that a
+        create cannot be undone.
+        """
+        self.add_card("ID1001", "Rolycoly", "NM")
+        self.db.upsert_managed_listing(
+            "ME: Ascended Heroes|NM",
+            ebay_parent_id="227528268218",
+            inventory_item_group_key="ME-ASCENDED-HEROES-NM-ABC123",
+            pushed=True,
+        )
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+
+        group = {
+            g["group_key"]: g for g in self.db.get_plan_groups(plan_id)
+        }["ME: Ascended Heroes|NM"]
+        self.assertEqual(group["ebay_parent_id"], "227528268218")
+
+    def test_a_group_with_no_managed_listing_is_still_new(self):
+        # The healthy create case must keep saying so: that label is the
+        # warning that pressing the button twice makes two listings.
+        self.add_card("ID1001", "Rolycoly", "NM")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+
+        group = {
+            g["group_key"]: g for g in self.db.get_plan_groups(plan_id)
+        }["ME: Ascended Heroes|NM"]
+        self.assertIsNone(group["ebay_parent_id"])
+
+    def test_the_listings_recorded_cover_survives_a_card_with_no_link(self):
+        """
+        Same join, same reason: a group whose cards are all new to eBay has
+        no variation row to reach the override through, so the cover recorded
+        against the listing would read as absent and the page would show an
+        empty frame for a listing that has one.
+        """
+        self.add_card("ID1001", "Rolycoly", "NM")
+        self.db.upsert_managed_listing(
+            "ME: Ascended Heroes|NM", ebay_parent_id="227528268218",
+            pushed=True,
+        )
+        self.db.set_listing_cover_image(
+            "227528268218", "https://cdn.example.com/cover.png"
+        )
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+
+        group = {
+            g["group_key"]: g for g in self.db.get_plan_groups(plan_id)
+        }["ME: Ascended Heroes|NM"]
+        self.assertEqual(
+            group["cover_image_url"], "https://cdn.example.com/cover.png"
+        )
+        self.assertFalse(group["cover_is_staged"])
+
     def test_a_plan_item_carries_its_cards_condition(self):
         """
         The move check reads the card's own condition off the item, and the
