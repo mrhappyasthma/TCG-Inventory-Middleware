@@ -296,18 +296,23 @@ class CreateListingTests(PushTestCase):
         self.assertEqual(result["pushed"], 2)
         self.assertEqual(result["failed"], 0)
         self.assertEqual(result["listings_created"], 1)
-        # Items, then offers, then the group, then publish. The group is what
-        # makes the listing visible, so anything it references must exist by
-        # the time it is written.
-        # Items, then offers, then one question, then the group, then
-        # publish. The question -- does eBay already have a listing for these
-        # cards? -- is asked because a publish whose reply was lost looks
-        # locally identical to one that never happened, and guessing wrong
-        # creates a second live listing. One SKU answers for the whole group.
+        # Items, then offers, then one question, then the group, then a
+        # read-back, then publish.
+        #
+        # The question -- does eBay already have a listing for these cards?
+        # -- is asked because a publish whose reply was lost looks locally
+        # identical to one that never happened, and guessing wrong creates a
+        # second live listing. One SKU answers for the whole group.
+        #
+        # The read-back is what eBay says the group now holds, because the
+        # write's own response reports what was accepted record by record
+        # and cannot say what the group ended up containing. Two separate
+        # faults produced a listing shorter than the run believed, and
+        # neither was noticed until a human counted the dropdown.
         self.assertEqual(
             api.kinds(),
             ["upsert_items", "create_offers", "published_listing_id",
-             "upsert_group", "publish_group"],
+             "upsert_group", "get_group", "publish_group"],
         )
 
         # The listing is now ours to manage through the API, and the eBay item
@@ -1417,6 +1422,128 @@ class PartialPushKeepsTheWholeListingTests(PushTestCase):
         push_plan(self.db, api, self.approved_plan(), user_id=SHARED_SCOPE)
         group = list(api.groups.values())[0]
         self.assertEqual(sorted(group["variantSKUs"]), ["ID1001", "ID1002"])
+
+
+class GroupIsConfirmedAgainstEbayTests(PushTestCase):
+    """
+    What eBay holds, not what we sent.
+
+    The write's own response reports what eBay accepted, record by record --
+    it cannot say what the group ends up containing. Two different faults
+    ended with a live listing holding fewer cards than the run believed, and
+    neither was noticed until somebody counted the variation dropdown by
+    hand. This is the net under both, and under whatever causes the next one.
+    """
+
+    def test_a_missing_variation_is_named_on_the_same_run(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+
+        class LosesOne(FakeEbay):
+            def get_group(self, group_key):
+                held = dict(self.groups.get(group_key) or {})
+                held["variantSKUs"] = ["ID1001"]
+                return held
+
+        api = LosesOne()
+        result = push_plan(
+            self.db, api, self.approved_plan(), user_id=SHARED_SCOPE
+        )
+
+        errors = [e["message"] for e in result["logs"] if e["level"] == "ERROR"]
+        self.assertTrue(errors, "a listing short of cards must say so")
+        self.assertIn("ID1002", errors[0])
+        self.assertIn("not on sale", errors[0])
+
+    def test_a_complete_group_is_confirmed_rather_than_assumed(self):
+        self.add_card("ID1001", "Charizard", "004/102")
+        api = FakeEbay()
+
+        result = push_plan(
+            self.db, api, self.approved_plan(), user_id=SHARED_SCOPE
+        )
+
+        joined = " ".join(e["message"] for e in result["logs"])
+        self.assertIn("eBay confirms the listing holds", joined)
+        self.assertNotIn("not on sale", joined)
+
+    def test_an_unreadable_group_is_unconfirmed_not_broken(self):
+        # A failed check is not a failure: saying cards are missing when the
+        # question could not be asked sends somebody to fix nothing.
+        self.add_card("ID1001", "Charizard", "004/102")
+
+        class CannotRead(FakeEbay):
+            def get_group(self, group_key):
+                raise RuntimeError("eBay is down")
+
+        result = push_plan(
+            self.db, CannotRead(), self.approved_plan(), user_id=SHARED_SCOPE
+        )
+
+        self.assertEqual(result["failed"], 0)
+        joined = " ".join(e["message"] for e in result["logs"])
+        self.assertIn("unconfirmed rather than known good", joined)
+
+
+class OfferRecoveryTests(PushTestCase):
+    def test_an_offer_ebay_refused_but_holds_is_adopted(self):
+        """
+        Creating an offer cannot simply be retried, so a refusal eBay did not
+        mean wedges the card permanently: every later attempt creates again,
+        eBay answers that one already exists, and the card fails forever with
+        an orphan offer nobody holds the id of.
+        """
+        self.add_card("ID1001", "Charizard", "004/102")
+
+        class RefusesButHasOne(FakeEbay):
+            def create_offers(self, payloads):
+                self.calls.append(("create_offers", [p["sku"] for p in payloads]))
+                # eBay reports a system error while having created it.
+                for payload in payloads:
+                    self.next_offer += 1
+                    self.offers[str(self.next_offer)] = payload
+                return [{
+                    "sku": p["sku"], "statusCode": 500,
+                    "errors": [{"longMessage": "A system error has occurred"}],
+                } for p in payloads]
+
+        api = RefusesButHasOne()
+        result = push_plan(
+            self.db, api, self.approved_plan(), user_id=SHARED_SCOPE
+        )
+
+        self.assertEqual(result["failed"], 0, "the card must not be written off")
+        self.assertEqual(result["pushed"], 1)
+        joined = " ".join(e["message"] for e in result["logs"])
+        self.assertIn("already exists", joined)
+        # The id is stored, so the next push changes the price rather than
+        # trying to create a second offer.
+        with self.db.get_connection() as conn:
+            offer_id = conn.execute(
+                "SELECT offer_id FROM ebay_variations WHERE manifest_id = ?",
+                ("ID1001",),
+            ).fetchone()["offer_id"]
+        self.assertTrue(offer_id)
+
+    def test_a_card_with_no_offer_anywhere_still_fails(self):
+        # The recovery must not turn a real refusal into a success.
+        self.add_card("ID1001", "Charizard", "004/102")
+
+        class RefusesEntirely(FakeEbay):
+            def create_offers(self, payloads):
+                self.calls.append(("create_offers", [p["sku"] for p in payloads]))
+                return [{
+                    "sku": p["sku"], "statusCode": 400,
+                    "errors": [{"longMessage": "the policy id is invalid"}],
+                } for p in payloads]
+
+        result = push_plan(
+            self.db, RefusesEntirely(), self.approved_plan(),
+            user_id=SHARED_SCOPE,
+        )
+
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["pushed"], 0)
 
 
 class AddingToALiveListingTests(PushTestCase):

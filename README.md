@@ -816,6 +816,29 @@ so pressing Push again cannot duplicate anything or re-list what worked.
 A card that keeps failing can be left out of the draft; excluding a broken
 card is eBay's own documented way to unblock the rest of a group.
 
+### What stops a bad batch becoming a short listing
+
+Four things, each closing a way this went wrong at least once:
+
+* **eBay's own system errors are retried.** `25001` arrives *per record*
+  inside an otherwise fine response, where the transport's 429/5xx retry
+  cannot see it. Failed records are re-sent twice with a short backoff, for
+  the idempotent calls only — an inventory item is a full replace and a
+  quantity is absolute, so re-sending one cannot double anything.
+* **A failed write never removes a card from the listing.** Both the push and
+  the refresh send every card the listing should hold, whatever this run's
+  writes did. A failed write means the card's details are unchanged, not that
+  it should stop being sold.
+* **The group is read back from eBay.** After every write, and it names any
+  card eBay does not report holding, on the same run. The write's own
+  response says what eBay accepted record by record — it cannot say what the
+  listing ended up containing, which is the question you actually have.
+* **A refused offer is checked before the card is written off.** Creating an
+  offer is the one call that cannot be retried, so a refusal eBay did not
+  mean would wedge that card forever: every later attempt would create again
+  and be told one already exists. If eBay turns out to hold an offer, it is
+  adopted instead.
+
 A card **added to a listing that already exists** is published as part of the
 push, which is a separate call from writing the variation set. Naming a card
 in the group does not put it on sale — an offer's status is its own, and a

@@ -948,6 +948,12 @@ def _push_group(
     db.upsert_managed_listing(
         group_key, inventory_item_group_key=ebay_group_key, pushed=True
     )
+    # What eBay holds, not what we sent. Checked before the publish, so a
+    # card missing from the group is named on the same run rather than being
+    # discovered by counting a dropdown days later.
+    _confirm_group_variations(
+        api, ebay_group_key, [sku for _, sku in entries], record
+    )
 
     if not published:
         listing_id = api.publish_group(ebay_group_key)
@@ -1118,8 +1124,29 @@ def _create_offers(
             if item is None:
                 continue
             if sku in rejected:
-                _mark(db, item, STATUS_FAILED, counts, rejected[sku])
-                record("ERROR", f"{sku}: {rejected[sku]}")
+                # Ask eBay whether the offer exists anyway before writing the
+                # card off.
+                #
+                # Creating an offer is the one call here that cannot simply
+                # be retried, so a refusal that eBay did not mean wedges the
+                # card permanently: every later attempt creates again, eBay
+                # answers "an offer already exists for this SKU", and the
+                # card fails forever with an orphan offer nobody holds the id
+                # of. eBay's own transient system errors make that a real
+                # sequence rather than a theoretical one. Read-only, and only
+                # on the failure path, so it costs nothing when things work.
+                adopted = _recover_offer_id(api, sku, record)
+                if adopted:
+                    db.set_variation_offer(item["manifest_id"], adopted)
+                    item["offer_id"] = adopted
+                    record("WARN", (
+                        f"{sku}: eBay refused the offer ({rejected[sku]}) but "
+                        f"reports one already exists, so it is being used "
+                        f"rather than creating a second."
+                    ))
+                else:
+                    _mark(db, item, STATUS_FAILED, counts, rejected[sku])
+                    record("ERROR", f"{sku}: {rejected[sku]}")
                 continue
 
             offer_id = str(row.get("offerId") or "").strip()
@@ -1469,6 +1496,74 @@ def _confirm_group_cover(
     return False
 
 
+def _confirm_group_variations(
+    api: Any,
+    ebay_group_key: str,
+    expected: Sequence[str],
+    record: Callable[[str, str], None],
+) -> Optional[List[str]]:
+    """
+    Ask eBay which variations the group now holds, and name any that are not
+    there. Returns the missing SKUs, ``[]`` when all are present, and None
+    when the question could not be asked.
+
+    The general safety net under every specific fix in this module. Two
+    separate faults -- offers left unpublished, and a refresh rebuilding the
+    group from only the cards that had just been written -- each ended with a
+    live listing holding fewer cards than the run believed, and in both cases
+    nothing noticed until somebody counted the dropdown by hand days later.
+    The write's own response cannot answer this: it reports what eBay
+    accepted, one record at a time, not what the group ends up containing.
+
+    Unlike the cover check, this reads a resource we have just written rather
+    than eBay's rendering of a listing, so a mismatch here is a real
+    difference rather than propagation lag. It is still reported rather than
+    raised: the cards that did land are live and correct, and the remedy is
+    another push, not an unwind.
+    """
+    wanted = [str(sku) for sku in expected if str(sku or "").strip()]
+    if not wanted:
+        return None
+    getter = getattr(api, "get_group", None)
+    if not callable(getter):
+        return None
+    try:
+        live = getter(ebay_group_key) or {}
+    except Exception as exc:  # noqa: BLE001 - a failed check is not a failure
+        record("WARN", (
+            f"Could not read the group back from eBay, so the variation list "
+            f"is unconfirmed rather than known good: {exc}"
+        ))
+        return None
+
+    held = {str(sku) for sku in (live.get("variantSKUs") or [])}
+    if not held:
+        # An empty answer is far more likely to be a shape we did not
+        # understand than a listing that just lost every variation, and
+        # reporting it as the latter would send somebody to fix nothing.
+        record("WARN", (
+            "eBay returned no variation list for this group, so it could not "
+            "be confirmed. Nothing is known to be wrong."
+        ))
+        return None
+
+    missing = [sku for sku in wanted if sku not in held]
+    if not missing:
+        record("INFO", (
+            f"eBay confirms the listing holds all {len(wanted)} variation(s)"
+        ))
+        return []
+
+    shown = ", ".join(missing[:10])
+    record("ERROR", (
+        f"eBay reports {len(held)} variation(s) on this listing, and "
+        f"{len(missing)} of the {len(wanted)} sent are not among them: "
+        f"{shown}{' ...' if len(missing) > 10 else ''}. They are not on sale. "
+        f"Push this listing again, or use Refresh on the eBay Listings tab."
+    ))
+    return missing
+
+
 def _cover_for_refresh(
     db: Database,
     api: Any,
@@ -1680,6 +1775,11 @@ def refresh_listing(
         ))
         cover_verified = _confirm_group_cover(
             api, ebay_group_key, cover_sent, record
+        )
+        # The listing's whole point is which cards it offers, so confirm
+        # that too rather than only the picture.
+        _confirm_group_variations(
+            api, ebay_group_key, [sku for _, sku in kept], record
         )
 
         # Put the group back on sale, which is the other half of "re-send
