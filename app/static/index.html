@@ -1348,23 +1348,20 @@
 
             <form id="conditionForm" onsubmit="saveCondition(event)" class="space-y-4 text-xs">
                 <div>
-                    <label class="block text-slate-300 mb-1" for="conditionInput">The grade, spelled as your export spells it</label>
-                    <input type="text" id="conditionInput" maxlength="40" placeholder="NM" autocomplete="off" list="conditionSuggestions"
-                        class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white font-mono text-sm focus:outline-none focus:border-brand-500">
+                    <label class="block text-slate-300 mb-1" for="conditionInput">Grade</label>
                     <!--
-                        Suggestions, not a closed list. The value is passed
-                        through to eBay untranslated, so a vocabulary of our
-                        own would be a third one that can disagree with both
-                        SortSwift's and eBay's.
+                        A closed list, filled from /api/inventory/conditions
+                        rather than written out here: the canonical codes have
+                        to match the engine's, and a copy in markup is a copy
+                        that drifts. The list also carries whatever spellings
+                        this catalogue already uses, which cannot be known in
+                        advance - see the endpoint for why forcing an older
+                        "Near Mint" card onto "NM" would split it in two.
                     -->
-                    <datalist id="conditionSuggestions">
-                        <option value="NM"></option>
-                        <option value="LP"></option>
-                        <option value="MP"></option>
-                        <option value="HP"></option>
-                        <option value="DM"></option>
-                    </datalist>
-                    <p class="text-[11px] text-slate-500 mt-1.5">Stored exactly as typed. It becomes part of the listing title and the condition descriptor.</p>
+                    <select id="conditionInput"
+                        class="w-full px-3 py-2 rounded-xl bg-dark-900 border border-slate-700 text-white font-mono text-sm focus:outline-none focus:border-brand-500">
+                    </select>
+                    <p class="text-[11px] text-slate-500 mt-1.5">Stored as shown, and sent to eBay as the matching condition descriptor. It also appears in the listing title.</p>
                 </div>
 
                 <div class="p-3 rounded-xl bg-amber-950/40 border border-amber-800/50 text-[11px] text-amber-200/90 leading-snug space-y-2">

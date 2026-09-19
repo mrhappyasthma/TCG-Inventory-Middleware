@@ -8,7 +8,9 @@ from tcg_engine.db import (SHARED_SCOPE, Database, apply_pricing_rules,
                           apply_condition_multiplier,
                           normalize_condition_key)
 from tcg_engine.batches import (
+    CONDITION_CHOICES,
     build_variation_option_name,
+    condition_is_mappable,
     process_batch_csv,
     variation_sort_key,
 )
@@ -2611,6 +2613,65 @@ class ConditionCorrectionTests(unittest.TestCase):
             self.db.set_manifest_condition("ID9999", "NM"),
             {"status": "missing"},
         )
+
+    def test_the_spellings_already_in_use_are_reported(self):
+        """
+        A catalogue can legitimately hold "NM" and "Near Mint" side by side,
+        because the grade is whatever the export that catalogued the card
+        used. The dialog offers those too, so it never forces a card onto a
+        new spelling -- which would change its identity and leave the next
+        upload re-creating the original.
+        """
+        self.db.insert_manifest(
+            "ID1002", "Charizard", "Base Set", "Near Mint", "Holofoil"
+        )
+        self.db.insert_manifest(
+            "ID1003", "Blastoise", "Base Set", "NM", "Normal"
+        )
+        self.assertEqual(
+            self.db.get_conditions_in_use(), ["LP", "NM", "Near Mint"]
+        )
+
+
+class GradeVocabularyTests(unittest.TestCase):
+    """
+    Which grades a person may enter by hand.
+
+    Not a new vocabulary and not applied to uploads -- an export's condition
+    is still passed through verbatim. This is the narrower question of
+    whether a value typed into this application can be listed at all, and it
+    is answered by the two tables that already exist rather than by a third.
+    """
+
+    def test_the_offered_codes_all_resolve(self):
+        for value, _label in CONDITION_CHOICES:
+            self.assertTrue(
+                condition_is_mappable(value),
+                f"{value} is offered but cannot be listed",
+            )
+
+    def test_a_longhand_spelling_is_accepted(self):
+        # The test is "can this be listed", not a house style: an older card
+        # catalogued as "Near Mint" must stay saveable.
+        for value in ("Near Mint", "near mint or better", "Excellent",
+                      "Very Good", "Damaged", "  nm  "):
+            self.assertTrue(condition_is_mappable(value), value)
+
+    def test_an_unlistable_grade_is_rejected(self):
+        for value in ("", None, "Sparkly", "PSA 9", "Gem Mint 10"):
+            self.assertFalse(condition_is_mappable(value), repr(value))
+
+    def test_the_bare_damaged_key_is_rejected(self):
+        """
+        "D" is the canonical *multiplier* key, and no descriptor table knows
+        it -- so a card stored as "D" prices correctly and is then skipped at
+        export. "DM" is the spelling that works end to end, and it is the one
+        offered.
+        """
+        self.assertFalse(condition_is_mappable("D"))
+        self.assertTrue(condition_is_mappable("DM"))
+        self.assertIn("DM", [v for v, _ in CONDITION_CHOICES])
+        self.assertNotIn("D", [v for v, _ in CONDITION_CHOICES])
 
 
 class StockTargetTests(unittest.TestCase):

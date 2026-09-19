@@ -1941,9 +1941,41 @@ Three things the dialog will tell you:
 * **Your export still owns the field.** Correct it in SortSwift too, or the
   next upload mentioning the card re-creates it at the old grade.
 
-It is stored exactly as typed. The suggestions in the dialog are suggestions
-only — there is deliberately no translation table, so a vocabulary of our own
-would be a third one that can disagree with both SortSwift's and eBay's.
+**The dialog is a closed list**, so an unlistable grade cannot be entered:
+
+| Code | Sent to eBay as |
+|---|---|
+| `NM` | Near mint or better (`400010`) |
+| `LP` | Excellent (`400015`) |
+| `MP` | Very good (`400016`) |
+| `HP` | Poor (`400017`) |
+| `DM` | Poor (`400017`) |
+
+The mapping to eBay's four-value enum already happened on export and still
+does; `ConditionID` stays `4000` for every ungraded card and the grade travels
+in the condition descriptor. The list is served from the engine rather than
+written into the page, so it cannot drift from the table that does the
+mapping, and the same check is enforced on the endpoint — the dropdown is a
+convenience, not the control.
+
+Two deliberate details:
+
+* **`D` is not offered and is refused.** It is the canonical key in the
+  *pricing multiplier* table, but no descriptor table recognises it, so a card
+  stored as `D` prices correctly and is then skipped at export. `DM` is the
+  spelling that works the whole way.
+* **Spellings your catalogue already uses are offered as well.** A card
+  catalogued from an older export may say `Near Mint` where a newer one says
+  `NM`, and both list perfectly well. Forcing such a card onto a canonical
+  code would change its **identity** — condition is part of the natural key —
+  so the next upload would re-create the original and leave a twin. The card's
+  own current grade is always in the list, whatever it is.
+
+None of this applies to an **upload**, which still passes the export's
+condition through verbatim. The closed set answers the narrower question of
+whether a value typed into this application can be listed at all, and it
+answers it with the two tables that already exist rather than inventing a
+third vocabulary.
 
 > **The drafts page will not do this for you.** Its **Listing** dropdown only
 > offers listings of the card's own grade, and the server refuses a

@@ -3896,6 +3896,30 @@ class Database:
             conn.commit()
         return {"previous": previous, "current": cleaned}
 
+    def get_conditions_in_use(self) -> List[str]:
+        """
+        Every distinct condition spelling this catalogue actually holds.
+
+        Needed because the condition is passed through verbatim from the
+        export, so a catalogue can legitimately hold "NM" and "Near Mint"
+        side by side -- a card catalogued from an older export keeps the
+        spelling that export used. A dialog offering only canonical codes
+        would force such a card onto a new spelling, and since condition is
+        part of a card's identity that makes it a different card: the next
+        upload re-creates the original and leaves a twin.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT DISTINCT condition
+                  FROM manifest
+                 WHERE TRIM(COALESCE(condition, '')) != ''
+                 ORDER BY condition
+                """
+            )
+            return [str(row["condition"]).strip() for row in cursor.fetchall()]
+
     def set_manifest_condition(
         self, manifest_id: str, condition: str
     ) -> Dict[str, Any]:

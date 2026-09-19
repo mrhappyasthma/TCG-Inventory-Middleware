@@ -10,7 +10,7 @@ from .db import (
     SHARED_SCOPE,
     apply_pricing_rules,
     apply_condition_multiplier,
-    
+    normalize_condition_key,
 )
 
 
@@ -232,6 +232,49 @@ CONDITION_TO_EBAY_GRADE = {
     "dmg": "Poor",
     "damaged": "Poor",
 }
+
+
+# The grades offered when a person sets a condition **by hand**.
+#
+# Not a new vocabulary, and not applied to the ingest: an uploaded export's
+# condition is still passed through verbatim, because ours would be a third
+# vocabulary able to disagree with both SortSwift's and eBay's. These are the
+# short codes SortSwift itself exports, each shown with the eBay bucket it
+# resolves to, so what a person picks is the same string an upload would have
+# produced for the same card. Picking a spelling the export does not use would
+# make the hand-corrected card a *different card* from the one the next upload
+# creates -- condition is part of a card's identity.
+#
+# "D" is deliberately absent even though it is the canonical multiplier key:
+# no descriptor table recognises it, so a card stored as "D" is skipped at
+# export. "DM" is the spelling that works end to end.
+CONDITION_CHOICES = (
+    ("NM", "Near mint or better"),
+    ("LP", "Lightly played / Excellent"),
+    ("MP", "Moderately played / Very good"),
+    ("HP", "Heavily played / Poor"),
+    ("DM", "Damaged / Poor"),
+)
+
+
+def condition_is_mappable(condition) -> bool:
+    """
+    Whether a grade can travel the whole way to eBay.
+
+    Both halves have to hold, because they are separate tables and a value in
+    only one of them fails later rather than here: ``CONDITION_TO_EBAY_GRADE``
+    is what becomes the required Condition Descriptor, and
+    ``normalize_condition_key`` is what selects the pricing multiplier. A
+    condition recognised by neither is already skipped with a warning during
+    an upload; this is the same judgement, applied to a value typed in by a
+    person rather than read from a file.
+    """
+    text = str(condition or "").strip().lower()
+    if not text:
+        return False
+    return bool(CONDITION_TO_EBAY_GRADE.get(text)) and bool(
+        normalize_condition_key(text)
+    )
 
 
 def _value_ids_for_category(category_id: str) -> Dict[str, str]:

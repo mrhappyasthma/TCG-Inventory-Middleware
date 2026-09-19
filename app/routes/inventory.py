@@ -33,7 +33,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from tcg_engine.batches import process_batch_csv
+from tcg_engine.batches import (
+    CONDITION_CHOICES,
+    condition_is_mappable,
+    process_batch_csv,
+)
 from tcg_engine.plans import PlanError, build_plan
 from tcg_engine.csvtools import decode_csv_bytes
 
@@ -370,6 +374,43 @@ def set_card_remark(
         "current": result["current"],
     }
 
+@router.get("/api/inventory/conditions")
+def get_condition_choices(user: Dict[str, Any] = Depends(require_active_user)):
+    """
+    The grades a person may choose from, so the dialog is a list and not a
+    free-text box.
+
+    Served rather than hardcoded in the page for two reasons. The list has to
+    match the engine's, and a copy in JavaScript is a copy that drifts. And
+    the second half of it cannot be known in advance: **whatever spellings
+    this account's catalogue already uses** are offered too, because the
+    condition is passed through verbatim from the export and older cards may
+    say "Near Mint" where newer ones say "NM". Forcing such a card onto a
+    canonical code would change its identity -- condition is part of the
+    natural key -- so the next upload would re-create it at the old spelling
+    and leave a twin behind.
+
+    Each option says whether it is one of the canonical codes, so the dialog
+    can show the others as what they are: spellings already in use here.
+    """
+    inv = inventory_for(user)
+    canonical = [
+        {"value": value, "label": label, "canonical": True}
+        for value, label in CONDITION_CHOICES
+    ]
+    known = {value.strip().lower() for value, _ in CONDITION_CHOICES}
+    for existing in inv.get_conditions_in_use():
+        if existing.strip().lower() in known:
+            continue
+        known.add(existing.strip().lower())
+        canonical.append({
+            "value": existing,
+            "label": "already used in your catalogue",
+            "canonical": False,
+        })
+    return {"choices": canonical}
+
+
 @router.post("/api/inventory/{manifest_id}/condition")
 def set_card_condition(
     manifest_id: str,
@@ -393,7 +434,31 @@ def set_card_condition(
     because the live listing still describes the old grade.
     """
     inv = inventory_for(user)
-    result = inv.set_manifest_condition(manifest_id, req.condition)
+
+    # A closed set, enforced here and not only by the dialog's dropdown. A
+    # grade that maps to neither an eBay condition descriptor nor a pricing
+    # multiplier cannot be listed -- an upload carrying one is skipped with a
+    # warning, and typing one here would have put a card into that state from
+    # inside the app. A spelling already in use in this catalogue is allowed
+    # through, because the dropdown offers those and a control must not offer
+    # what the server refuses.
+    wanted = req.condition.strip()
+    if not condition_is_mappable(wanted):
+        in_use = {c.strip().lower() for c in inv.get_conditions_in_use()}
+        if wanted.lower() not in in_use:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{wanted!r} is not a grade this can list. eBay requires a "
+                    f"condition descriptor on a card listing and the pricing "
+                    f"rules need a multiplier, and that value resolves to "
+                    f"neither. Use one of "
+                    f"{', '.join(v for v, _ in CONDITION_CHOICES)}, or a "
+                    f"spelling your export already uses."
+                ),
+            )
+
+    result = inv.set_manifest_condition(manifest_id, wanted)
 
     if result["status"] == "missing":
         raise HTTPException(status_code=404, detail="Card not found.")
@@ -524,6 +589,18 @@ def add_card_manually(
 ):
     """Manually add or update a card in the master catalog."""
     inv = inventory_for(user)
+    # The same closed set as the condition dialog, for the same reason: this
+    # is hand entry, and a grade that maps to no eBay descriptor makes a card
+    # that cannot be listed. An uploaded row gets a warning and is skipped;
+    # one created here would just sit there looking fine.
+    if not condition_is_mappable(req.condition):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{req.condition!r} is not a grade this can list. Use one of "
+                f"{', '.join(v for v, _ in CONDITION_CHOICES)}."
+            ),
+        )
     manifest_id, is_new, card_data = inv.get_or_create_manifest(
         req.product_name, req.set_name, req.condition, req.printing
     )

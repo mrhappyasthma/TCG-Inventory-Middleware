@@ -1570,6 +1570,68 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(again.status_code, 200)
         self.assertFalse(again.json()["changed"])
 
+    def test_39g2_the_grades_offered_are_a_closed_set_the_server_enforces(self):
+        """
+        The dropdown is a convenience; this is the control.
+
+        A grade that resolves to neither an eBay condition descriptor nor a
+        pricing multiplier makes a card that cannot be listed -- an upload
+        carrying one is skipped with a warning, so hand entry must not be the
+        one way into that state.
+        """
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        rows = self.client.get("/api/inventory").json()["items"]
+        manifest_id = rows[0]["manifest_id"]
+
+        offered = self.client.get("/api/inventory/conditions")
+        self.assertEqual(offered.status_code, 200, offered.text)
+        values = [c["value"] for c in offered.json()["choices"]]
+        for code in ("NM", "LP", "MP", "HP", "DM"):
+            self.assertIn(code, values)
+        # Whatever this catalogue already holds is offered too, so the
+        # control never shows something the server would refuse.
+        from app import deps
+
+        for existing in deps.owner_inventory().get_conditions_in_use():
+            self.assertIn(existing, values)
+
+        bad = self.client.post(
+            f"/api/inventory/{manifest_id}/condition",
+            json={"condition": "Sparkly"},
+        )
+        self.assertEqual(bad.status_code, 400, bad.text)
+        self.assertIn("condition descriptor", bad.json()["detail"])
+
+        # "D" is the canonical multiplier key but no descriptor table knows
+        # it, so a card stored as "D" would be skipped at export. DM is the
+        # spelling that works end to end, and the refusal keeps them apart.
+        d_only = self.client.post(
+            f"/api/inventory/{manifest_id}/condition", json={"condition": "D"}
+        )
+        self.assertEqual(d_only.status_code, 400, d_only.text)
+
+        # A long-hand spelling eBay and the rules both understand is fine:
+        # the closed set is "can this be listed", not a house style.
+        longhand = self.client.post(
+            f"/api/inventory/{manifest_id}/condition",
+            json={"condition": "Near Mint"},
+        )
+        self.assertEqual(longhand.status_code, 200, longhand.text)
+
+    def test_39g3_a_card_added_by_hand_gets_the_same_check(self):
+        self.sign_in("google-sub-admin", "admin@example.com", "Admin User")
+        res = self.client.post("/api/inventory/add", json={
+            "product_name": "Bad Grade", "set_name": "Test Set",
+            "condition": "Sparkly", "printing": "Normal",
+        })
+        self.assertEqual(res.status_code, 400, res.text)
+
+        ok = self.client.post("/api/inventory/add", json={
+            "product_name": "Good Grade", "set_name": "Test Set",
+            "condition": "NM", "printing": "Normal",
+        })
+        self.assertEqual(ok.status_code, 200, ok.text)
+
     def test_39h_a_condition_that_would_collide_is_refused_not_merged(self):
         """
         Two cards cannot share one identity, and merging them would have to

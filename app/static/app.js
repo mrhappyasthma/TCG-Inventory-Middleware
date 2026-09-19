@@ -2490,8 +2490,21 @@ async function saveRemark(e) {
 // -------------------------------------------------------------------
 
 let conditionEditManifestId = null;
+// Fetched once and kept. The list changes only when a new spelling enters the
+// catalogue, which is an upload, and the page reloads far more often than
+// that.
+let conditionChoices = null;
 
-function openConditionModal(manifestId) {
+async function loadConditionChoices() {
+    if (conditionChoices) return conditionChoices;
+    const res = await fetch("/api/inventory/conditions");
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to load the grades");
+    conditionChoices = data.choices || [];
+    return conditionChoices;
+}
+
+async function openConditionModal(manifestId) {
     const row = (lastInventoryItems || []).find(i => i.manifest_id === manifestId);
     conditionEditManifestId = manifestId;
 
@@ -2499,13 +2512,31 @@ function openConditionModal(manifestId) {
         ? `[${row.manifest_id}] ${row.product_name}`
           + `${row.card_number ? " #" + row.card_number : ""} - ${row.set_name}`
         : `[${manifestId}]`;
-    const input = requireElement("conditionInput");
-    input.value = row ? (row.condition || "") : "";
+
+    const select = requireElement("conditionInput");
+    const current = row ? String(row.condition || "").trim() : "";
+    let choices;
+    try {
+        choices = await loadConditionChoices();
+    } catch (err) {
+        alert(err.message);
+        return;
+    }
+    // The card's own value is always present, even if it is a spelling no
+    // longer offered: a dropdown that silently reassigns the grade of the
+    // card you opened is worse than one with an odd entry in it.
+    const options = choices.slice();
+    if (current && !options.some(c => c.value === current)) {
+        options.push({ value: current, label: "this card's current grade", canonical: false });
+    }
+    select.innerHTML = options.map(c =>
+        `<option value="${escapeHtml(c.value)}"${c.value === current ? " selected" : ""}>`
+        + `${escapeHtml(c.value)}${c.label ? " — " + escapeHtml(c.label) : ""}</option>`
+    ).join("");
 
     requireElement("conditionModal").classList.remove("hidden");
     syncModalScrollLock();
-    input.focus();
-    input.select();
+    select.focus();
 }
 
 function closeConditionModal() {
