@@ -1662,7 +1662,28 @@ an empty draft is the correct outcome of a dump that changed nothing.
 
 Press **Rebuild draft** after a batch upload, a price refresh or a manual edit.
 The page then shows one block per eBay listing, grouped exactly the way eBay
-will publish it, with one row per card. On each row you can:
+will publish it, with one row per card.
+
+Each block header says which listing it is: **updates #227528268218**, or **a
+new listing** in green if none exists yet. Only the second one publishes
+something, and only that one cannot be undone by pressing the button again.
+
+A card's **Change** badge describes what happens to *the card*, which is not
+the same thing:
+
+| Badge | Means |
+|---|---|
+| **New variation** | The card is added to the existing listing as one more option in its dropdown. |
+| **New listing** | The card's block has no listing yet, so pushing publishes one. |
+| **Update** | Quantity or price changes on a card already live. |
+| **Sold out → 0** | Stock goes to zero; the price is left alone. |
+
+Both new cases are a *create* underneath — the card needs an inventory item,
+an offer and a place in the group either way — but they were both labelled
+"New listing", which read as though retrying five failed cards would publish
+a sixth listing beside the one holding the other 147.
+
+On each row you can:
 
 * adjust the **quantity** or **price**;
 * **move the card into another variation listing**, or give it a single of its

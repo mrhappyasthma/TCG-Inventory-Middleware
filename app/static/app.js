@@ -3642,7 +3642,25 @@ const DRAFT_ACTION_LABELS = {
     end_listing: { label: "End listing", cls: "bg-rose-950/80 text-rose-300 border-rose-800" },
 };
 
-function draftActionBadge(action) {
+// The badge describes what happens to the *card*, and `create_listing` covers
+// two outcomes that look nothing alike to a person reading the page: a card
+// that will be published as its own listing, and a card that will appear as
+// one more variation in a listing that already exists.
+//
+// Both are "create" to the engine -- the card needs an inventory item, an
+// offer and a place in the group either way -- but calling the second one
+// "New listing" is wrong in the direction that matters, since a new listing
+// is the irreversible outcome. It read as though a retry of five failed cards
+// would publish a sixth Ascended Heroes listing beside the one holding the
+// other 147.
+function draftActionBadge(action, group) {
+    if (action === "create_listing") {
+        const joining = group && group.ebay_parent_id
+            && !isSingleGroup(group.group_key);
+        if (joining) {
+            return `<span class="inline-block px-2 py-0.5 rounded-full text-[10px] font-bold border bg-emerald-950/80 text-emerald-400 border-emerald-800" title="A new variation in listing #${escapeHtml(group.ebay_parent_id)}, which already exists. No new listing is created.">New variation</span>`;
+        }
+    }
     const meta = DRAFT_ACTION_LABELS[action]
         || { label: action, cls: "bg-slate-900 text-slate-400 border-slate-800" };
     return `<span class="inline-block px-2 py-0.5 rounded-full text-[10px] font-bold border ${meta.cls}">${escapeHtml(meta.label)}</span>`;
@@ -3816,6 +3834,9 @@ function renderDraftPlan(detail) {
                         <p class="text-[11px] text-slate-500">
                             ${group.item_count} card(s)${group.excluded_count ? `, ${group.excluded_count} left out` : ""}
                             &middot; ${group.proposed_copies} cop${group.proposed_copies === 1 ? "y" : "ies"} proposed
+                            &middot; ${group.ebay_parent_id
+                                ? `<span title="This listing already exists. Its cards are updated and any new ones are added to it as variations.">updates <span class="font-mono">#${escapeHtml(group.ebay_parent_id)}</span></span>`
+                                : `<span class="text-emerald-400/90" title="No listing exists for this set and condition yet. Pushing publishes one, which cannot be undone by pressing the button again.">a new listing</span>`}
                         </p>
                     </div>
                     ${draftCoverControl(group)}
@@ -3835,7 +3856,7 @@ function renderDraftPlan(detail) {
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-slate-800/60 text-slate-300">
-                            ${groupItems.map(i => draftItemRow(i, moveTargets)).join("")}
+                            ${groupItems.map(i => draftItemRow(i, moveTargets, group)).join("")}
                         </tbody>
                     </table>
                 </div>
@@ -3958,7 +3979,7 @@ async function openDraftCoverPrompt(button) {
     }
 }
 
-function draftItemRow(item, moveTargets) {
+function draftItemRow(item, moveTargets, group) {
     const excluded = item.status === "excluded";
     const problems = item.validation ? JSON.parse(item.validation) : [];
     const rowCls = excluded
@@ -4008,7 +4029,7 @@ function draftItemRow(item, moveTargets) {
                 ${problems.length ? `<ul class="mt-1 space-y-0.5">${problems.map(p => `<li class="text-[10px] text-amber-300">⚠ ${escapeHtml(p)}</li>`).join("")}</ul>` : ""}
             </td>
             ${cardThumbnailCell(item, "py-2 px-4")}
-            <td class="py-2.5 px-4">${draftActionBadge(item.action)}</td>
+            <td class="py-2.5 px-4">${draftActionBadge(item.action, group)}</td>
             <td class="py-2.5 px-4 text-center whitespace-nowrap">
                 ${from(item.observed_qty, item.proposed_qty, false)}
                 <input type="number" min="0" value="${item.proposed_qty === null ? "" : item.proposed_qty}"
