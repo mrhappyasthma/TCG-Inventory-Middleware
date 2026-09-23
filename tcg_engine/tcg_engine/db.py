@@ -130,6 +130,30 @@ CONDITION_KEY_ALIASES = {
 }
 
 
+def variation_sort_key(card: Dict[str, Any]):
+    """
+    Order a variation group by card number so the eBay dropdown reads in
+    collector order rather than upload order.
+
+    Card numbers are not plain integers -- "121/198", "TG12/TG30", "SV107" --
+    so the leading integer is used, with any non-numeric prefix as a secondary
+    key. Cards with no usable number sort last, alphabetically, instead of
+    being scattered through the list.
+    """
+    raw = str(card.get("card_number") or "").strip()
+    match = re.search(r"(\d+)", raw)
+    if not match:
+        return (1, "", 0, str(card.get("product_name") or "").lower())
+    prefix = raw[: match.start()].upper()
+    return (0, prefix, int(match.group(1)), str(card.get("product_name") or "").lower())
+
+
+def _abbreviate(text: str, pairs) -> str:
+    for long_form, short_form in pairs:
+        text = text.replace(long_form, short_form)
+    return text
+
+
 def _joined_distinct(concatenated) -> str:
     """
     Tidy SQLite's ``GROUP_CONCAT(DISTINCT x)`` into a readable list.
@@ -3509,7 +3533,25 @@ class Database:
                 """,
                 params,
             )
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+
+        # Card-number order within each listing, which is the order eBay
+        # shows the variation dropdown in -- so the drafts page reads the
+        # way the listing will, rather than in the order the cards happened
+        # to be catalogued.
+        #
+        # Sorted here rather than in the ORDER BY because a card number is
+        # not a number: "10/132" sorts before "2/132" as text and
+        # "TG12/TG30" has no integer to sort on at all. `variation_sort_key`
+        # is the same function the push uses to order `variantSKUs`, so the
+        # page and the listing cannot disagree about it.
+        #
+        # The group stays the primary key so blocks remain contiguous; the
+        # page renders them in order and would interleave otherwise.
+        rows.sort(key=lambda row: (
+            str(row.get("group_key") or ""), variation_sort_key(row)
+        ))
+        return rows
 
     def update_plan_item(self, item_id: int, **fields) -> bool:
         """

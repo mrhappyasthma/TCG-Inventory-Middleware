@@ -12,6 +12,10 @@ from .db import (
     apply_pricing_rules,
     apply_condition_multiplier,
     normalize_condition_key,
+    # Re-exported: it lived here first, and push.py and the tests import it
+    # from this module. It moved to db.py so that db.py can order plan items
+    # by it without importing this module, which imports db.py.
+    variation_sort_key,
 )
 
 
@@ -412,30 +416,6 @@ def build_variation_option_name(
         return _sanitize_variation_value(name)
     rendered = template.replace("{name}", name).replace("{card_number}", number)
     return _sanitize_variation_value(rendered)
-
-
-def variation_sort_key(card: Dict[str, Any]):
-    """
-    Order a variation group by card number so the eBay dropdown reads in
-    collector order rather than upload order.
-
-    Card numbers are not plain integers -- "121/198", "TG12/TG30", "SV107" --
-    so the leading integer is used, with any non-numeric prefix as a secondary
-    key. Cards with no usable number sort last, alphabetically, instead of
-    being scattered through the list.
-    """
-    raw = str(card.get("card_number") or "").strip()
-    match = re.search(r"(\d+)", raw)
-    if not match:
-        return (1, "", 0, str(card.get("product_name") or "").lower())
-    prefix = raw[: match.start()].upper()
-    return (0, prefix, int(match.group(1)), str(card.get("product_name") or "").lower())
-
-
-def _abbreviate(text: str, pairs) -> str:
-    for long_form, short_form in pairs:
-        text = text.replace(long_form, short_form)
-    return text
 
 
 def generate_variation_title(

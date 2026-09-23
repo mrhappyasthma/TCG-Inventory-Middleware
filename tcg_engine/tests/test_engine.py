@@ -2872,6 +2872,65 @@ class StockTargetTests(unittest.TestCase):
         )
 
 
+class PlanItemOrderTests(unittest.TestCase):
+    """
+    A draft lists a listing's cards in the order eBay will show them.
+
+    They were in manifest-id order, which is the order the cards happened
+    to be catalogued in and means nothing to somebody looking for #122.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = Database(db_path=os.path.join(self.tmp, "t.db"))
+        # Deliberately catalogued out of order, so manifest id and card
+        # number disagree and the test can tell which one is being used.
+        for name, number in [
+            ("Dudunsparce", "144"), ("Brambleghast", "14"),
+            ("Heatran", "122"), ("Iron Moth", "27"),
+            ("Galvantula", "TG12/TG30"), ("Mystery Card", ""),
+        ]:
+            self.db.get_or_create_manifest(
+                name, "Terastal Gathering", "NM", "Normal",
+                card_number=number, price=1.99,
+            )
+            self.db.increment_manifest_quantity(
+                self.db.find_manifest(
+                    name, "Terastal Gathering", "NM", "Normal"
+                )["manifest_id"], 1
+            )
+
+    def numbers(self):
+        from tcg_engine.plans import build_plan
+        plan = build_plan(self.db, user_id=SHARED_SCOPE, source="manual")
+        return [
+            str(i.get("card_number") or "")
+            for i in self.db.get_plan_items(plan["plan_id"])
+        ]
+
+    def test_cards_are_ordered_by_card_number_numerically(self):
+        """14 before 27 before 122 before 144 -- not as text."""
+        ordered = self.numbers()
+        self.assertEqual(ordered[:4], ["14", "27", "122", "144"])
+
+    def test_a_prefixed_number_sorts_after_the_plain_ones(self):
+        self.assertEqual(self.numbers()[4], "TG12/TG30")
+
+    def test_a_card_with_no_number_sorts_last(self):
+        """Rather than being scattered through the list."""
+        self.assertEqual(self.numbers()[-1], "")
+
+    def test_it_is_the_same_ordering_the_push_sends(self):
+        """
+        The page and the listing must not disagree about the dropdown
+        order, so both go through variation_sort_key.
+        """
+        from tcg_engine.plans import build_plan
+        plan = build_plan(self.db, user_id=SHARED_SCOPE, source="manual")
+        items = self.db.get_plan_items(plan["plan_id"])
+        self.assertEqual(items, sorted(items, key=variation_sort_key))
+
+
 class ImageOverrideTests(unittest.TestCase):
     """
     A replacement picture this application serves, ahead of the export's.
