@@ -1050,6 +1050,50 @@ we store.
 Image headers only: no Pillow, and never a whole file, so a 6 MB photograph
 costs the same as a thumbnail.
 
+### When there is no bigger picture to be had
+
+Sometimes the upstream catalogue simply does not hold one. SortSwift's
+`pikaqian` images are all 300x419, and every URL variant worth trying —
+`_large`, `@2x`, `_orig`, a `/large/` path — returns 403. At that point the
+choice is between leaving those cards unlistable and enlarging what exists:
+
+```bash
+python scripts/upscale_card_images.py                     # what it would do
+python scripts/upscale_card_images.py --set "Terastal Gathering" --yes
+python scripts/upscale_card_images.py --purge --yes       # undo it
+```
+
+It downloads each offending picture, scales it with Lanczos resampling to
+520 pixels on the longest side, writes it beside the databases, and points
+the card at the local copy through `manifest.image_override` — which sits
+ahead of both of the export's image columns, so a re-upload cannot put the
+small URL back.
+
+**It adds pixels, not detail.** A 300x419 scan becomes 372x520, a 19%
+enlargement, so it stays close to the original — but nothing is recovered
+that was not in the file. That is a fair trade against a listing that can
+never be revised again, and eBay's rule is about dimensions.
+
+Three things to know before running it:
+
+* **`PUBLIC_BASE_URL` must be set** to this deployment's public HTTPS origin,
+  e.g. `https://cards.yourname.synology.me`. eBay fetches the picture from
+  there itself, and behind the DSM reverse proxy the container cannot work
+  out its own public address — the same reason `EBAY_NOTIFICATION_ENDPOINT`
+  is configuration. It must be `https`; eBay will not fetch listing imagery
+  over plain HTTP.
+* **The files are not in either database**, so **Backup does not cover
+  them**. They live in `data/card-images/`, inside the same volume, so they
+  survive a container rebuild — but not a lost volume.
+* **Purging is not free.** A listing already live keeps working, because eBay
+  copies each picture into its own store on first fetch. But the next Refresh
+  or push re-sends every image URL, so `--purge` clears the overrides as well
+  as the files, returning those cards to the undersized pictures eBay refused
+  — which is honest, where a dead link would get the whole listing rejected.
+
+Confirm the result with `scripts/check_images.py --all`, which measures
+whichever image is actually being sent.
+
 ### Which picture a card is shown and listed with
 
 Two columns arrive from the SortSwift export and they are **not**

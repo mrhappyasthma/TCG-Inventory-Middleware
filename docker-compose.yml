@@ -23,6 +23,13 @@ services:
       # Optional: if blank, a random secret is generated and persisted to /data.
       - JWT_SECRET=${JWT_SECRET:-}
       - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      # The public HTTPS origin this deployment is reached on, e.g.
+      # https://cards.yourname.synology.me. Needed only when a card picture
+      # has had to be enlarged and served from here, because eBay fetches
+      # that URL itself -- and behind the reverse proxy the container cannot
+      # work out its own public address. Same reasoning as
+      # EBAY_NOTIFICATION_ENDPOINT below.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       # eBay integration. All optional: with these blank the app is the CSV
       # tool it has always been and every eBay control is absent. They must be
       # listed here or a value in .env never reaches the container.

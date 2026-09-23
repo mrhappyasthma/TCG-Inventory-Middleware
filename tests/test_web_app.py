@@ -3485,5 +3485,63 @@ class TestWebApp(unittest.TestCase):
         )
 
 
+class CardImageRouteTests(unittest.TestCase):
+    """
+    The public route eBay fetches a replacement card picture from.
+
+    Unauthenticated on purpose -- eBay has no session with us, and a
+    sign-in redirect is indistinguishable to it from a broken image, which
+    gets the listing refused. So the thing to pin is that it stays open to
+    anonymous callers *and* that it cannot be talked into serving anything
+    but a card picture out of the data volume, which is also where the
+    databases live.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+        cls.tmp = tempfile.mkdtemp()
+        os.makedirs(cls.tmp, exist_ok=True)
+        with open(os.path.join(cls.tmp, "ID1001.jpg"), "wb") as handle:
+            handle.write(b"\xff\xd8\xff\xe0not-really-a-jpeg")
+        with open(os.path.join(cls.tmp, "secrets.db"), "wb") as handle:
+            handle.write(b"sqlite")
+
+    def get(self, name):
+        with mock.patch(
+            "app.routes.inventory.CARD_IMAGE_DIR", self.tmp
+        ):
+            return self.client.get(f"/card-images/{name}")
+
+    def test_an_anonymous_caller_is_served(self):
+        response = self.get("ID1001.jpg")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+
+    def test_a_missing_image_is_a_404(self):
+        self.assertEqual(self.get("ID9999.jpg").status_code, 404)
+
+    def test_it_will_not_walk_out_of_the_image_directory(self):
+        for attempt in (
+            "../inventory.db", "..%2Finventory.db", "....//inventory.db",
+            "%2e%2e%2finventory.db",
+        ):
+            self.assertEqual(
+                self.get(attempt).status_code, 404,
+                f"{attempt} must not resolve outside the image directory",
+            )
+
+    def test_it_serves_only_picture_extensions(self):
+        """
+        The databases sit in the same volume, so an endpoint that served
+        any extension would be a reader for them.
+        """
+        self.assertEqual(self.get("secrets.db").status_code, 404)
+
+    def test_a_dotfile_is_refused(self):
+        """`.session_secret` lives beside the databases."""
+        self.assertEqual(self.get(".session_secret").status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()

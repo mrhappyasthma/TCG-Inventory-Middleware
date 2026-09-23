@@ -2872,6 +2872,76 @@ class StockTargetTests(unittest.TestCase):
         )
 
 
+class ImageOverrideTests(unittest.TestCase):
+    """
+    A replacement picture this application serves, ahead of the export's.
+
+    It exists because eBay's 500-pixel minimum is re-checked on every
+    change to a listing, so one small photo blocks price and quantity
+    updates too -- and when the upstream CDN has no larger copy, enlarging
+    and hosting it is the only remedy left.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = Database(db_path=os.path.join(self.tmp, "t.db"))
+        self.db.get_or_create_manifest(
+            "Applin - 1902", "Gem Pack Volume 6", "NM", "Normal",
+            cdn_image="https://cdn/small.jpg",
+            stock_image="https://cdn/stock.jpg",
+        )
+
+    def image_url(self):
+        rows = {r["manifest_id"]: r for r in self.db.get_cards_for_planning()}
+        return rows["ID1001"]["image_url"]
+
+    def test_without_an_override_the_export_image_is_used(self):
+        self.assertEqual(self.image_url(), "https://cdn/small.jpg")
+
+    def test_an_override_beats_both_export_columns(self):
+        self.db.set_manifest_image_override("ID1001", "https://us/ID1001.jpg")
+        self.assertEqual(self.image_url(), "https://us/ID1001.jpg")
+
+    def test_clearing_an_override_returns_the_export_image(self):
+        """
+        Worth pinning because it is the cost of a purge: the card goes back
+        to the picture eBay refused, not to nothing.
+        """
+        self.db.set_manifest_image_override("ID1001", "https://us/ID1001.jpg")
+        self.db.set_manifest_image_override("ID1001", "")
+        self.assertEqual(self.image_url(), "https://cdn/small.jpg")
+
+    def test_an_upload_does_not_disturb_an_override(self):
+        """
+        The export keeps supplying the small URL, so a re-upload must not
+        put it back -- which is the whole reason this is its own column
+        rather than an overwrite of cdn_image.
+        """
+        self.db.set_manifest_image_override("ID1001", "https://us/ID1001.jpg")
+        self.db.get_or_create_manifest(
+            "Applin - 1902", "Gem Pack Volume 6", "NM", "Normal",
+            cdn_image="https://cdn/small.jpg",
+        )
+        self.assertEqual(self.image_url(), "https://us/ID1001.jpg")
+
+    def test_the_push_sends_the_override(self):
+        from tcg_engine.push import card_image
+        self.db.set_manifest_image_override("ID1001", "https://us/ID1001.jpg")
+        rows = {r["manifest_id"]: r for r in self.db.get_cards_for_planning()}
+        self.assertEqual(card_image(rows["ID1001"]), "https://us/ID1001.jpg")
+
+    def test_overrides_are_listed_and_cleared_in_bulk(self):
+        self.db.set_manifest_image_override("ID1001", "https://us/ID1001.jpg")
+        self.assertEqual(len(self.db.get_image_overrides()), 1)
+        self.assertEqual(self.db.clear_image_overrides(), 1)
+        self.assertEqual(self.db.get_image_overrides(), [])
+
+    def test_an_unknown_card_is_reported_rather_than_created(self):
+        self.assertFalse(
+            self.db.set_manifest_image_override("ID9999", "https://us/x.jpg")
+        )
+
+
 class PerLanguageTitleTests(unittest.TestCase):
     """
     Titles rendered per language, with the set code and year of the group.

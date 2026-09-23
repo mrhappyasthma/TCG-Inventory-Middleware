@@ -19,6 +19,7 @@ stock target that drives the restock filter.
 
 import csv
 import io
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -29,7 +30,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -43,6 +44,7 @@ from tcg_engine.csvtools import decode_csv_bytes
 
 try:
     from app.deps import (
+        CARD_IMAGE_DIR,
         MAX_UPLOAD_BYTES,
         inventory_for,
         read_upload_limited,
@@ -52,6 +54,7 @@ try:
     )
 except ImportError:
     from .deps import (
+        CARD_IMAGE_DIR,
         MAX_UPLOAD_BYTES,
         inventory_for,
         read_upload_limited,
@@ -64,6 +67,16 @@ except ImportError:
 # field for prose: an unbounded string here would reach the inventory table
 # and the packing-slip column and wreck both.
 REMARK_MAX_LENGTH = 60
+
+# What the public card-image route will serve, and as what. A closed map
+# rather than a guess from the extension: this endpoint is unauthenticated,
+# so it answers only for the formats eBay accepts and nothing else.
+CARD_IMAGE_EXTENSIONS = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 def _csv_safe(value: Any) -> Any:
     """
@@ -624,6 +637,50 @@ def delete_card_endpoint(
     if not success:
         raise HTTPException(status_code=404, detail="Card not found.")
     return {"success": True, "manifest_id": manifest_id}
+
+@router.get("/card-images/{filename}")
+def serve_card_image(filename: str):
+    """
+    Serve a replacement card picture. **Deliberately unauthenticated.**
+
+    eBay fetches an image by URL with no session and no credentials of ours,
+    so this cannot sit behind ``require_active_user`` -- a login redirect is
+    indistinguishable to eBay from a broken picture, and the listing is
+    refused. Everything here is a photograph of a trading card that is about
+    to be published on a public eBay listing anyway, so there is nothing
+    disclosed that the listing would not disclose.
+
+    Two things it must not become. It serves **only** from the card-image
+    directory, resolved and compared after ``realpath`` so that a crafted
+    name cannot walk out of it, and it serves only the extensions eBay
+    accepts -- this is a picture endpoint, not a file server for the data
+    volume, which is where the databases live.
+
+    The path is deliberately short and outside ``/api``: it ends up embedded
+    in eBay's own records, and a tidier URL is one less thing to regret.
+    """
+    safe = os.path.basename(str(filename or ""))
+    if not safe or safe.startswith("."):
+        raise HTTPException(status_code=404, detail="No such image.")
+    if os.path.splitext(safe)[1].lower() not in CARD_IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=404, detail="No such image.")
+
+    directory = os.path.realpath(CARD_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(directory, safe))
+    # Compared against the directory plus a separator, so a sibling folder
+    # whose name merely starts with the same characters cannot match.
+    if not path.startswith(directory + os.sep) or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="No such image.")
+
+    return FileResponse(
+        path,
+        media_type=CARD_IMAGE_EXTENSIONS[os.path.splitext(safe)[1].lower()],
+        # eBay copies the picture into its own store when it first fetches
+        # it, so this is read a handful of times per image. Cached all the
+        # same: a Refresh re-sends every URL on the listing at once.
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
 
 @router.get("/api/export/manifest")
 def export_manifest_endpoint(

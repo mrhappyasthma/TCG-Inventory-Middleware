@@ -13,5 +13,12 @@ google-auth[requests]>=2.35.0
 # transitively, but the eBay client depends on it directly and a transitive
 # dependency is not a promise, so it is named here.
 cryptography>=41.0.0
+# Enlarging a card picture eBay would refuse for being under its
+# 500-pixel minimum, in scripts/upscale_card_images.py. Note that
+# scripts/check_images.py deliberately does NOT use this: it measures an
+# image from its header bytes alone, so checking the whole catalogue costs
+# a few kilobytes per picture rather than downloading every one of them.
+# Only the repair needs to decode and re-encode.
+Pillow>=10.0.0
 -e ./tcg_engine
 -e ./ebay_client

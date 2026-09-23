@@ -242,8 +242,20 @@ def apply_pricing_rules(
 #
 # Spelled once and interpolated, so display and the push cannot disagree
 # about which image a card has.
+# `image_override` comes first, and is the only one of the three this
+# application writes rather than reads off an export.
+#
+# It exists because eBay requires 500 pixels on an image's longest side and
+# re-validates every picture on a listing whenever anything about that
+# listing changes -- so one undersized photo blocks all future price and
+# quantity updates too. When the export's own image is too small and no
+# better one exists upstream, the remedy is to enlarge it and serve it
+# ourselves, and that replacement has to survive a re-upload: the export
+# keeps supplying the small URL, and without a column of our own the next
+# batch would quietly put it back.
 CARD_IMAGE_SQL = """
                 COALESCE(
+                    NULLIF(TRIM(COALESCE(m.image_override, '')), ''),
                     NULLIF(TRIM(COALESCE(m.cdn_image, '')), ''),
                     NULLIF(TRIM(COALESCE(m.stock_image, '')), ''),
                     ''
@@ -705,6 +717,25 @@ class Database:
             if "ebay_fields_json" not in manifest_columns:
                 cursor.execute(
                     "ALTER TABLE manifest ADD COLUMN ebay_fields_json TEXT"
+                )
+
+            # A replacement picture this application serves itself, which
+            # wins over both of the export's image columns.
+            #
+            # Needed because eBay's 500-pixel minimum is enforced against
+            # every picture on a listing on *every* change, so one small
+            # photo blocks price and quantity updates as well. When the
+            # export's image is too small and the upstream CDN has no bigger
+            # copy, the only remedy left is to enlarge it and host it.
+            #
+            # A column of our own rather than overwriting cdn_image: the
+            # export owns that one and a later batch would put the small URL
+            # straight back, silently, which is the whole failure this is
+            # meant to end. Written only by scripts/upscale_card_images.py
+            # and cleared by its --purge.
+            if "image_override" not in manifest_columns:
+                cursor.execute(
+                    "ALTER TABLE manifest ADD COLUMN image_override TEXT"
                 )
 
             # Create indexes for fast lookups
@@ -4109,6 +4140,63 @@ class Database:
             "status": "ok", "previous": previous, "current": wanted,
             "changed": True, "was_live": was_live,
         }
+
+    def set_manifest_image_override(
+        self, manifest_id: str, image_url: str
+    ) -> bool:
+        """
+        Point a card at a replacement picture we serve ourselves.
+
+        Beats both of the export's image columns. Passing an empty URL
+        clears it, which hands the card back to whatever the export
+        supplied -- so clearing an override for a card whose export image
+        is undersized returns it to the state that blocks revisions.
+        """
+        url = str(image_url or "").strip()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE manifest SET image_override = ? WHERE manifest_id = ?",
+                (url or None, str(manifest_id).strip()),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_image_overrides(self) -> List[Dict[str, Any]]:
+        """Every card currently pointed at a replacement picture."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT manifest_id, product_name, set_name, condition,
+                       printing, card_number, image_override,
+                       cdn_image, stock_image
+                  FROM manifest
+                 WHERE TRIM(COALESCE(image_override, '')) != ''
+                 ORDER BY set_name, manifest_id
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def clear_image_overrides(self) -> int:
+        """
+        Drop every replacement picture, returning how many were cleared.
+
+        The cards fall back to their export images, which for the cards
+        this feature exists for means falling back to a picture eBay will
+        refuse on the next revision. Deliberately not done implicitly
+        anywhere.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE manifest SET image_override = NULL
+                 WHERE TRIM(COALESCE(image_override, '')) != ''
+                """
+            )
+            conn.commit()
+            return cursor.rowcount
 
     def set_manifest_ebay_fields(
         self, manifest_id: str, fields: Optional[Dict[str, Any]]

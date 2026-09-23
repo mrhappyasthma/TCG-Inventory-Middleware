@@ -236,6 +236,28 @@ class _UserDbTokenStore(TokenStore):
 DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
 USER_DATABASE_URL = os.environ.get("USER_DATABASE_URL", "data/users.db")
 
+# Replacement card pictures this deployment serves to eBay itself.
+#
+# Beside the databases, so they are inside the same bind mount and survive a
+# container rebuild. They are *not* inside either .db, so the backup and
+# restore in the Database dialog do not cover them -- which matters, because
+# a card whose image_override points at a file that is gone sends eBay a
+# dead URL, and eBay refuses the whole listing on the next revision rather
+# than just that picture.
+CARD_IMAGE_DIR = os.environ.get(
+    "CARD_IMAGE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(DATABASE_URL)), "card-images"),
+)
+
+# The public origin eBay should fetch those pictures from.
+#
+# Configuration rather than anything read off a request, for exactly the
+# reason EBAY_NOTIFICATION_ENDPOINT is: behind the DSM reverse proxy the URL
+# this process sees is not the URL the outside world uses, so a URL built
+# from a request would be unreachable from eBay and the failure would arrive
+# much later, as a refused listing.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
 # Where the dashboard's assets live. Needed by `main` to mount /static
 # and by the route that serves index.html, so it has one definition
 # here rather than one each.
