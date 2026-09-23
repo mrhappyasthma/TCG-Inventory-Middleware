@@ -20,6 +20,14 @@ What it fixes, and why each is worth a pass over the file:
   "Volume"; the title renderer abbreviates back to "Vol" by itself if a
   particular title will not fit in eBay's 80 characters.
 
+* **The language aspect says Czech.** SortSwift exports these cards with
+  ``Language`` = ``CS`` -- Chinese Simplified -- and then spells that out in
+  ``*C:Language`` as ``Czech``. That column becomes a live eBay item
+  specific, so every card would be listed as being in Czech. Only the
+  aspect is corrected; the plain ``Language`` code stays ``CS``, because it
+  selects the listing title template and ``CS`` is the code Listing Rules
+  holds the Chinese format under.
+
 **It deliberately leaves the card name alone**, and that is worth stating
 because the obvious "improvement" is destructive. Every row spells
 ``*C:Card Name`` as ``"Applin - 1902"`` while ``Product Name (No Card
@@ -50,6 +58,7 @@ catalogue, and nothing in the dashboard should be able to rewrite an export.
 """
 
 import argparse
+import collections
 import csv
 import os
 import sys
@@ -78,12 +87,31 @@ SET_COLUMN = "*C:Set"
 SET_CODE_COLUMN = "Set Code"
 CARD_NAME_COLUMN = "*C:Card Name"
 
+# The eBay-facing language aspect, and the wrong value to replace.
+#
+# SortSwift exports these cards with `Language` = "CS" -- Chinese Simplified
+# -- and then renders that into `*C:Language` as **"Czech"**. The plain code
+# is right and the expansion is wrong, so the mistake is in whatever maps one
+# to the other at their end. Left alone it ships as a live eBay item specific
+# reading "Language: Czech" on every Chinese card.
+#
+# Corrected here, in the file, rather than by a lookup table inside the
+# application. That distinction is the point: this project passes source
+# values through verbatim precisely so it never holds a third vocabulary that
+# can disagree with SortSwift's and eBay's, and a mapping in the ingest would
+# be exactly that. A correction applied to the export keeps the app honest
+# and leaves one obvious place to delete once SortSwift is fixed.
+LANGUAGE_ASPECT_COLUMN = "*C:Language"
+LANGUAGE_CODE_COLUMN = "Language"
+WRONG_LANGUAGE = "Czech"
+RIGHT_LANGUAGE = "Chinese"
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Correct set names and set codes in a Chinese SortSwift export "
-            "before importing it."
+            "Correct the set names, set codes and language aspect in a "
+            "Chinese SortSwift export before importing it."
         ),
     )
     parser.add_argument("source", help="The export to read")
@@ -121,8 +149,23 @@ def main(argv=None):
 
     set_changes = {}
     unknown_sets = {}
+    language_fixed = 0
+    language_other = collections.Counter()
 
     for row in rows:
+        # The eBay aspect only. The plain `Language` column is deliberately
+        # left as "CS", because that value becomes `manifest.language` and
+        # is what selects the listing title template -- and `CS` is the key
+        # Listing Rules has a Chinese template under. Rewriting it to
+        # "Chinese" would look tidier and would silently drop every one of
+        # these listings back onto the English title format.
+        current = str(row.get(LANGUAGE_ASPECT_COLUMN) or "").strip()
+        if current == WRONG_LANGUAGE:
+            row[LANGUAGE_ASPECT_COLUMN] = RIGHT_LANGUAGE
+            language_fixed += 1
+        elif current and current != RIGHT_LANGUAGE:
+            language_other[current] += 1
+
         original_set = str(row.get(SET_COLUMN) or "").strip()
         correction = SET_CORRECTIONS.get(original_set)
         if correction:
@@ -150,6 +193,41 @@ def main(argv=None):
             )
     else:
         print("   none -- no row named a set this knows how to correct")
+
+    print(
+        f"\nLanguage aspect ({LANGUAGE_ASPECT_COLUMN}): "
+        f"{language_fixed} row(s) {WRONG_LANGUAGE!r} -> {RIGHT_LANGUAGE!r}"
+    )
+    if language_fixed:
+        print(
+            "   SortSwift is exporting Chinese Simplified cards with the\n"
+            "   language code 'CS' and then spelling that out as 'Czech'.\n"
+            "   Left uncorrected it reaches eBay as a live item specific\n"
+            "   reading 'Language: Czech' on every card. Fix it in SortSwift:\n"
+            "   this rewrite is a stopgap that has to be re-run on every\n"
+            "   export until then.\n"
+            f"   Check that eBay accepts {RIGHT_LANGUAGE!r} for your category\n"
+            "   before pushing -- like the Game aspect, eBay only takes\n"
+            "   values from its own list, and the surest way to find the\n"
+            "   exact spelling is to read it off a live listing of the same\n"
+            "   kind."
+        )
+    if language_other:
+        print(
+            "   Rows left alone because they say something else: "
+            + ", ".join(f"{v!r} x{n}" for v, n in sorted(language_other.items()))
+        )
+    # The plain code column is load-bearing and untouched; say so, because
+    # "why is this still CS" is the obvious next question.
+    codes = collections.Counter(
+        str(row.get(LANGUAGE_CODE_COLUMN) or "").strip() for row in rows
+    )
+    print(
+        f"   The plain {LANGUAGE_CODE_COLUMN!r} column is unchanged "
+        f"({', '.join(f'{v!r} x{n}' for v, n in sorted(codes.items()))}). "
+        f"It selects the title template, and Listing Rules holds the "
+        f"Chinese format under that code."
+    )
 
     if unknown_sets:
         # Named rather than silently passed through: a set this does not know
