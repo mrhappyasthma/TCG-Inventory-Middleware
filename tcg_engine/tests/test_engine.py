@@ -2872,5 +2872,203 @@ class StockTargetTests(unittest.TestCase):
         )
 
 
+class PerLanguageTitleTests(unittest.TestCase):
+    """
+    Titles rendered per language, with the set code and year of the group.
+
+    One template per account stopped being enough when a second language
+    arrived: a Chinese listing states its set code, language and year,
+    while an English one states none of them, and a single template cannot
+    produce both.
+    """
+
+    def setUp(self):
+        from tcg_engine.db import (
+            DEFAULT_CHINESE_TITLE_TEMPLATE,
+            DEFAULT_VARIATION_TITLE_TEMPLATE,
+        )
+        self.chinese = DEFAULT_CHINESE_TITLE_TEMPLATE
+        self.english = DEFAULT_VARIATION_TITLE_TEMPLATE
+        self.settings = {
+            "variation_title_template": self.english,
+            "variation_title_template_CS": self.chinese,
+            "variation_title_template_JA": "",
+        }
+
+    def _card(self, **overrides):
+        card = {
+            "set_code": "CBB6C",
+            "language": "CS",
+            "ebay_fields_json":
+                '{"item_specifics": {"C:Year Manufactured": "2026"}}',
+        }
+        card.update(overrides)
+        return card
+
+    def test_the_language_selects_the_template(self):
+        from tcg_engine.batches import title_template_for
+        self.assertEqual(title_template_for(self.settings, "CS"), self.chinese)
+        self.assertEqual(title_template_for(self.settings, "EN"), self.english)
+
+    def test_the_language_code_is_matched_case_insensitively(self):
+        from tcg_engine.batches import title_template_for
+        self.assertEqual(title_template_for(self.settings, "cs"), self.chinese)
+
+    def test_a_blank_language_template_falls_back_to_the_default(self):
+        """
+        An empty Japanese slot exists to be visible and editable before
+        there is any Japanese stock. It must behave as "not set".
+        """
+        from tcg_engine.batches import title_template_for
+        self.assertEqual(title_template_for(self.settings, "JA"), self.english)
+
+    def test_an_unknown_language_falls_back_rather_than_failing(self):
+        from tcg_engine.batches import title_template_for
+        self.assertEqual(title_template_for(self.settings, "ZZ"), self.english)
+        self.assertEqual(title_template_for(self.settings, ""), self.english)
+
+    def test_the_set_code_and_year_reach_the_title(self):
+        from tcg_engine.batches import generate_variation_title
+        title = generate_variation_title(
+            "Gem Pack Volume 6", condition="NM", template=self.chinese,
+            set_code="CBB6C", year="2026",
+        )
+        self.assertEqual(
+            title,
+            "Pokemon Gem Pack Volume 6 CBB6C Chinese 2026 "
+            "Singles & Holos - CHOOSE YOUR CARD!",
+        )
+        self.assertLessEqual(len(title), 80)
+
+    def test_a_group_whose_cards_disagree_states_neither_value(self):
+        """
+        A title describes the whole listing. Printing one member's set code
+        as the group's is the mistake get_plan_groups had to stop making
+        with MIN(), where a mixed block was headed with one card's grade.
+        """
+        from tcg_engine.batches import group_title_fields, group_language
+        # Each field is judged on its own, so a group can legitimately
+        # agree on the year while disagreeing about the set code.
+        mixed_code = [self._card(), self._card(set_code="CSV9C")]
+        self.assertEqual(
+            group_title_fields(mixed_code), {"set_code": "", "year": "2026"}
+        )
+
+        mixed_year = [
+            self._card(),
+            self._card(
+                ebay_fields_json=
+                '{"item_specifics": {"C:Year Manufactured": "2025"}}'
+            ),
+        ]
+        self.assertEqual(
+            group_title_fields(mixed_year), {"set_code": "CBB6C", "year": ""}
+        )
+
+        self.assertEqual(
+            group_language([self._card(), self._card(language="EN")]), ""
+        )
+
+    def test_a_uniform_group_reports_its_values(self):
+        from tcg_engine.batches import group_title_fields, group_language
+        cards = [self._card(), self._card()]
+        self.assertEqual(
+            group_title_fields(cards), {"set_code": "CBB6C", "year": "2026"}
+        )
+        self.assertEqual(group_language(cards), "CS")
+
+    def test_an_unresolved_placeholder_leaves_no_double_space(self):
+        """
+        An English card has no year, so a template naming {year} would
+        otherwise ship a listing title with a gap in it.
+        """
+        from tcg_engine.batches import generate_variation_title
+        title = generate_variation_title(
+            "Chilling Reign", condition="NM", template=self.chinese,
+            set_code="", year="",
+        )
+        self.assertNotIn("  ", title)
+        self.assertEqual(
+            title, "Pokemon Chilling Reign Chinese Singles & Holos - CHOOSE YOUR CARD!"
+        )
+
+    def test_volume_is_kept_when_it_fits(self):
+        """
+        The abbreviation is a fallback, not a default. "Gem Pack Volume 6"
+        fits at exactly 80 with a five-character code, so it stays.
+        """
+        from tcg_engine.batches import render_variation_title
+        title, trimmed = render_variation_title(
+            "Gem Pack Volume 6", condition="NM", template=self.chinese,
+            set_code="CBB6C", year="2026",
+        )
+        self.assertIn("Volume", title)
+        self.assertFalse(trimmed)
+
+    def test_volume_is_abbreviated_only_when_it_has_to_be(self):
+        """
+        A six-character code tips the same title to 81, and "Vol" is a
+        better answer than the mid-word chop the last resort would make.
+        """
+        from tcg_engine.batches import render_variation_title
+        title, trimmed = render_variation_title(
+            "Gem Pack Volume 6", condition="NM", template=self.chinese,
+            set_code="CBB06C", year="2026",
+        )
+        self.assertIn("Gem Pack Vol 6", title)
+        self.assertNotIn("Volume", title)
+        self.assertLessEqual(len(title), 80)
+        self.assertFalse(trimmed)
+
+    def test_singles_and_holos_collapses_before_the_set_name_is_cut(self):
+        """
+        Template text is ours and says nothing false about a card, so it is
+        given up before the set name is.
+        """
+        from tcg_engine.batches import render_variation_title
+        title, trimmed = render_variation_title(
+            "Chasing Glory Together", condition="NM", template=self.chinese,
+            set_code="CSV10C", year="2026",
+        )
+        self.assertEqual(
+            title,
+            "Pokemon Chasing Glory Together CSV10C Chinese 2026 Holos "
+            "- CHOOSE YOUR CARD!",
+        )
+        self.assertIn("Chasing Glory Together", title)
+        self.assertFalse(trimmed)
+
+    def test_a_title_that_cannot_fit_reports_that_it_was_trimmed(self):
+        """
+        `trimmed` is what lets the drafts page flag a clipped set name
+        without blocking every template the abbreviations resolve.
+        """
+        from tcg_engine.batches import render_variation_title
+        title, trimmed = render_variation_title(
+            "A Set Name So Long That Nothing Short Of Cutting It Will Ever "
+            "Make This Title Fit",
+            condition="NM", template=self.chinese,
+            set_code="CSV10C", year="2026",
+        )
+        self.assertEqual(len(title), 80)
+        self.assertTrue(trimmed)
+
+    def test_the_english_default_is_untouched_by_any_of_this(self):
+        """
+        The per-language work must not restyle a listing that never asked
+        for it: an English group with no template of its own renders
+        exactly as it always did.
+        """
+        from tcg_engine.batches import generate_variation_title, title_template_for
+        title = generate_variation_title(
+            "SWSH06: Chilling Reign", condition="NM",
+            template=title_template_for(self.settings, "EN"),
+        )
+        self.assertEqual(
+            title,
+            "SWSH06: Chilling Reign: Pick Your Card - NM - Complete Your Set",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

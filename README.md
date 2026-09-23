@@ -606,8 +606,86 @@ Configure how the middleware splits and titles listings via the **"Listing Rules
 * **Single Listing Value Threshold** (`single_threshold`, default `$5.00`): cards whose effective calculated price is **equal to or above** the threshold are split out as **standalone Single listings**. This only applies while set grouping is on.
 * **Smart 80-Character Title Formatting**:
   * Default Title: `{set_name}: Pick Your Card - {condition} - Complete Your Set`
+  * Placeholders: `{set_name}`, `{condition}`, `{set_code}` and `{year}`.
   * `{condition}` is substituted **verbatim** from your export, so the title always matches the cards it describes.
-  * **Automatic Fallback**: if the title exceeds eBay's 80-character limit, the **set name** is trimmed. The condition is never abbreviated or altered, because the title makes a factual claim about the cards.
+  * `{set_code}` and `{year}` are filled in only when **every card on the listing agrees** on them, and vanish cleanly when they do not — a title describes the whole listing, so a value its members disagree about has no business being stated as fact.
+  * **Automatic Fallback**: if the title exceeds eBay's 80-character limit it is shortened in three steps, cheapest first — the set name's own abbreviations (`Volume` → `Vol`), then the template's (`Near Mint` → `NM`, `Singles & Holos` → `Holos`), and only then the set name is trimmed by the overflow. The condition is never abbreviated or altered, because the title makes a factual claim about the cards. A title that still had to be cut short blocks approval on the drafts page and names itself.
+
+#### A title template per language
+
+One template per account was enough while the store was English-only. A
+second language broke that: a Chinese listing wants its set code, its
+language and its year in the title, because that is what a buyer searches on
+and "Gem Pack Volume 6" alone does not say which print run it is. An English
+listing wants none of them.
+
+So **Listing Rules holds one template per language**, under the main one:
+
+| Template | Applies to |
+|---|---|
+| Variation Listing Title Template | Every listing with no language template of its own — your English listings |
+| Chinese `(CS)` / `(ZH)` | Listings whose cards are all in that language |
+| Japanese `(JA)` | Nothing yet — seeded empty, ready to fill in |
+
+An **empty** box means "use the main template", which is why the Japanese
+slot can sit there doing nothing until there is Japanese stock. The language
+is whatever your export puts in its `Language` column, matched
+case-insensitively and not translated — so if SortSwift starts spelling a
+language differently, those listings fall back to the main template rather
+than silently rendering the wrong one. That is visible on the drafts page
+before anything is pushed.
+
+Two codes are seeded for Chinese because SortSwift currently exports these
+cards as `CS`; if that is corrected to `ZH`, the listings keep their format.
+
+Shipped Chinese format, and what it renders:
+
+```
+Pokemon {set_name} {set_code} Chinese {year} Singles & Holos - CHOOSE YOUR CARD!
+
+Pokemon Gem Pack Volume 6 CBB6C Chinese 2026 Singles & Holos - CHOOSE YOUR CARD!   80
+Pokemon Chasing Glory Together CSV10C Chinese 2026 Holos - CHOOSE YOUR CARD!       76
+```
+
+The second one lost "Singles & " to the fallback rather than having its set
+name cut — which is the ladder working as intended.
+
+#### Renaming listings that are already up
+
+Changing a template changes what a *future* write sends. It does nothing to
+listings already live, because a title lives on the inventory item group at
+eBay and nothing re-sends that group on its own. `scripts/retitle_listings.py`
+closes that gap:
+
+```bash
+python scripts/retitle_listings.py                      # what would change
+python scripts/retitle_listings.py --language CS        # narrowed to one language
+python scripts/retitle_listings.py --listing 227521446958 --yes
+```
+
+On the NAS, where the databases and the eBay connection live:
+
+```bash
+cd /volume1/docker/tcg-middleware
+docker compose exec tcg-middleware python scripts/retitle_listings.py --yes
+```
+
+It re-sends each listing through the same **Refresh** path the eBay Listings
+tab uses, rather than writing the group itself. That is deliberate: writing a
+group is a full replace, and a second implementation of "send every SKU, the
+right cover and the right aspects" is a second place for those rules to
+drift — and that failure is silent, discovered by counting a dropdown by
+hand. Consequences worth knowing:
+
+* It **cannot move stock or money** — quantity is re-sent as what eBay is
+  known to hold, and no price is sent.
+* It re-sends pictures and specifics too, so a listing carrying an image
+  under eBay's 500-pixel minimum will be refused. Run
+  `scripts/check_images.py --all` first if that is possible.
+* **Singles are skipped and reported.** A single's title is built from the
+  card, not from the variation template.
+* It reads each listing's current title back from eBay for the preview, and
+  reports one it could not read as unknown rather than as unchanged.
 * **Dropdown option labels** (`variation_option_template`, default
   `{name} ({card_number})`): each card appears as e.g. `Crushing Gloves (133/198)`.
   The number keeps reprints distinguishable, and options are **always sorted by

@@ -38,6 +38,11 @@ class TitlePreviewRequest(BaseModel):
     set_name: str
     condition: str = ""
     template: Optional[str] = "{set_name}: Pick Your Card - {condition} - Complete Your Set"
+    # Optional so the existing caller keeps working. A template naming
+    # {set_code} or {year} without them previews with those words absent,
+    # which is exactly what a listing whose cards disagree on them gets.
+    set_code: str = ""
+    year: str = ""
 
 @router.get("/api/listing-settings")
 def get_listing_settings_endpoint(user: Dict[str, Any] = Depends(require_active_user)):
@@ -120,6 +125,8 @@ def preview_title_endpoint(
         set_name=req.set_name,
         condition=req.condition,
         template=req.template or DEFAULT_VARIATION_TITLE_TEMPLATE,
+        set_code=req.set_code,
+        year=req.year,
     )
     return {
         "set_name": req.set_name,

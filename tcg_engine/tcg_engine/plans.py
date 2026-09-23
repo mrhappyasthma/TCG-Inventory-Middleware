@@ -26,6 +26,12 @@ has walked away. Catching that on the drafts page is the page's real job.
 import json
 from typing import Any, Dict, Iterable, List, Optional
 
+from .batches import (
+    group_language,
+    group_title_fields,
+    render_variation_title,
+    title_template_for,
+)
 from .db import SHARED_SCOPE, Database
 
 # What a plan item asks for. Quantity and price travel together rather than as
@@ -321,27 +327,47 @@ def validate_card(
 
 
 def validate_group_title(
-    group_key: str, set_name: str, condition: str, settings: Dict[str, str]
+    group_key: str,
+    set_name: str,
+    condition: str,
+    settings: Dict[str, str],
+    cards: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
     """
-    Whether the listing title this group would get fits eBay's limit.
+    Whether the listing title this group would get survives eBay's limit.
 
     Reported against the group rather than a card because the title belongs to
     the listing. Singles are titled from the card and are checked per card.
+
+    This renders the title **the push will actually send** -- same template
+    resolution, same set code and year, same shortening ladder -- rather than
+    a substitution of its own. Two copies of that logic would drift, and the
+    way that fails is the page approving a title eBay then refuses, or
+    blocking one it would have accepted.
+
+    Only a title that had to have its **set name clipped** is a problem. A
+    template whose raw substitution runs long but which the abbreviations
+    resolve is fine, and flagging it would block approvals for listings that
+    come out perfectly well.
     """
     if is_single(group_key):
         return []
-    template = settings.get(
-        "variation_title_template",
-        "{set_name}: Pick Your Card - {condition} - Complete Your Set",
+    group_cards = cards or []
+    fields = group_title_fields(group_cards)
+    template = title_template_for(settings, group_language(group_cards))
+    title, trimmed = render_variation_title(
+        set_name or "",
+        condition=condition or "",
+        template=template,
+        set_code=fields["set_code"],
+        year=fields["year"],
     )
-    title = template.replace("{set_name}", set_name or "").replace(
-        "{condition}", condition or ""
-    )
-    if len(title) > EBAY_TITLE_LIMIT:
+    if trimmed:
         return [
-            f"title is {len(title)} characters, over eBay's "
-            f"{EBAY_TITLE_LIMIT}-character limit"
+            f"the title does not fit eBay's {EBAY_TITLE_LIMIT}-character "
+            f"limit, so the set name would be cut short: {title!r}. Shorten "
+            f"the title template for this listing's language under Listing "
+            f"Rules."
         ]
     return []
 
@@ -520,10 +546,17 @@ def plan_blockers(db: Database, plan_id: int) -> List[Dict[str, Any]]:
                 # to agree. The title check below reads `condition`, so on a
                 # mixed group it would validate a title nobody gets.
                 "conditions": set(),
+                # The items themselves, so the title can be rendered from
+                # the group's real set code, year and language rather than
+                # from the first card that happened to arrive. Popped
+                # before this is returned -- it is working state, and the
+                # endpoint sends these entries to the browser.
+                "cards": [],
                 "problems": [],
             },
         )
         entry["conditions"].add(str(item.get("condition") or "").strip())
+        entry["cards"].append(item)
         for problem in json.loads(item["validation"] or "[]"):
             entry["problems"].append(
                 {
@@ -537,7 +570,7 @@ def plan_blockers(db: Database, plan_id: int) -> List[Dict[str, Any]]:
     for group_key, entry in by_group.items():
         problems = list(validate_group_title(
             group_key, entry.get("set_name") or "", entry.get("condition") or "",
-            settings,
+            settings, cards=entry.pop("cards", []),
         ))
         # A listing carries one ConditionID, so a group holding two grades
         # publishes cards under a description that is wrong for some of them.

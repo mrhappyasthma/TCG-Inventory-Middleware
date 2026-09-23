@@ -1760,9 +1760,30 @@
                 <!-- Variation Title Template -->
                 <div class="p-4 rounded-xl bg-dark-900/70 border border-slate-700/80 space-y-2">
                     <label class="block font-semibold text-slate-200">Variation Listing Title Template</label>
-                    <p class="text-[11px] text-slate-400">Template used for eBay set-level parent listings. Placeholders: <code class="text-accent-cyan font-mono">{set_name}</code> and <code class="text-accent-cyan font-mono">{condition}</code>. The condition is taken verbatim from your SortSwift export, so the title always matches the cards.</p>
+                    <p class="text-[11px] text-slate-400">Template used for eBay set-level parent listings. Placeholders: <code class="text-accent-cyan font-mono">{set_name}</code>, <code class="text-accent-cyan font-mono">{condition}</code>, <code class="text-accent-cyan font-mono">{set_code}</code> and <code class="text-accent-cyan font-mono">{year}</code>. The condition is taken verbatim from your SortSwift export, so the title always matches the cards. The set code and year are only filled in when every card on the listing agrees on them.</p>
                     <input type="text" id="settingTitleTemplate" value="{set_name}: Pick Your Card - {condition} - Complete Your Set" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
-                    
+
+                    <!-- Per-language overrides. One template stopped being
+                         enough with a second language: a Chinese listing
+                         states its set code, language and year, an English
+                         one states none of them. -->
+                    <div class="mt-3 pt-3 border-t border-slate-700/80 space-y-3">
+                        <p class="text-[11px] text-slate-400">A listing whose cards are all in one language uses that language's template instead, if it has one. Leave a box empty to use the template above. The language is whatever your export puts in its <code class="font-mono">Language</code> column.</p>
+                        <div>
+                            <label class="block text-[11px] text-slate-300 mb-1">Chinese <span class="text-slate-500 font-mono">(CS)</span></label>
+                            <input type="text" id="settingTitleTemplateCS" placeholder="Leave empty to use the template above" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                        </div>
+                        <div>
+                            <label class="block text-[11px] text-slate-300 mb-1">Chinese <span class="text-slate-500 font-mono">(ZH)</span></label>
+                            <input type="text" id="settingTitleTemplateZH" placeholder="Leave empty to use the template above" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                            <p class="text-[10px] text-slate-500 mt-1">Two codes because SortSwift currently exports these cards as <code class="font-mono">CS</code>. If that is corrected to <code class="font-mono">ZH</code>, the listings keep their format instead of falling back to the English one.</p>
+                        </div>
+                        <div>
+                            <label class="block text-[11px] text-slate-300 mb-1">Japanese <span class="text-slate-500 font-mono">(JA)</span></label>
+                            <input type="text" id="settingTitleTemplateJA" placeholder="Leave empty to use the template above" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                        </div>
+                    </div>
+
                     <!-- Title Character Preview & Fallback Demo -->
                     <div class="mt-3 p-3 rounded-lg bg-dark-800 border border-slate-700 space-y-2">
                         <div class="flex items-center justify-between text-[11px] text-slate-400">

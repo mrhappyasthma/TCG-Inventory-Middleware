@@ -40,7 +40,10 @@ from .batches import (
     build_variation_option_name,
     variation_sort_key,
     generate_variation_title,
+    group_language,
+    group_title_fields,
     resolve_condition_descriptor,
+    title_template_for,
 )
 from .db import (
     DEFAULT_VARIATION_OPTION_TEMPLATE,
@@ -933,11 +936,24 @@ def _push_group(
     else:
         cover_sent = account_cover_url or _first_image(kept)
 
+    # The title is resolved from the cards the listing will actually hold,
+    # not from the plan's items: `kept` already includes everything the
+    # listing keeps, and a set code or year the members disagree on must not
+    # be stated as the listing's own. The template is chosen by the group's
+    # language, so a Chinese listing and an English one can be titled
+    # differently on the same account.
+    title_fields = group_title_fields(kept)
     api.upsert_group(ebay_group_key, _group_payload(
         ebay_group_key,
         entries,
         title=generate_variation_title(
-            set_name, condition=condition, template=title_template
+            set_name,
+            condition=condition,
+            template=title_template_for(
+                settings, group_language(kept), default=title_template
+            ),
+            set_code=title_fields["set_code"],
+            year=title_fields["year"],
         ),
         description=description,
         # Both from the full set, for the same reason: a one-card plan was
@@ -1792,11 +1808,24 @@ def refresh_listing(
             db, api, ebay_parent_id, ebay_group_key,
             [c for c, _ in kept], settings, record,
         )
+        # Resolved from the listing's own cards, exactly as the push does --
+        # the two share this group write, so a title rule applied to one is
+        # owed to the other. A refresh that rendered the old template would
+        # quietly undo a retitle on the next repair.
+        refresh_cards = [c for c, _ in kept]
+        title_fields = group_title_fields(refresh_cards)
         api.upsert_group(ebay_group_key, _group_payload(
             ebay_group_key,
             kept,
             title=generate_variation_title(
-                set_name, condition=condition, template=title_template
+                set_name,
+                condition=condition,
+                template=title_template_for(
+                    settings, group_language(refresh_cards),
+                    default=title_template,
+                ),
+                set_code=title_fields["set_code"],
+                year=title_fields["year"],
             ),
             description=_group_description([c for c, _ in kept], single),
             cover_image_url=cover_sent,

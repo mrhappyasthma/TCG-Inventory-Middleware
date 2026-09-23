@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 from typing import Dict, Any, List, Optional
@@ -312,6 +313,38 @@ DEFAULT_VARIATION_TITLE_TEMPLATE = (
     "{set_name}: Pick Your Card - {condition} - Complete Your Set"
 )
 
+# The placeholders a title template may use. Named here because the set of
+# them is now part of the user-facing contract -- the Listing Rules dialog
+# lists them, and a template naming one that does not exist renders the
+# literal text rather than failing, which is the kind of mistake that is only
+# visible once a listing is live.
+TITLE_PLACEHOLDERS = ("{set_name}", "{condition}", "{set_code}", "{year}")
+
+# Shortenings tried, in order, when a rendered title exceeds eBay's limit.
+#
+# Two separate lists, because the two are not equally safe.
+#
+# A **set name is data**: it names the thing being sold, so only a shortening
+# a reader can undo belongs here. "Volume" -> "Vol" qualifies. The reason to
+# have the list at all is that the alternative is worse -- the last-resort
+# fallback below chops the name mid-word, and "Gem Pack Volu" is not a set.
+SET_NAME_ABBREVIATIONS = (
+    ("Volume", "Vol"),
+)
+
+# **Template text is ours.** Shortening it states nothing false about the
+# cards, which is why "Near Mint" -> "NM" has always been allowed here.
+# "Singles & Holos" -> "Holos" is the same kind of edit: both describe what
+# the listing offers rather than making a claim about a particular card, and
+# losing the longer form costs less than a truncated set name.
+#
+# Note this is deliberately not applied to {condition}, which is substituted
+# from the card's own grade and is a factual claim -- see the docstring below.
+TEMPLATE_ABBREVIATIONS = (
+    ("Near Mint", "NM"),
+    ("Singles & Holos", "Holos"),
+)
+
 
 def _sanitize_variation_value(value: str) -> str:
     """
@@ -368,40 +401,208 @@ def variation_sort_key(card: Dict[str, Any]):
     return (0, prefix, int(match.group(1)), str(card.get("product_name") or "").lower())
 
 
+def _abbreviate(text: str, pairs) -> str:
+    for long_form, short_form in pairs:
+        text = text.replace(long_form, short_form)
+    return text
+
+
 def generate_variation_title(
     set_name: str,
     condition: str = "",
     template: str = DEFAULT_VARIATION_TITLE_TEMPLATE,
+    set_code: str = "",
+    year: str = "",
 ) -> str:
+    """Render a listing title, shortening it to fit. See :func:`render_variation_title`."""
+    title, _ = render_variation_title(
+        set_name, condition=condition, template=template,
+        set_code=set_code, year=year,
+    )
+    return title
+
+
+def render_variation_title(
+    set_name: str,
+    condition: str = "",
+    template: str = DEFAULT_VARIATION_TITLE_TEMPLATE,
+    set_code: str = "",
+    year: str = "",
+):
     """
     Build an eBay variation listing title within the 80-character limit.
 
     The condition is substituted verbatim from the source data and is never
     abbreviated or altered here: the title makes a factual claim about the
-    cards, so shortening it risks misdescribing them. When a title is too long
-    the set name is truncated instead.
+    cards, so shortening it risks misdescribing them.
+
+    ``set_code`` and ``year`` are the group's own values, and are only
+    supplied by the caller when every card in the listing agrees on them --
+    a title describes the whole listing, so a value its members disagree
+    about has no business being stated as fact. Both render empty when
+    unknown, and the collapse below means an unused or unresolved
+    placeholder leaves no double space behind.
+
+    Over-length titles are shortened in four steps, cheapest first, and each
+    step is only taken because the one after it costs more:
+
+    1. abbreviate the **set name** (``Volume`` -> ``Vol``), which a reader
+       can undo;
+    2. abbreviate the **template text** (``Near Mint`` -> ``NM``,
+       ``Singles & Holos`` -> ``Holos``), which states nothing about a
+       specific card;
+    3. trim the set name by the overflow, which is the blunt instrument the
+       first two exist to avoid -- it chops mid-word.
+
+    Returns ``(title, trimmed)``. ``trimmed`` is True only when step 3 had
+    to run, and it exists so the drafts page can flag a title that will
+    reach eBay with a clipped set name. The alternative -- flagging every
+    template whose *raw* substitution exceeds 80 -- would block approvals
+    for titles the shortening above resolves perfectly well.
     """
     cond = str(condition or "").strip()
+    code = str(set_code or "").strip()
+    yr = str(year or "").strip()
 
     def render(tpl: str, s_name: str) -> str:
-        return tpl.replace("{set_name}", s_name).replace("{condition}", cond)
+        rendered = (
+            tpl.replace("{set_name}", s_name)
+            .replace("{condition}", cond)
+            .replace("{set_code}", code)
+            .replace("{year}", yr)
+        )
+        # An unresolved placeholder would otherwise leave a double space, or
+        # a trailing separator, in a live listing title. Collapsing is safe
+        # because no legitimate title needs a run of spaces.
+        return " ".join(rendered.split())
 
     s_name = str(set_name or "").strip()
 
     title = render(template, s_name)
     if len(title) <= 80:
-        return title
+        return title, False
 
-    # Legacy templates hardcode "Near Mint" instead of using {condition}.
-    # Shortening that literal is safe because it is template text, not data.
-    shortened = render(template.replace("Near Mint", "NM"), s_name)
-    if len(shortened) <= 80:
-        return shortened
+    # 1. The set name's own abbreviations, tried before anything else is
+    #    given up: "Gem Pack Vol 6" still names the set, where the trim at
+    #    the end of this function would leave "Gem Pack Volu".
+    short_name = _abbreviate(s_name, SET_NAME_ABBREVIATIONS)
+    if short_name != s_name:
+        title = render(template, short_name)
+        if len(title) <= 80:
+            return title, False
 
-    # Last resort: trim the set name by exactly the overflow amount.
-    overflow = len(shortened) - 80
-    trimmed_set = s_name[: max(0, len(s_name) - overflow)].strip()
-    return render(template.replace("Near Mint", "NM"), trimmed_set)[:80]
+    # 2. Then the template's own wording. Cumulative with step 1: by here
+    #    the set name has already given up what it can.
+    short_template = _abbreviate(template, TEMPLATE_ABBREVIATIONS)
+    title = render(short_template, short_name)
+    if len(title) <= 80:
+        return title, False
+
+    # 3. Last resort: trim the set name by exactly the overflow amount.
+    overflow = len(title) - 80
+    trimmed_set = short_name[: max(0, len(short_name) - overflow)].strip()
+    return render(short_template, trimmed_set)[:80], True
+
+
+# The eBay export column the year comes from. It is an item specific rather
+# than a column of our own, so it lives in manifest.ebay_fields_json.
+YEAR_SPECIFIC = "C:Year Manufactured"
+
+
+def _card_year(card) -> str:
+    try:
+        fields = json.loads(card.get("ebay_fields_json") or "{}")
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(fields, dict):
+        return ""
+    specifics = fields.get("item_specifics")
+    if not isinstance(specifics, dict):
+        return ""
+    return str(specifics.get(YEAR_SPECIFIC) or "").strip()
+
+
+def group_title_fields(cards) -> dict:
+    """
+    The ``set_code`` and ``year`` a whole listing can be said to have.
+
+    A title describes the listing, not one card in it, so a value is only
+    returned when **every** card agrees on it and returns empty otherwise.
+    That is the same rule ``push._uniform_aspects`` applies to listing-level
+    aspects, and it exists for the reason ``get_plan_groups`` had to stop
+    using ``MIN()``: picking one member's value and printing it as the
+    group's turns a disagreement into a confident, wrong statement -- there,
+    a 152-card block headed with the grade of its single odd card.
+
+    Blank is the safe answer because the renderer collapses an unresolved
+    placeholder away, so a mixed group simply loses that word from its
+    title rather than gaining a false one.
+    """
+    codes = set()
+    years = set()
+    for card in cards:
+        codes.add(str(card.get("set_code") or "").strip())
+        years.add(_card_year(card))
+    return {
+        "set_code": codes.pop() if len(codes) == 1 else "",
+        "year": years.pop() if len(years) == 1 else "",
+    }
+
+
+# Where a language-specific title template is stored. The suffix is the
+# card's own language code, uppercased, exactly as the export spells it.
+TITLE_TEMPLATE_PREFIX = "variation_title_template"
+
+
+def title_template_key(language: str) -> str:
+    """The settings key holding the title template for one language."""
+    return f"{TITLE_TEMPLATE_PREFIX}_{str(language or '').strip().upper()}"
+
+
+def title_template_for(
+    settings: Dict[str, str],
+    language: str = "",
+    default: str = DEFAULT_VARIATION_TITLE_TEMPLATE,
+) -> str:
+    """
+    The title template that applies to a listing in this language.
+
+    One template per account was enough while every card was English. It
+    stopped being enough the moment a second language arrived: a Chinese
+    listing wants its language, its set code and its year in the title,
+    and an English one wants none of them -- rendered through a single
+    template, one of the two always comes out wrong.
+
+    So the language-specific template wins and the plain
+    ``variation_title_template`` is the fallback. A **blank** language
+    template falls through too, which is what makes "leave an empty one for
+    Japanese" work with no special case: the key can exist, be visible in
+    Listing Rules, and do nothing until it is filled in.
+
+    The language is whatever the export put in the card's ``Language``
+    column, uppercased. It is deliberately not normalised against a table of
+    our own -- this project passes source values through -- which does mean
+    that if the export starts spelling a language differently, the listing
+    falls back to the default template rather than silently rendering the
+    wrong one. That is the failure mode to expect, and it is visible on the
+    drafts page before anything is pushed.
+    """
+    specific = str(settings.get(title_template_key(language)) or "").strip()
+    if specific:
+        return specific
+    return str(settings.get(TITLE_TEMPLATE_PREFIX) or default)
+
+
+def group_language(cards) -> str:
+    """
+    The language a whole listing is in, or "" when its cards disagree.
+
+    Same rule as :func:`group_title_fields`, and it matters more here: the
+    language selects the *template*, so guessing would render an entire
+    listing's title in the wrong format rather than dropping one word.
+    """
+    languages = {str(card.get("language") or "").strip() for card in cards}
+    return languages.pop() if len(languages) == 1 else ""
 
 
 

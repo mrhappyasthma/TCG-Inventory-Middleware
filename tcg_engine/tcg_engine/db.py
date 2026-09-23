@@ -18,6 +18,37 @@ DEFAULT_GAME = "Pokémon TCG"
 # Dropdown label for each card in a variation listing. The card number keeps
 # reprints distinguishable and gives the list a natural order.
 DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
+
+# Listing titles, per language of the cards in the listing.
+#
+# One template per account was enough while the store was English-only. A
+# second language broke that: a Chinese listing wants its set code, its
+# language and its year stated -- buyers search on all three, and the set
+# name alone does not distinguish a Chinese print run from anything else --
+# while an English listing wants none of them. Rendered through one
+# template, one of the two is always wrong.
+#
+# `variation_title_template` stays the default and is what an English
+# listing gets. `variation_title_template_<CODE>` overrides it for one
+# language, where CODE is the card's own `Language` value uppercased, as
+# the export spells it. A blank override falls through to the default,
+# which is what lets an empty Japanese slot sit in Listing Rules doing
+# nothing until it is filled in.
+DEFAULT_VARIATION_TITLE_TEMPLATE = (
+    "{set_name}: Pick Your Card - {condition} - Complete Your Set"
+)
+# The export spells Chinese Simplified "CS" today. "ZH" is seeded to the
+# same format so that correcting SortSwift -- which it needs, since it is
+# currently also labelling these cards' *C:Language as "Czech" -- does not
+# silently drop these listings back onto the English template.
+DEFAULT_CHINESE_TITLE_TEMPLATE = (
+    "Pokemon {set_name} {set_code} Chinese {year} "
+    "Singles & Holos - CHOOSE YOUR CARD!"
+)
+# Seeded empty on purpose: the key exists so it is visible and editable
+# before there is any Japanese stock, and an empty value is inherited as
+# "use the default".
+DEFAULT_JAPANESE_TITLE_TEMPLATE = ""
 DEFAULT_SHIPPING_PROFILE = "Free Shipping Cards"
 DEFAULT_RETURN_PROFILE = "No Returns"
 DEFAULT_PAYMENT_PROFILE = "Immediate Payment"
@@ -997,7 +1028,10 @@ class Database:
                 default_settings = [
                     ("single_threshold", "5.00"),
                     ("group_by_set", "true"),
-                    ("variation_title_template", "{set_name}: Pick Your Card - {condition} - Complete Your Set"),
+                    ("variation_title_template", DEFAULT_VARIATION_TITLE_TEMPLATE),
+                    ("variation_title_template_CS", DEFAULT_CHINESE_TITLE_TEMPLATE),
+                    ("variation_title_template_ZH", DEFAULT_CHINESE_TITLE_TEMPLATE),
+                    ("variation_title_template_JA", DEFAULT_JAPANESE_TITLE_TEMPLATE),
                     ("category_id", "183454"),
                     ("condition_descriptor_style", "label_id"),
                     ("seller_postal_code", DEFAULT_SELLER_POSTAL_CODE),
@@ -1059,6 +1093,14 @@ class Database:
                 ("reprice_max_change_percent",
                  DEFAULT_REPRICE_MAX_CHANGE_PERCENT),
                 ("target_quantity_default", DEFAULT_TARGET_QUANTITY),
+                # Added with per-language titles. The backfill only writes a
+                # key that is missing or blank, so an existing database picks
+                # the Chinese format up without disturbing anything already
+                # configured -- and the Japanese slot, being empty, is
+                # created but inert.
+                ("variation_title_template_CS", DEFAULT_CHINESE_TITLE_TEMPLATE),
+                ("variation_title_template_ZH", DEFAULT_CHINESE_TITLE_TEMPLATE),
+                ("variation_title_template_JA", DEFAULT_JAPANESE_TITLE_TEMPLATE),
             ):
                 cursor.execute(
                     """
@@ -3421,7 +3463,8 @@ class Database:
                 f"""
                 SELECT i.*,
                        m.product_name, m.set_name, m.condition, m.printing,
-                       m.card_number, m.language, m.quantity AS catalogued_qty,
+                       m.card_number, m.language, m.set_code,
+                       m.quantity AS catalogued_qty,
                        m.price AS catalogued_price, m.market_price,
                        m.cdn_image, m.stock_image, {CARD_IMAGE_SQL},
                        m.remarks, m.ebay_fields_json,
@@ -4161,7 +4204,8 @@ class Database:
             cursor.execute(
                 f"""
                 SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
-                       m.printing, m.card_number, m.language, m.cdn_image,
+                       m.printing, m.card_number, m.language, m.set_code,
+                       m.cdn_image,
                        m.stock_image, {CARD_IMAGE_SQL},
                        m.remarks, m.ebay_fields_json, m.price, m.quantity,
                        v.custom_label, v.offer_id, v.ebay_parent_id,

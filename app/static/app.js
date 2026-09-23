@@ -1078,6 +1078,16 @@ async function loadListingSettings() {
         if (s.variation_title_template) {
             document.getElementById("settingTitleTemplate").value = s.variation_title_template;
         }
+        // Per-language overrides. Set unconditionally, including to "",
+        // because an empty override is a real state -- it means "use the
+        // default" -- and leaving a stale value in the box would make a
+        // cleared template look like it was still in force.
+        document.getElementById("settingTitleTemplateCS").value =
+            s.variation_title_template_CS || "";
+        document.getElementById("settingTitleTemplateZH").value =
+            s.variation_title_template_ZH || "";
+        document.getElementById("settingTitleTemplateJA").value =
+            s.variation_title_template_JA || "";
         document.getElementById("settingGroupBySet").checked =
             String(s.group_by_set ?? "true").toLowerCase() !== "false";
         document.getElementById("settingDescriptorStyle").value =
@@ -1110,6 +1120,9 @@ async function saveListingSettings(e) {
     const shippingProfile = document.getElementById("settingShippingProfile").value.trim();
     const returnProfile = document.getElementById("settingReturnProfile").value.trim();
     const paymentProfile = document.getElementById("settingPaymentProfile").value.trim();
+    const titleTemplateCS = document.getElementById("settingTitleTemplateCS").value.trim();
+    const titleTemplateZH = document.getElementById("settingTitleTemplateZH").value.trim();
+    const titleTemplateJA = document.getElementById("settingTitleTemplateJA").value.trim();
 
     try {
         const res = await fetch("/api/listing-settings", {
@@ -1119,6 +1132,9 @@ async function saveListingSettings(e) {
                 settings: {
                     single_threshold: threshold,
                     variation_title_template: template,
+                    variation_title_template_CS: titleTemplateCS,
+                    variation_title_template_ZH: titleTemplateZH,
+                    variation_title_template_JA: titleTemplateJA,
                     group_by_set: groupBySet ? "true" : "false",
                     condition_descriptor_style: descriptorStyle,
                     seller_postal_code: postalCode,
