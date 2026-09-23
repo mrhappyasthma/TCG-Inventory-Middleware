@@ -148,12 +148,6 @@ def variation_sort_key(card: Dict[str, Any]):
     return (0, prefix, int(match.group(1)), str(card.get("product_name") or "").lower())
 
 
-def _abbreviate(text: str, pairs) -> str:
-    for long_form, short_form in pairs:
-        text = text.replace(long_form, short_form)
-    return text
-
-
 def _joined_distinct(concatenated) -> str:
     """
     Tidy SQLite's ``GROUP_CONCAT(DISTINCT x)`` into a readable list.

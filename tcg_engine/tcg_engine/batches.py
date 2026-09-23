@@ -418,6 +418,12 @@ def build_variation_option_name(
     return _sanitize_variation_value(rendered)
 
 
+def _abbreviate(text: str, pairs) -> str:
+    for long_form, short_form in pairs:
+        text = text.replace(long_form, short_form)
+    return text
+
+
 def generate_variation_title(
     set_name: str,
     condition: str = "",
