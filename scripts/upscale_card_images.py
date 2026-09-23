@@ -16,7 +16,7 @@ and points the card at the local copy through ``manifest.image_override``.
 
 Three things about that are worth knowing before running it.
 
-**It adds pixels, not detail.** A 300x419 scan becomes 358x500 -- about a 19%
+**It adds pixels, not detail.** A 300x419 scan becomes 372x520 -- about a 24%
 enlargement, so it stays close to the original -- but nothing is recovered
 that was not there. It satisfies eBay's rule honestly, because the rule is
 about dimensions, and a soft picture beats a listing that cannot be revised.
@@ -57,6 +57,7 @@ import argparse
 import io
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -76,6 +77,11 @@ TARGET_LONGEST_SIDE = 520
 # Generous, because these are photographs on a third-party CDN and the
 # alternative to waiting is a card left unlistable.
 FETCH_TIMEOUT_SECONDS = 30
+
+# How often the measuring pass reports. Often enough that a run on a slow
+# link is visibly alive, rare enough that a large catalogue does not scroll
+# the summary off the screen.
+PROGRESS_EVERY = 50
 
 USER_AGENT = (
     "TCG-Inventory-Middleware/1.0 "
@@ -178,31 +184,51 @@ def main(argv=None):
         )
         return 2
 
-    from ebay_client import pictures  # noqa: PLC0415
-
     cards = db.get_inventory(
         search=None, sort_by="manifest_id", sort_dir="ASC",
         limit=1000000, offset=0,
         set_name=args.set_name or None, below_target=False,
         target_default=db.get_target_quantity_default(),
     )
-    print(f"Measuring {len(cards)} card(s)...\n")
+    # One HTTP round trip per card, sequentially. Measured at roughly 60 ms
+    # each, so a full catalogue is minutes rather than seconds -- and it is
+    # deliberately not parallelised, because this is a rare repair run
+    # against somebody else's CDN and a few minutes is a fair price for not
+    # opening a dozen connections to it at once.
+    #
+    # Which is exactly why it reports as it goes. A run that prints one line
+    # and then nothing for four minutes is indistinguishable from one that
+    # has hung, and the same reasoning put an elapsed clock on the module
+    # overlays in the dashboard.
+    print(f"Measuring {len(cards)} card(s) -- about one HTTP request each, "
+          f"so expect a few minutes...\n")
 
     too_small, unreadable, fine, no_image = [], [], 0, []
-    for card in cards:
+    started = time.monotonic()
+    for index, card in enumerate(cards, start=1):
         url = current_image(card)
         if not url:
             no_image.append(card)
-            continue
-        verdict = deps.check_picture(url)
-        if verdict["ok"] is True:
-            fine += 1
-        elif verdict["ok"] is False:
-            too_small.append((card, url, verdict))
         else:
-            # Never counted as a pass. Our fetch failing is not proof eBay's
-            # will, but it is not evidence it will succeed either.
-            unreadable.append((card, url, verdict))
+            verdict = deps.check_picture(url)
+            if verdict["ok"] is True:
+                fine += 1
+            elif verdict["ok"] is False:
+                too_small.append((card, url, verdict))
+            else:
+                # Never counted as a pass. Our fetch failing is not proof
+                # eBay's will, but it is not evidence it will succeed either.
+                unreadable.append((card, url, verdict))
+        if index % PROGRESS_EVERY == 0 or index == len(cards):
+            elapsed = time.monotonic() - started
+            rate = index / elapsed if elapsed else 0
+            remaining = (len(cards) - index) / rate if rate else 0
+            print(
+                f"  {index}/{len(cards)} measured, {len(too_small)} too small"
+                f" -- {elapsed:.0f}s elapsed"
+                + (f", about {remaining:.0f}s left" if remaining > 5 else "")
+            )
+    print()
 
     print(f"  {fine} already meet eBay's {EBAY_MIN_LONGEST_SIDE}px minimum")
     print(f"  {len(too_small)} are too small")
