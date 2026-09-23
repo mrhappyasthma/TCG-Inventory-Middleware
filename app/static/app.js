@@ -4157,7 +4157,7 @@ function draftItemRow(item, moveTargets, group) {
         <tr class="${rowCls} transition-colors">
             <td class="py-2.5 px-4">
                 <p class="font-semibold text-slate-200">${escapeHtml(item.product_name || "-")}</p>
-                <p class="text-[10px] text-slate-500 font-mono">${escapeHtml(item.manifest_id)}${item.card_number ? ` · #${escapeHtml(item.card_number)}` : ""}</p>
+                <p class="text-[10px] text-slate-500 font-mono">${escapeHtml(item.manifest_id)}${item.card_number ? ` · #${escapeHtml(item.card_number)}` : ""}${item.set_name ? ` · ${escapeHtml(item.set_name)}` : ""}</p>
                 ${problems.length ? `<ul class="mt-1 space-y-0.5">${problems.map(p => `<li class="text-[10px] text-amber-300">⚠ ${escapeHtml(p)}</li>`).join("")}</ul>` : ""}
             </td>
             ${cardThumbnailCell(item, "py-2 px-4")}
