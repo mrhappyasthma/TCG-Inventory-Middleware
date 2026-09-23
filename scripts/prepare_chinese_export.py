@@ -23,9 +23,11 @@ What it fixes, and why each is worth a pass over the file:
 * **The language aspect says Czech.** SortSwift exports these cards with
   ``Language`` = ``CS`` -- Chinese Simplified -- and then spells that out in
   ``*C:Language`` as ``Czech``. That column becomes a live eBay item
-  specific, so every card would be listed as being in Czech. Only the
-  aspect is corrected; the plain ``Language`` code stays ``CS``, because it
-  selects the listing title template and ``CS`` is the code Listing Rules
+  specific, so every card would be listed as being in Czech. ``Chinese`` is
+  confirmed against eBay's own item specifics for the card category, which
+  matters because eBay only takes Language values from its own list. Only
+  the aspect is corrected; the plain ``Language`` code stays ``CS``, because
+  it selects the listing title template and ``CS`` is the code Listing Rules
   holds the Chinese format under.
 
 **It deliberately leaves the card name alone**, and that is worth stating
@@ -101,6 +103,11 @@ CARD_NAME_COLUMN = "*C:Card Name"
 # can disagree with SortSwift's and eBay's, and a mapping in the ingest would
 # be exactly that. A correction applied to the export keeps the app honest
 # and leaves one obvious place to delete once SortSwift is fixed.
+#
+# "Chinese" is not a guess. eBay only accepts Language values from its own
+# per-category list -- the same constraint that makes `default_game` an
+# override rather than a fallback -- and this spelling was read off eBay's
+# item specifics for the card category and confirmed to be one of them.
 LANGUAGE_ASPECT_COLUMN = "*C:Language"
 LANGUAGE_CODE_COLUMN = "Language"
 WRONG_LANGUAGE = "Czech"
@@ -206,11 +213,8 @@ def main(argv=None):
             "   reading 'Language: Czech' on every card. Fix it in SortSwift:\n"
             "   this rewrite is a stopgap that has to be re-run on every\n"
             "   export until then.\n"
-            f"   Check that eBay accepts {RIGHT_LANGUAGE!r} for your category\n"
-            "   before pushing -- like the Game aspect, eBay only takes\n"
-            "   values from its own list, and the surest way to find the\n"
-            "   exact spelling is to read it off a live listing of the same\n"
-            "   kind."
+            f"   {RIGHT_LANGUAGE!r} is confirmed against eBay's own item\n"
+            "   specifics for this category, so the value is one it accepts."
         )
     if language_other:
         print(
