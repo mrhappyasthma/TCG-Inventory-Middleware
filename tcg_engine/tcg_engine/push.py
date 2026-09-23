@@ -350,6 +350,7 @@ def _group_payload(
     description: str,
     cover_image_url: str,
     aspects: Dict[str, List[str]],
+    option_template: str = DEFAULT_VARIATION_OPTION_TEMPLATE,
 ) -> Dict[str, Any]:
     """
     The inventory item group that becomes one variation listing.
@@ -361,10 +362,18 @@ def _group_payload(
     page exists at all.
     """
     skus = [sku for _, sku in entries]
+    # The **configured** template, not the shipped default.
+    #
+    # These values have to match the `Card` aspect written onto each
+    # inventory item, which `_inventory_item_payload` renders from the
+    # configured template. Hardcoding the default here meant that customising
+    # `variation_option_template` made the group declare one set of option
+    # values while the items claimed another -- latent only because the
+    # shipped default and the hardcoded one were the same string.
     options = [
         build_variation_option_name(
             entry.get("product_name") or "", entry.get("card_number") or "",
-            DEFAULT_VARIATION_OPTION_TEMPLATE,
+            option_template,
         )
         for entry, _ in entries
     ]
@@ -960,6 +969,7 @@ def _push_group(
         # narrowing the listing-level aspects and could blank the cover.
         cover_image_url=cover_sent,
         aspects=_uniform_aspects(kept, settings),
+        option_template=option_template,
     ))
     db.upsert_managed_listing(
         group_key, inventory_item_group_key=ebay_group_key, pushed=True
@@ -1830,6 +1840,7 @@ def refresh_listing(
             description=_group_description([c for c, _ in kept], single),
             cover_image_url=cover_sent,
             aspects=_uniform_aspects([c for c, _ in kept], settings),
+            option_template=option_template,
         ))
         cover_verified = _confirm_group_cover(
             api, ebay_group_key, cover_sent, record

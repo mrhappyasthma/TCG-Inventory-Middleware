@@ -11,13 +11,6 @@ That is the same trap ``db.set_manifest_condition`` documents for the grade.
 
 What it fixes, and why each is worth a pass over the file:
 
-* **The card name carries the card number.** Every one of the 214 rows has
-  ``*C:Card Name`` as ``"Applin - 1902"`` while ``Product Name (No Card
-  Number)`` holds the clean ``"Applin"``. The ingest prefers the former, and
-  the variation dropdown template is ``{name} ({card_number})`` -- so every
-  option on every listing would read ``Applin - 1902 (1902)``. The clean name
-  is already in the file; this just moves it into the column the ingest reads.
-
 * **Three set codes are placeholders.** ``Gem Pack 4/5/6`` restate the set
   name rather than naming the set, and the title template puts the code in
   front of buyers. The real codes are CBB4C / CBB5C / CBB6C.
@@ -26,6 +19,19 @@ What it fixes, and why each is worth a pass over the file:
   4``, ``Gem Pack Vol 5`` but ``Gem Pack Volume 6``. All three become
   "Volume"; the title renderer abbreviates back to "Vol" by itself if a
   particular title will not fit in eBay's 80 characters.
+
+**It deliberately leaves the card name alone**, and that is worth stating
+because the obvious "improvement" is destructive. Every row spells
+``*C:Card Name`` as ``"Applin - 1902"`` while ``Product Name (No Card
+Number)`` holds a clean ``"Applin"``, which looks like an easy tidy-up --
+the variation dropdown otherwise reads ``Applin - 1902 (1902)``. But the
+card number is **not** part of this system's natural key, so the number
+inside the name is the only thing keeping two different cards apart:
+stripping it merges "Applin - 1902" and "Applin - 1903", which have
+different card numbers, different TCGplayer ids and different prices.
+Measured on the real file, it collapses 214 cards into 112 across 49
+merges. The duplicated number in a dropdown label is the far cheaper
+problem, and the option template is where to fix it.
 
 **This is a workaround, not the fix.** The durable fix is to correct these in
 SortSwift, because the next export will otherwise carry the old values again
@@ -71,30 +77,13 @@ SET_CORRECTIONS = {
 SET_COLUMN = "*C:Set"
 SET_CODE_COLUMN = "Set Code"
 CARD_NAME_COLUMN = "*C:Card Name"
-CLEAN_NAME_COLUMN = "Product Name (No Card Number)"
-
-
-def corrected_card_name(row):
-    """
-    The card's name without its number, or None if nothing needs doing.
-
-    Taken from the export's own clean column rather than by stripping a
-    suffix off the other one. Parsing "Applin - 1902" would work until a card
-    is legitimately named with a dash or a number, and the file already
-    carries the answer.
-    """
-    current = str(row.get(CARD_NAME_COLUMN) or "").strip()
-    clean = str(row.get(CLEAN_NAME_COLUMN) or "").strip()
-    if not clean or clean == current:
-        return None
-    return clean
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Correct set names, set codes and card names in a Chinese "
-            "SortSwift export before importing it."
+            "Correct set names and set codes in a Chinese SortSwift export "
+            "before importing it."
         ),
     )
     parser.add_argument("source", help="The export to read")
@@ -131,7 +120,6 @@ def main(argv=None):
         return 2
 
     set_changes = {}
-    name_changes = 0
     unknown_sets = {}
 
     for row in rows:
@@ -149,11 +137,6 @@ def main(argv=None):
                 original_set, str(row.get(SET_CODE_COLUMN) or "").strip()
             )
 
-        clean = corrected_card_name(row)
-        if clean is not None:
-            row[CARD_NAME_COLUMN] = clean
-            name_changes += 1
-
     print(f"{len(rows)} row(s) read from {args.source}\n")
 
     print("Set name and code corrections:")
@@ -167,8 +150,6 @@ def main(argv=None):
             )
     else:
         print("   none -- no row named a set this knows how to correct")
-
-    print(f"\nCard names stripped of their card number: {name_changes}")
 
     if unknown_sets:
         # Named rather than silently passed through: a set this does not know

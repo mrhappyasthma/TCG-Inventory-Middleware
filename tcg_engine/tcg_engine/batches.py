@@ -363,6 +363,25 @@ def _sanitize_variation_value(value: str) -> str:
     return cleaned
 
 
+def _ends_with_number(name: str, number: str) -> bool:
+    """
+    Whether a product name already finishes with its own card number.
+
+    Deliberately narrow: it matches only at the end, and only once any
+    separator between the two has been discounted. A number appearing in the
+    middle of a name ("Mew 151 Promo") is part of the name and is left alone,
+    because suppressing the suffix there would lose the distinction the
+    number is carrying.
+    """
+    trimmed = re.sub(r"[\s\-_/#]+$", "", str(name or "").strip())
+    if not trimmed.endswith(str(number or "")):
+        return False
+    head = trimmed[: len(trimmed) - len(number)]
+    # Either the number is the whole name, or what precedes it is a
+    # separator rather than a digit -- "Applin - 1902" yes, "Mew 1151" no.
+    return head == "" or not head[-1:].isalnum()
+
+
 def build_variation_option_name(
     product_name: str,
     card_number: str = "",
@@ -378,6 +397,18 @@ def build_variation_option_name(
     name = str(product_name or "").strip()
     number = str(card_number or "").strip()
     if not number:
+        return _sanitize_variation_value(name)
+    # A name that already ends in its own card number does not get it twice.
+    #
+    # Some exports spell the product name "Applin - 1902" rather than
+    # "Applin", and the template would render "Applin - 1902 (1902)" on every
+    # option of every listing. The number cannot simply be stripped out of
+    # the name instead: this project's natural key is (name, set, condition,
+    # printing) and does *not* include the card number, so for such an export
+    # the number inside the name is the only thing distinguishing two
+    # different cards -- removing it merged 214 cards into 112 on a real
+    # file. So the name is left exactly as it is and the suffix is skipped.
+    if _ends_with_number(name, number):
         return _sanitize_variation_value(name)
     rendered = template.replace("{name}", name).replace("{card_number}", number)
     return _sanitize_variation_value(rendered)

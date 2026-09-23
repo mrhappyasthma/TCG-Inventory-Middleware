@@ -3053,6 +3053,63 @@ class PerLanguageTitleTests(unittest.TestCase):
         self.assertEqual(len(title), 80)
         self.assertTrue(trimmed)
 
+    def test_a_name_ending_in_its_own_number_is_not_given_it_twice(self):
+        """
+        Some exports spell the product name "Applin - 1902". The template
+        would otherwise render "Applin - 1902 (1902)" on every option.
+        """
+        from tcg_engine.batches import build_variation_option_name
+        self.assertEqual(
+            build_variation_option_name("Applin - 1902", "1902"),
+            "Applin - 1902",
+        )
+
+    def test_the_number_is_not_stripped_out_of_the_name_to_achieve_that(self):
+        """
+        The natural key is (name, set, condition, printing) and excludes the
+        card number, so for such an export the number *inside the name* is
+        the only thing telling two cards apart. Removing it merged 214 cards
+        into 112 on the real file.
+        """
+        from tcg_engine.batches import build_variation_option_name
+        first = build_variation_option_name("Applin - 1902", "1902")
+        second = build_variation_option_name("Applin - 1903", "1903")
+        self.assertNotEqual(first, second)
+
+    def test_an_ordinary_name_still_gets_its_number(self):
+        from tcg_engine.batches import build_variation_option_name
+        self.assertEqual(
+            build_variation_option_name("Pikachu", "025/198"),
+            "Pikachu (025/198)",
+        )
+
+    def test_a_number_inside_a_name_is_left_alone(self):
+        """
+        Only a trailing match is suppressed. A digit that is part of the
+        name, or a longer number merely ending in the card's, still gets
+        the suffix -- "Mew 1151" is not card 151.
+        """
+        from tcg_engine.batches import build_variation_option_name
+        self.assertEqual(
+            build_variation_option_name("Mew 1151", "151"), "Mew 1151 (151)"
+        )
+
+    def test_the_group_declares_the_configured_option_values(self):
+        """
+        The group's option list must match the `Card` aspect on each item,
+        which is rendered from the configured template. _group_payload
+        hardcoded the shipped default, so customising the template made the
+        two disagree -- latent only because the two strings were equal.
+        """
+        from tcg_engine.push import _group_payload
+        entries = [({"product_name": "Applin - 1902", "card_number": "1902"}, "ID1")]
+        payload = _group_payload(
+            "GRP", entries, title="t", description="d",
+            cover_image_url="", aspects={}, option_template="{name}",
+        )
+        values = payload["variesBy"]["specifications"][0]["values"]
+        self.assertEqual(values, ["Applin - 1902"])
+
     def test_the_english_default_is_untouched_by_any_of_this(self):
         """
         The per-language work must not restyle a listing that never asked
