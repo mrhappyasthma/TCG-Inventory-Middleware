@@ -65,6 +65,23 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "data/inventory.db")
 
 COVER_LABEL = "cover photo"
 
+# A trading card is 2.5 x 3.5 inches, so a picture of a whole one is about
+# 0.714 wide for every unit tall. This is not an eBay rule -- eBay accepts
+# any shape over the minimum size -- which is exactly why it is checked
+# here, in the card-aware tool, rather than in ebay_client, which knows
+# nothing about cards.
+#
+# It catches a failure the size check cannot see: an image that is a *crop*
+# of a card rather than the card. Two of a 214-card Chinese import were the
+# top half only -- 866x569 and 856x581, full width and about half the
+# height, so the attacks, weakness, retreat cost and set number were all
+# missing. Both sailed through the 500-pixel check at 866 and 856, and
+# would have gone live as those variations' photographs.
+CARD_ASPECT = 2.5 / 3.5
+# Generous: a scan with a little border, or trimmed tight, is still a card.
+# Only something well outside this is worth a person's attention.
+CARD_ASPECT_TOLERANCE = 0.12
+
 
 def mediawiki_original(url):
     """
@@ -105,12 +122,35 @@ def describe(url, indent="    "):
           + ("OK" if ok
              else f"TOO SMALL, eBay needs {EBAY_MIN_LONGEST_SIDE}"))
 
+    if not card_shaped(width, height):
+        # Louder than the letterbox note below, because the consequence is
+        # different in kind: that one is cosmetic, this one means the
+        # picture is not of the whole card.
+        print(f"{indent}NOT CARD-SHAPED: {width/height:.2f} wide per unit "
+              f"tall, where a trading card is {CARD_ASPECT:.2f}. This is "
+              f"usually a crop rather than the whole card -- check it "
+              f"before listing. eBay accepts it; a buyer looking for the "
+              f"attacks and the set number will not find them.")
+
     ratio = longest / max(1, min(width, height))
     if ok and ratio >= WIDE_ASPECT_RATIO:
         print(f"{indent}note: {ratio:.1f}:1, so it letterboxes in eBay's "
               f"square gallery thumbnail. Allowed -- the minimum size is the "
               f"only hard rule -- but it shows small in search results.")
     return ok
+
+
+def card_shaped(width, height):
+    """
+    Whether these proportions are plausibly a photograph of a whole card.
+
+    Deliberately separate from the size verdict and never fatal: it is a
+    judgement about the subject of the picture, not about eBay's rules, and
+    a cover photo legitimately is not a card at all.
+    """
+    if not width or not height:
+        return True
+    return abs((width / height) - CARD_ASPECT) / CARD_ASPECT <= CARD_ASPECT_TOLERANCE
 
 
 def check_url(url):
