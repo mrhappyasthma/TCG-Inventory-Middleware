@@ -87,6 +87,13 @@ def update_listing_settings_endpoint(
     picture_note = ""
     cover = str(req.settings.get("cover_image_url") or "").strip()
     if cover:
+        # Checked before the size, because it is the more expensive
+        # mistake: this is the fallback cover for every listing that has
+        # no staged one of its own, so an eBay-hosted URL here fails not
+        # one listing but all of them, at publish, after approval.
+        problem = deps.ebay_hosted_cover_problem(cover)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
         verdict = deps.check_picture(cover)
         if verdict["ok"] is False:
             raise HTTPException(status_code=400, detail=verdict["reason"])

@@ -2149,8 +2149,15 @@ recorded and the dialog says why, so nothing is silently lost.
   merge pictures; the uploaded set replaces what is present.
 * eBay **ignores a URL identical to one already on the listing**, so re-sending
   the same address is a no-op. Use a different image.
-* Do not mix eBay-hosted and self-hosted images on one listing; eBay rejects
-  the combination.
+* ⚠️ **Never use an eBay-hosted URL.** An address copied out of an existing
+  listing points at `i.ebayimg.com`, and eBay refuses any listing whose
+  pictures mix its own copies with self-hosted ones — *"A mixture of Self
+  Hosted and EPS pictures are not allowed"*. Every card picture here is
+  self-hosted, so such a cover fails the **whole listing** at publish, not
+  just the picture. Setting one as the account-wide default in Listing Rules
+  cost six variation listings and 211 cards in one push. It is now refused
+  wherever a cover is set, and again before the group is written. Use the
+  image's original address, not eBay's copy of it.
 * ⚠️ **At least 500 pixels on the longest side.** eBay re-validates every
   picture on a listing whenever anything about it changes, so one undersized
   image blocks *all* future changes — including ones with nothing to do with

@@ -311,6 +311,9 @@ def set_plan_cover(
     # fetch inside the check does not block the event loop.
     picture_note = ""
     if url:
+        problem = deps.ebay_hosted_cover_problem(url)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
         verdict = deps.check_picture(url)
         if verdict["ok"] is False:
             raise HTTPException(status_code=400, detail=verdict["reason"])

@@ -124,6 +124,10 @@ async def set_listing_cover(
             detail="The cover photo must be a full http:// or https:// URL that eBay can fetch.",
         )
 
+    problem = deps.ebay_hosted_cover_problem(url)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+
     # Measured before it is stored, not after eBay refuses it.
     #
     # eBay wants 500 pixels on the longest side and re-checks every picture

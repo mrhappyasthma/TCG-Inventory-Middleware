@@ -2872,6 +2872,59 @@ class StockTargetTests(unittest.TestCase):
         )
 
 
+class EbayHostedCoverTests(unittest.TestCase):
+    """
+    An eBay-hosted cover cannot go on a listing of self-hosted pictures.
+
+    eBay refuses the whole listing for it -- "A mixture of Self Hosted and
+    EPS pictures are not allowed" -- and it did: six variation listings
+    and 211 cards, while the three singles in the same push went up fine,
+    because a single never writes an inventory item group and so never
+    sends a group picture.
+    """
+
+    def test_an_ebay_url_is_recognised(self):
+        from tcg_engine.push import _is_ebay_hosted
+        self.assertTrue(
+            _is_ebay_hosted("https://i.ebayimg.com/images/g/abc/s-l1600.jpg")
+        )
+        self.assertTrue(_is_ebay_hosted("https://p1.ebaystatic.com/x.gif"))
+
+    def test_our_own_urls_are_not(self):
+        from tcg_engine.push import _is_ebay_hosted
+        for url in (
+            "https://sortswift.nyc3.cdn.digitaloceanspaces.com/c/1.jpg",
+            "https://cards.example.synology.me/card-images/ID1001.jpg",
+            "",
+        ):
+            self.assertFalse(_is_ebay_hosted(url), url)
+
+    def test_it_matches_the_host_not_a_substring(self):
+        """
+        A URL that merely mentions the domain is not an eBay picture, and
+        refusing it would reject a perfectly good cover.
+        """
+        from tcg_engine.push import _is_ebay_hosted
+        self.assertFalse(_is_ebay_hosted("https://notebayimg.com/x.jpg"))
+        self.assertFalse(
+            _is_ebay_hosted("https://example.com/?u=i.ebayimg.com/x.jpg")
+        )
+
+    def test_the_engine_and_the_library_agree(self):
+        """
+        push.py cannot import ebay_client -- that boundary is what lets the
+        push be tested with no network -- so the host list is duplicated.
+        This is what keeps the two copies honest.
+        """
+        from ebay_client.pictures import is_ebay_hosted
+        from tcg_engine.push import _is_ebay_hosted
+        for url in (
+            "https://i.ebayimg.com/a.jpg", "https://p1.ebaystatic.com/b.gif",
+            "https://example.com/c.jpg", "https://notebayimg.com/d.jpg", "",
+        ):
+            self.assertEqual(is_ebay_hosted(url), _is_ebay_hosted(url), url)
+
+
 class PlanGroupStatusTests(unittest.TestCase):
     """
     Leaving a whole listing out of a push in one action.

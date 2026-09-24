@@ -48,6 +48,39 @@ HEADER_BYTES = 131072
 # Not a rejection -- eBay accepts it -- so it is reported and nothing more.
 WIDE_ASPECT_RATIO = 2.0
 
+# The hosts eBay serves its own copies of pictures from -- eBay Picture
+# Services, "EPS".
+#
+# They matter because eBay refuses a listing whose pictures are a mixture
+# of EPS and self-hosted ones: "A mixture of Self Hosted and EPS pictures
+# are not allowed." So a URL on one of these cannot be combined with a URL
+# anywhere else on the same listing, and every card picture this
+# application sends is self-hosted by definition.
+#
+# Confirmed the expensive way. A cover photo copied out of an existing
+# listing is an EPS URL, and setting one as the account-wide default made
+# every new variation listing fail at publish -- six listings, 211 cards --
+# while the three singles in the same push went up fine, because a single
+# never writes an inventory item group and so never sends a group picture.
+EPS_HOSTS = ("ebayimg.com", "ebaystatic.com")
+
+
+def is_ebay_hosted(url) -> bool:
+    """
+    Whether this picture is one eBay already hosts.
+
+    Matched on the host, not on a substring of the whole URL: a query
+    parameter or a path that merely mentions ebayimg.com is not an eBay
+    picture, and treating it as one would refuse a perfectly good URL.
+    """
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    try:
+        host = (urlparse(str(url or "")).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in EPS_HOSTS)
+
 USER_AGENT = "TCG-Inventory-Middleware/1.0 (image size check)"
 
 

@@ -180,6 +180,34 @@ def check_picture(url: str) -> Dict[str, Any]:
         }
     return ebay_pictures.check(url)
 
+def ebay_hosted_cover_problem(url) -> str:
+    """
+    Why this cover photo cannot be used, or "" if it can.
+
+    eBay refuses a listing whose pictures mix its own hosted copies with
+    self-hosted ones. Every card picture this application sends is
+    self-hosted, so an eBay-hosted cover fails the *whole listing* at
+    publish -- with an error that names neither the cover nor the listing
+    usefully. Six listings and 211 cards were rejected that way before
+    this check existed.
+
+    The obvious way to acquire one is to copy the image address out of an
+    existing listing, which is exactly what a person does when looking for
+    a cover photo.
+    """
+    if ebay_pictures is None or not str(url or "").strip():
+        return ""
+    if not ebay_pictures.is_ebay_hosted(url):
+        return ""
+    return (
+        "That picture is hosted by eBay. eBay refuses a listing whose "
+        "pictures mix its own copies with self-hosted ones, and every card "
+        "picture here is self-hosted -- so this cover would fail the whole "
+        "listing at publish. Use the image's original address rather than "
+        "eBay's copy of it, or upload it somewhere of your own."
+    )
+
+
 def get_ebay_client(user_id: int):
     """
     One account's eBay client, or None when the integration is unconfigured.

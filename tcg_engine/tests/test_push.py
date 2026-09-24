@@ -1863,6 +1863,51 @@ class QuantityReachesTheOfferTests(PushTestCase):
         self.assertIn("offer", logs[0][1])
 
 
+class EbayHostedCoverIsRefusedTests(PushTestCase):
+    """
+    A cover eBay already hosts fails the whole listing, so it is refused
+    before the group is written.
+
+    eBay's own words: "A mixture of Self Hosted and EPS pictures are not
+    allowed." It happened on a real push -- six variation listings, 211
+    cards -- and the three singles in the same run went up fine, because a
+    single never writes a group and so never sends a group picture.
+
+    Refused *before* ``upsert_group`` on purpose. When the publish was the
+    first thing to object, six groups had already been written and were
+    left sitting unpublished.
+    """
+
+    EPS = "https://i.ebayimg.com/images/g/abc/s-l1600.jpg"
+
+    def staged(self, cover):
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        self.db.set_plan_group_cover(plan_id, "Base Set|Near Mint", cover)
+        approve_plan(self.db, plan_id, approved_by=1)
+        api = FakeEbay()
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        return api, result
+
+    def test_the_listing_is_not_written_at_all(self):
+        api, result = self.staged(self.EPS)
+        self.assertEqual(api.groups, {}, "no group should have been written")
+        self.assertEqual(result["pushed"], 0)
+        self.assertEqual(result["failed"], 2)
+
+    def test_the_reason_names_the_cover_rather_than_ebays_wording(self):
+        _, result = self.staged(self.EPS)
+        message = " ".join(e["message"] for e in result["logs"])
+        self.assertIn("hosted by eBay", message)
+        self.assertIn("Listing Rules", message)
+
+    def test_a_self_hosted_cover_is_untouched_by_the_check(self):
+        api, result = self.staged(COVER)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(list(api.groups.values())[0]["imageUrls"], [COVER])
+
+
 class PushKeepsTheListingsCoverTests(PushTestCase):
     """
     A push must not replace the cover photo of a listing it is updating.

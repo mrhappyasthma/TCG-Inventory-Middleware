@@ -951,6 +951,30 @@ def _push_group(
     # be stated as the listing's own. The template is chosen by the group's
     # language, so a Chinese listing and an English one can be titled
     # differently on the same account.
+    # A cover eBay already hosts cannot go on a listing whose card
+    # pictures it does not, and eBay refuses the whole listing for it:
+    # "A mixture of Self Hosted and EPS pictures are not allowed."
+    #
+    # Caught here, before the group is written, so the run fails with a
+    # reason that names the cause instead of eBay's wording -- and so it
+    # fails without leaving an unpublished group behind, which is what
+    # happened when the publish was the first thing to object: six
+    # listings written, none of them live, 211 cards reported failed.
+    if _is_ebay_hosted(cover_sent) and not all(
+        _is_ebay_hosted(card_image(card)) for card in kept
+    ):
+        reason = (
+            f"the cover photo is hosted by eBay ({cover_sent}) while the "
+            f"card pictures are not, and eBay refuses a listing that mixes "
+            f"the two. Set a cover photo that is not an eBay URL -- on this "
+            f"listing, or under Listing Rules if it is the account-wide "
+            f"default -- or clear it to use the first card's picture."
+        )
+        for item in live:
+            _mark(db, item, STATUS_FAILED, counts, reason)
+        record("ERROR", f"{group_key or 'ungrouped'}: {reason}")
+        return (0, 0)
+
     title_fields = group_title_fields(kept)
     api.upsert_group(ebay_group_key, _group_payload(
         ebay_group_key,
@@ -1413,6 +1437,27 @@ def card_image(item: Dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+# The hosts eBay serves its own picture copies from.
+#
+# Duplicated from ``ebay_client.pictures.EPS_HOSTS`` rather than imported,
+# because ``tcg_engine`` holds no dependency on the eBay library -- that
+# boundary is what lets the whole push be tested against a fake with no
+# network. Two lines of domain names is a cheaper price than the
+# dependency, and they do not change.
+EBAY_IMAGE_HOSTS = ("ebayimg.com", "ebaystatic.com")
+
+
+def _is_ebay_hosted(url) -> bool:
+    """Whether eBay already hosts this picture. See the note at the call site."""
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    try:
+        host = (urlparse(str(url or "")).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in EBAY_IMAGE_HOSTS)
 
 
 def _first_image(items: List[Dict[str, Any]]) -> str:
