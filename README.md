@@ -2158,6 +2158,22 @@ recorded and the dialog says why, so nothing is silently lost.
   cost six variation listings and 211 cards in one push. It is now refused
   wherever a cover is set, and again before the group is written. Use the
   image's original address, not eBay's copy of it.
+
+  If you have already set one — or several — `scripts/rehost_ebay_covers.py`
+  downloads each and serves it from this deployment instead, leaving *which*
+  picture is used unchanged. It covers the account-wide default, a live
+  listing's own cover, and one staged on a draft:
+
+  ```bash
+  docker compose exec tcg-middleware python scripts/rehost_ebay_covers.py --yes
+  ```
+
+  It refuses anything that comes back under 500 pixels rather than enlarging
+  it. eBay answers an image id it no longer knows with **HTTP 200 and an
+  80×80 "no image" icon**, not a 404 — and a cover that is genuinely on a
+  live listing cleared eBay's own minimum to get there, so a small download
+  is the placeholder rather than the picture. Those are named and left
+  alone; pick a new cover for them.
 * ⚠️ **At least 500 pixels on the longest side.** eBay re-validates every
   picture on a listing whenever anything about it changes, so one undersized
   image blocks *all* future changes — including ones with nothing to do with

@@ -1982,6 +1982,28 @@ class Database:
             row = cursor.fetchone()
             return row["url"] if row else ""
 
+    def get_listing_cover_images(self) -> Dict[str, str]:
+        """
+        Every cover photo recorded against a live listing.
+
+        Needed to answer a question about the set rather than about one
+        listing -- "which of these would eBay refuse" -- which is not
+        something the per-listing read can be looped into without knowing
+        the listing ids first.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT ebay_parent_id, cover_image_url
+                  FROM ebay_listing_overrides
+                 WHERE TRIM(COALESCE(cover_image_url, '')) != ''
+                 ORDER BY ebay_parent_id
+                """
+            )
+            return {r["ebay_parent_id"]: r["cover_image_url"]
+                    for r in cursor.fetchall()}
+
     def set_listing_cover_image(self, ebay_parent_id: str, cover_image_url: str) -> str:
         """
         Record the cover image for one eBay listing.
