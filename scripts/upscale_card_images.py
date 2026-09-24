@@ -54,7 +54,6 @@ to the data volume, and it is a repair rather than routine work.
 """
 
 import argparse
-import io
 import os
 import sys
 import time
@@ -66,13 +65,17 @@ for path in (REPO_ROOT, os.path.join(REPO_ROOT, "tcg_engine")):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from app import deps  # noqa: E402
 
-# eBay's documented floor. A little headroom is added so that a picture
-# landing exactly on the boundary cannot be rejected by a rounding
-# disagreement between their measurement and ours.
-EBAY_MIN_LONGEST_SIDE = 500
-TARGET_LONGEST_SIDE = 520
+# The enlargement itself is shared with replace_card_image.py, which
+# needs it for the same reason on a replacement picture.
+from _imaging import (  # noqa: E402
+    EBAY_MIN_LONGEST_SIDE,
+    TARGET_LONGEST_SIDE,
+    upscale,
+)
 
 # Generous, because these are photographs on a third-party CDN and the
 # alternative to waiting is a card left unlistable.
@@ -93,33 +96,6 @@ def fetch(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SECONDS) as r:
         return r.read()
-
-
-def upscale(raw: bytes, target: int = TARGET_LONGEST_SIDE):
-    """
-    (bytes, (width, height)) for the enlarged JPEG.
-
-    Lanczos because it is the least bad of the cheap resamplers on
-    photographic material; anything better means a model and a GPU, which
-    is a great deal of machinery for a 19% enlargement.
-
-    Converted to RGB because a JPEG cannot carry an alpha channel, and a
-    palette or RGBA source would otherwise fail at save time rather than
-    here.
-    """
-    from PIL import Image  # noqa: PLC0415 - imported late so --purge needs no Pillow
-
-    image = Image.open(io.BytesIO(raw))
-    image.load()
-    width, height = image.size
-    scale = target / max(width, height)
-    if scale <= 1.0:
-        return None, (width, height)
-    size = (max(1, round(width * scale)), max(1, round(height * scale)))
-    enlarged = image.convert("RGB").resize(size, Image.LANCZOS)
-    buffer = io.BytesIO()
-    enlarged.save(buffer, "JPEG", quality=92, optimize=True, progressive=True)
-    return buffer.getvalue(), size
 
 
 def current_image(card) -> str:

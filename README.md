@@ -1136,6 +1136,54 @@ Three things to know before running it:
 Confirm the result with `scripts/check_images.py --all`, which measures
 whichever image is actually being sent.
 
+### Replacing a picture with a better one you found
+
+Enlarging cannot help when the export's image is not merely small but
+*wrong* — a crop showing half the card, the wrong printing, or nothing
+usable. If you can find a better picture, point the card at it:
+
+```bash
+python scripts/replace_card_image.py ID2503 https://example.com/card.jpg
+python scripts/replace_card_image.py ID2503 https://example.com/card.jpg --yes
+python scripts/replace_card_image.py "Wattrel - 2605" https://example.com/x.jpg --yes
+python scripts/replace_card_image.py --from-file replacements.csv --yes
+python scripts/replace_card_image.py ID2503 --clear --yes
+```
+
+Name the card by manifest id or by a search term — an **ambiguous** search
+is refused and lists the candidates rather than guessing, because pointing
+the wrong card at a picture is silent and the next push publishes it.
+`--from-file` takes `manifest_id,url` per line, so a handful of corrections
+is one run.
+
+**It downloads the picture and serves it from this deployment by default.**
+A URL from a wiki or a forum can move, rot, or refuse a request that is not
+a browser, and the moment that matters is a push or Refresh weeks later —
+at which point eBay refuses the whole listing, not just the picture. Pass
+`--link` to store the URL verbatim instead, which needs no
+`PUBLIC_BASE_URL` and is reasonable for a CDN you trust.
+
+Because it is hosting the picture anyway, an undersized replacement is
+**enlarged on the way in** rather than refused. That matters more than it
+sounds: the whole-card images found for the two cropped Chinese cards were
+both 300x419 — better pictures at a worse size — and refusing them would
+have meant keeping a half-card because the whole card was too small.
+
+Everything is checked before anything is written:
+
+| Finding | Result |
+|---|---|
+| Unreachable or unmeasurable | **Refused** — eBay has to fetch it too |
+| Under 500 pixels | **Enlarged** to 520 on the way in — or refused with `--link`, where nothing can be done about it |
+| Not card-shaped | **Reported** — usually a crop, but it is your call |
+| Plain `http://` | **Reported** — eBay may not fetch it |
+
+It writes the same `image_override` column the upscaler uses, so a later
+SortSwift upload cannot undo it: the override sits ahead of the export's own
+image columns. `--clear` removes it, which hands the card back to whatever
+the export supplied — for a card whose export image was the problem, that
+puts the problem back.
+
 ### Which picture a card is shown and listed with
 
 Two columns arrive from the SortSwift export and they are **not**
