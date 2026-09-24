@@ -15,6 +15,27 @@ DEFAULT_SELLER_POSTAL_CODE = "94305"
 # eBay requires the "Game" item specific on card listings. Used only when the
 # uploaded export does not supply one.
 DEFAULT_GAME = "Pokémon TCG"
+
+# The Country of Origin item specific, which OVERRIDES the export the same
+# way DEFAULT_GAME does and for the same reason: eBay only accepts values
+# from its own per-category list, and the SortSwift export says "United
+# States" on every row, which is not where these cards come from.
+#
+# Applied at push time rather than baked into a card at ingest, so changing
+# it reaches every listing on its next push or Refresh instead of only the
+# cards catalogued afterwards.
+DEFAULT_COUNTRY_OF_ORIGIN = "Japan"
+
+# Promoted Listings Standard bids a percentage of the sale price. 2.1% is
+# the rate this seller uses; it is a setting rather than a constant because
+# the right number depends on the category and on how hard a listing needs
+# pushing, and because everything else here is per-account too.
+#
+# Note the rate alone changes nothing. Promoted Listings is the Marketing
+# API, not the Inventory API: an ad belongs to a *campaign*, so nothing is
+# promoted until `promoted_campaign_id` names one, and reaching that API at
+# all needs the sell.marketing OAuth scope, which means re-consenting.
+DEFAULT_PROMOTED_LISTING_RATE = "2.1"
 # Dropdown label for each card in a variation listing. The card number keeps
 # reprints distinguishable and gives the list a natural order.
 DEFAULT_VARIATION_OPTION_TEMPLATE = "{name} ({card_number})"
@@ -1134,6 +1155,11 @@ class Database:
                     ("target_quantity_default", DEFAULT_TARGET_QUANTITY),
                     ("auto_reprice_exclude_languages",
                      DEFAULT_REPRICE_EXCLUDE_LANGUAGES),
+                    ("default_country_of_origin",
+                     DEFAULT_COUNTRY_OF_ORIGIN),
+                    ("promoted_listing_rate",
+                     DEFAULT_PROMOTED_LISTING_RATE),
+                    ("promoted_campaign_id", ""),
                 ]
                 cursor.executemany(
                     """
@@ -1172,6 +1198,8 @@ class Database:
                 ("variation_title_template_JA", DEFAULT_JAPANESE_TITLE_TEMPLATE),
                 ("auto_reprice_exclude_languages",
                  DEFAULT_REPRICE_EXCLUDE_LANGUAGES),
+                ("default_country_of_origin", DEFAULT_COUNTRY_OF_ORIGIN),
+                ("promoted_listing_rate", DEFAULT_PROMOTED_LISTING_RATE),
             ):
                 cursor.execute(
                     """

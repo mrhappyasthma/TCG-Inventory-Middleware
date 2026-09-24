@@ -16,7 +16,7 @@ lives, HTTP behaviour in ``ebay_client`` where the retries and tokens live.
 
 from typing import Any, Dict, List, Sequence, Tuple
 
-from ebay_client import inventory
+from ebay_client import inventory, marketing
 
 
 class InventoryApiAdapter:
@@ -111,6 +111,29 @@ class InventoryApiAdapter:
 
     def withdraw_offer(self, offer_id: str) -> None:
         inventory.withdraw_offer(self.transport, offer_id)
+
+    def promote(self, listing_id: str, bid_percentage: str, campaign_id: str):
+        """
+        Put an ad on a published listing. Returns the ad id, or None.
+
+        Separate from everything else on this adapter because Promoted
+        Listings is a different API: an ad belongs to a campaign, not to
+        an offer, so it can only happen once a listing id exists.
+
+        Raises like any other call. The *caller* is what makes promoting
+        non-fatal -- a listing that went live unpromoted is a working
+        listing, and rolling one back over an ad would be the wrong
+        trade.
+        """
+        return marketing.create_ad(
+            self.transport, campaign_id, listing_id, bid_percentage
+        )
+
+    def campaigns(self):
+        """The seller's ad campaigns, for choosing one in the dashboard."""
+        return marketing.get_campaigns(
+            self.transport, marketplace_id=self.marketplace_id
+        )
 
     def failures(
         self, rows: Sequence[Dict[str, Any]]

@@ -1,3 +1,4 @@
+import json
 import csv
 import io
 import os
@@ -2870,6 +2871,71 @@ class StockTargetTests(unittest.TestCase):
         self.assertEqual(
             self.db.get_manifest_by_id("ID1001")["target_quantity"], 8
         )
+
+
+class CountryOfOriginTests(unittest.TestCase):
+    """
+    Country of Origin is set from settings, overriding the export.
+
+    The same treatment Game gets, for the same reason: eBay accepts only
+    values from its own per-category list, and the export says "United
+    States" on every row -- which is where the seller is, not where a
+    Pokemon card comes from.
+    """
+
+    SETTINGS = {
+        "default_game": "Pokémon TCG",
+        "default_country_of_origin": "Japan",
+    }
+
+    def card(self, **extra):
+        card = {
+            "manifest_id": "ID1001", "product_name": "Applin - 1902",
+            "set_name": "Gem Pack Volume 6", "condition": "NM",
+            "printing": "Normal", "card_number": "1902", "language": "CS",
+            "proposed_qty": 1,
+            "ebay_fields_json": json.dumps({"item_specifics": {
+                "C:Country of Origin": "United States",
+                "C:Country/Region of Manufacture": "United States",
+                "C:Card Name": "Applin - 1902",
+            }}),
+        }
+        card.update(extra)
+        return card
+
+    def aspects(self, settings=None):
+        from tcg_engine.push import _inventory_item_payload
+        payload = _inventory_item_payload(
+            self.card(), settings=settings if settings is not None else self.SETTINGS,
+            category_id="183454", option_name="Applin - 1902",
+            is_variation=True,
+        )
+        return payload["product"]["aspects"]
+
+    def test_it_overrides_what_the_export_said(self):
+        self.assertEqual(self.aspects()["Country of Origin"], ["Japan"])
+
+    def test_the_other_country_field_is_left_alone(self):
+        """
+        A different aspect, and not the one asked for. Changing it too
+        would be a decision nobody made.
+        """
+        self.assertEqual(
+            self.aspects()["Country/Region of Manufacture"], ["United States"]
+        )
+
+    def test_clearing_the_setting_falls_back_to_the_export(self):
+        aspects = self.aspects({"default_country_of_origin": ""})
+        self.assertEqual(aspects["Country of Origin"], ["United States"])
+
+    def test_the_listing_level_aspects_agree_with_the_items(self):
+        """
+        A variation listing carries one set of listing-level aspects, and
+        they have to say the same thing the items do.
+        """
+        from tcg_engine.push import _uniform_aspects
+        shared = _uniform_aspects([self.card(), self.card()], self.SETTINGS)
+        self.assertEqual(shared["Country of Origin"], ["Japan"])
 
 
 class EbayHostedCoverTests(unittest.TestCase):

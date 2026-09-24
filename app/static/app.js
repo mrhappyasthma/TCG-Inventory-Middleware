@@ -1107,6 +1107,14 @@ async function loadListingSettings() {
         document.getElementById("settingOptionTemplate").value =
             s.variation_option_template || "{name} ({card_number})";
         document.getElementById("settingCoverImage").value = s.cover_image_url || "";
+        document.getElementById("settingCountryOfOrigin").value =
+            s.default_country_of_origin ?? "";
+        document.getElementById("settingPromotedRate").value =
+            s.promoted_listing_rate || "2.1";
+        // Not defaulted: empty is the real, meaningful state -- it is what
+        // stops anything being promoted at all.
+        document.getElementById("settingPromotedCampaign").value =
+            s.promoted_campaign_id ?? "";
         document.getElementById("settingShippingProfile").value = s.shipping_profile_name || "";
         document.getElementById("settingReturnProfile").value = s.return_profile_name || "";
         document.getElementById("settingPaymentProfile").value = s.payment_profile_name || "";
@@ -1127,6 +1135,9 @@ async function saveListingSettings(e) {
     const optionTemplate = document.getElementById("settingOptionTemplate").value.trim()
         || "{name} ({card_number})";
     const coverImage = document.getElementById("settingCoverImage").value.trim();
+    const countryOfOrigin = document.getElementById("settingCountryOfOrigin").value.trim();
+    const promotedRate = document.getElementById("settingPromotedRate").value.trim();
+    const promotedCampaign = document.getElementById("settingPromotedCampaign").value.trim();
     const shippingProfile = document.getElementById("settingShippingProfile").value.trim();
     const returnProfile = document.getElementById("settingReturnProfile").value.trim();
     const paymentProfile = document.getElementById("settingPaymentProfile").value.trim();
@@ -1151,6 +1162,9 @@ async function saveListingSettings(e) {
                     default_game: defaultGame,
                     variation_option_template: optionTemplate,
                     cover_image_url: coverImage,
+                    default_country_of_origin: countryOfOrigin,
+                    promoted_listing_rate: promotedRate || "2.1",
+                    promoted_campaign_id: promotedCampaign,
                     shipping_profile_name: shippingProfile,
                     return_profile_name: returnProfile,
                     payment_profile_name: paymentProfile

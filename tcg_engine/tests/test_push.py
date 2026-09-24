@@ -1863,6 +1863,78 @@ class QuantityReachesTheOfferTests(PushTestCase):
         self.assertIn("offer", logs[0][1])
 
 
+class PromotedListingTests(PushTestCase):
+    """
+    An ad goes on a listing after it publishes -- and never fails it.
+
+    Promoted Listings is a separate API: an ad belongs to a campaign, not
+    to an offer. So nothing happens until a campaign is configured, and a
+    failure is a warning, because a listing that went live unpromoted is
+    a working listing and one rolled back over an advertisement is not.
+    """
+
+    class Promoting(FakeEbay):
+        def __init__(self, fail=False):
+            super().__init__()
+            self.promoted = []
+            self.fail = fail
+
+        def promote(self, listing_id, bid, campaign_id):
+            if self.fail:
+                raise RuntimeError("campaign not found")
+            self.promoted.append((listing_id, bid, campaign_id))
+            return "AD1"
+
+    def push_with(self, settings, api=None):
+        for key, value in settings.items():
+            self.db.set_listing_settings({key: value}, user_id=SHARED_SCOPE)
+        self.add_card("ID1001", "Charizard", "004/102")
+        self.add_card("ID1002", "Blastoise", "009/102")
+        plan_id = build_plan(self.db, user_id=1)["plan_id"]
+        approve_plan(self.db, plan_id, approved_by=1)
+        api = api or self.Promoting()
+        result = push_plan(self.db, api, plan_id, user_id=SHARED_SCOPE)
+        return api, result
+
+    def test_nothing_is_promoted_without_a_campaign(self):
+        """
+        Which is what keeps a deployment that does not use Promoted
+        Listings from ever needing the sell.marketing scope.
+        """
+        api, result = self.push_with({"promoted_listing_rate": "2.1"})
+        self.assertEqual(api.promoted, [])
+        self.assertEqual(result["failed"], 0)
+
+    def test_a_published_listing_is_promoted_at_the_configured_rate(self):
+        api, result = self.push_with({
+            "promoted_listing_rate": "2.1", "promoted_campaign_id": "CAMP1",
+        })
+        self.assertEqual(len(api.promoted), 1)
+        listing_id, bid, campaign = api.promoted[0]
+        self.assertEqual(bid, "2.10")
+        self.assertEqual(campaign, "CAMP1")
+        self.assertEqual(result["failed"], 0)
+
+    def test_a_refused_ad_does_not_fail_the_listing(self):
+        api, result = self.push_with(
+            {"promoted_listing_rate": "2.1", "promoted_campaign_id": "CAMP1"},
+            api=self.Promoting(fail=True),
+        )
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["pushed"], 2)
+        message = " ".join(e["message"] for e in result["logs"])
+        self.assertIn("could not be promoted", message)
+
+    def test_an_unusable_rate_is_reported_and_nothing_is_sent(self):
+        api, result = self.push_with({
+            "promoted_listing_rate": "0.5", "promoted_campaign_id": "CAMP1",
+        })
+        self.assertEqual(api.promoted, [])
+        self.assertEqual(result["failed"], 0)
+        message = " ".join(e["message"] for e in result["logs"])
+        self.assertIn("not a usable bid", message)
+
+
 class EbayHostedCoverIsRefusedTests(PushTestCase):
     """
     A cover eBay already hosts fails the whole listing, so it is refused

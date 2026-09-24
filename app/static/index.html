@@ -1767,6 +1767,24 @@
                     <div>
                         <label class="block text-[11px] text-slate-300 mb-1">Cover photo URL <span class="text-slate-500">(optional)</span></label>
                         <input type="text" id="settingCoverImage" placeholder="https://... (defaults to the first card's image)" class="w-full px-3 py-1.5 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                    <div>
+                        <label class="block font-semibold text-slate-200 mb-1">Country of Origin</label>
+                        <input type="text" id="settingCountryOfOrigin" placeholder="Japan" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white text-xs focus:outline-none focus:border-brand-500">
+                        <p class="text-[10px] text-slate-500 mt-1">Overrides whatever your export says, the same way <code class="font-mono">C:Game</code> does &mdash; eBay only accepts values from its own list, and the export puts your own country here. Leave blank to use the export's value. Note the separate <code class="font-mono">Country/Region of Manufacture</code> aspect is left alone.</p>
+                    </div>
+                    <div>
+                        <label class="block font-semibold text-slate-200 mb-1">Promoted listings ad rate</label>
+                        <span class="flex items-center gap-1.5">
+                            <input type="number" id="settingPromotedRate" min="2" max="100" step="0.1" placeholder="2.1" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                            <span class="text-[11px] text-slate-500 shrink-0">%</span>
+                        </span>
+                        <p class="text-[10px] text-slate-500 mt-1">Bid applied to each listing this creates, charged only when the item sells through the ad. eBay's range is 2%&ndash;100%.</p>
+                    </div>
+                    <div>
+                        <label class="block font-semibold text-slate-200 mb-1">Promoted listings campaign ID</label>
+                        <input type="text" id="settingPromotedCampaign" placeholder="Leave empty to promote nothing" class="w-full px-3 py-2 rounded-lg bg-dark-800 border border-slate-600 text-white font-mono text-xs focus:outline-none focus:border-brand-500">
+                        <p class="text-[10px] text-slate-500 mt-1"><strong class="text-slate-400">Nothing is promoted until this is set.</strong> An eBay ad belongs to a campaign, not to a listing, so the rate above does nothing on its own. Reaching the Promoted Listings API also needs the <code class="font-mono">sell.marketing</code> permission &mdash; if your eBay account was connected before that was added, disconnect and reconnect it, or every ad will be refused. A listing is never failed because its ad was: it goes live either way and the console says what happened.</p>
+                    </div>
                         <p class="text-[10px] text-slate-500 mt-1">Used as the listing's main photo. Leave blank to use the first card in the set. Each variation still gets its own image from your export's <code class="font-mono">CDN Image</code> column.</p>
                     </div>
                 </div>

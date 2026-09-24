@@ -36,6 +36,14 @@ DEFAULT_SCOPES = [
     "https://api.ebay.com/oauth/api_scope/sell.inventory",
     "https://api.ebay.com/oauth/api_scope/sell.account.readonly",
     "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
+    # Promoted Listings. Note that **adding a scope does not widen an
+    # existing token**: a refresh token carries the scopes it was granted,
+    # so an account connected before this line appeared keeps the old set
+    # and every marketing call answers 403 until the seller goes through
+    # the consent screen again. That is why nothing here promotes a
+    # listing unless a campaign has been configured -- a deployment that
+    # never touches Promoted Listings never needs to re-consent.
+    "https://api.ebay.com/oauth/api_scope/sell.marketing",
 ]
 
 # Notification subscriptions and the account-deletion callback are application

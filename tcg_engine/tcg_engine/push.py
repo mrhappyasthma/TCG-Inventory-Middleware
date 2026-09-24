@@ -82,6 +82,16 @@ CARD_CONDITION_DESCRIPTOR_ID = "40001"
 # to a buyer -- and to the inventory item group, which is keyed on it.
 VARIATION_ASPECT_NAME = "Card"
 
+# The Country of Origin item specific.
+#
+# Overridden from settings rather than passed through, exactly as Game is
+# and for the same reason: eBay only accepts values from its own
+# per-category list, and the export says "United States" on every row --
+# which is the country the seller is in, not where a Pokemon card comes
+# from. Note the export also carries "Country/Region of Manufacture",
+# which is a different aspect and is deliberately left alone.
+COUNTRY_OF_ORIGIN_SPECIFIC = "C:Country of Origin"
+
 # Item specifics readable off the card's own stored columns, for cards
 # catalogued before the export's "C:" columns were persisted. Translates
 # nothing: each value is the column, passed through.
@@ -215,6 +225,9 @@ def _inventory_item_payload(
     default_game = (settings.get("default_game") or "").strip()
     if default_game:
         specifics["C:Game"] = default_game
+    country = (settings.get("default_country_of_origin") or "").strip()
+    if country:
+        specifics[COUNTRY_OF_ORIGIN_SPECIFIC] = country
 
     # eBay's aspects are unprefixed names mapping to *lists* of values. The
     # "C:" prefix belongs to File Exchange's column naming and nothing else.
@@ -844,6 +857,7 @@ def _push_group(
             )
             _record_cover(db, listing_id, cover_image_url)
             record("INFO", f"{_sku_for(item)}: listed as #{listing_id}")
+            _promote(api, settings, str(listing_id), record)
         else:
             listing_id = managed["ebay_parent_id"]
             db.upsert_managed_listing(group_key, pushed=True)
@@ -1015,6 +1029,7 @@ def _push_group(
             f"{group_key}: listed as #{listing_id} with {len(entries)} "
             f"variation(s)"
         ))
+        _promote(api, settings, str(listing_id), record)
     else:
         listing_id = managed["ebay_parent_id"]
         _record_cover(db, listing_id, cover_image_url)
@@ -1055,6 +1070,69 @@ def _push_group(
 
     _confirm(db, live, listing_id, counts)
     return (0 if published else 1, 1 if published else 0)
+
+
+
+def _promote(
+    api: Any,
+    settings: Dict[str, str],
+    listing_id: str,
+    record: Callable[[str, str], None],
+) -> None:
+    """
+    Put an ad on a listing that has just been published. Never fatal.
+
+    Promoted Listings is a separate API, and an ad belongs to a campaign
+    rather than to an offer -- so nothing happens at all until a campaign
+    id is configured. A deployment that does not promote never calls
+    this, and therefore never needs the sell.marketing OAuth scope that
+    reaching it would require.
+
+    **A failure here is reported and nothing else.** A listing that went
+    live but was not promoted is a working listing; one rolled back over
+    an advertisement is not. That asymmetry is the whole reason this is
+    wrapped rather than allowed to propagate: the promotion is the least
+    important thing happening on this code path and must not be able to
+    fail the most important.
+    """
+    campaign = str(settings.get("promoted_campaign_id") or "").strip()
+    if not campaign or not listing_id:
+        return
+    promote = getattr(api, "promote", None)
+    if not callable(promote):
+        return
+
+    raw = str(settings.get("promoted_listing_rate") or "").strip()
+    try:
+        # Two decimals, and inside eBay's own 2%-100% range. Refused here
+        # while we still know which value it was, rather than as a 400
+        # against a listing that is already live.
+        bid = f"{float(raw):.2f}"
+        if not 2.0 <= float(raw) <= 100.0:
+            raise ValueError(f"{raw}% is outside eBay's 2%-100% range")
+    except (TypeError, ValueError) as exc:
+        record("WARN", (
+            f"listing #{listing_id} was not promoted: the promoted ad rate "
+            f"is {raw!r}, which is not a usable bid ({exc}). The listing is "
+            f"live and selling; fix the rate under Listing Rules and promote "
+            f"it from Seller Hub or on the next push."
+        ))
+        return
+
+    try:
+        ad_id = promote(str(listing_id), bid, campaign)
+    except Exception as exc:  # noqa: BLE001 - an ad must not fail a listing
+        record("WARN", (
+            f"listing #{listing_id} is live but could not be promoted at "
+            f"{bid}%: {exc}. Promoted Listings needs the sell.marketing "
+            f"scope, so an eBay account connected before that was added has "
+            f"to be reconnected -- and the campaign must be running."
+        ))
+        return
+    record("INFO", (
+        f"listing #{listing_id} promoted at {bid}%"
+        + (f" (ad {ad_id})" if ad_id else "")
+    ))
 
 
 def _publish_added_offers(
@@ -1480,6 +1558,7 @@ def _uniform_aspects(
     """
     per_card = []
     default_game = (settings.get("default_game") or "").strip()
+    country = (settings.get("default_country_of_origin") or "").strip()
     for item in items:
         try:
             fields = json.loads(item.get("ebay_fields_json") or "{}")
@@ -1493,6 +1572,8 @@ def _uniform_aspects(
             })
         if default_game:
             specifics["C:Game"] = default_game
+        if country:
+            specifics[COUNTRY_OF_ORIGIN_SPECIFIC] = country
         per_card.append({
             (k[2:] if k.startswith("C:") else k): str(v).strip()
             for k, v in specifics.items() if str(v or "").strip()
