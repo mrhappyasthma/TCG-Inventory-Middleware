@@ -117,5 +117,35 @@ class RehostTests(unittest.TestCase):
         )
 
 
+class PlanScopeTests(unittest.TestCase):
+    """
+    Which plans are examined, which is where this script first failed.
+
+    A push that put some cards live and failed the rest leaves the plan
+    `partial` -- and that is precisely the state a plan blocked by its
+    cover is in. Looking only at drafts skipped the only plan that
+    mattered and then reported that nothing needed re-hosting.
+    """
+
+    def test_a_partial_plan_is_in_scope(self):
+        self.assertNotIn("partial", rehost_ebay_covers.FINISHED_PLAN_STATUSES)
+
+    def test_every_status_a_push_can_still_reach_is_in_scope(self):
+        for status in ("draft", "approved", "pushing", "partial", "failed"):
+            self.assertNotIn(
+                status, rehost_ebay_covers.FINISHED_PLAN_STATUSES, status
+            )
+
+    def test_finished_plans_are_left_alone(self):
+        """
+        A pushed or discarded plan is a record of a decision, not
+        pending work.
+        """
+        self.assertEqual(
+            set(rehost_ebay_covers.FINISHED_PLAN_STATUSES),
+            {"pushed", "discarded"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

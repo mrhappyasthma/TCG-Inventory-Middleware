@@ -66,6 +66,18 @@ SERVABLE = {".jpg": ".jpg", ".jpeg": ".jpg", ".png": ".png", ".webp": ".webp"}
 # card's own replacement picture, which is named for its manifest id.
 COVER_PREFIX = "cover-"
 
+# Plans whose covers can no longer reach eBay, and which are therefore
+# left alone: `pushed` is finished and `discarded` was thrown away, and
+# both are records of a decision rather than pending work.
+#
+# Everything else is in scope, and **`partial` especially**. That is the
+# status a plan lands in when some of its cards went live and the rest
+# failed -- which is exactly the state a listing blocked by its cover is
+# in. Filtering to draft and approved skipped the only plan that
+# mattered, and the script then reported "nothing needs re-hosting" to
+# somebody staring at six covers that did.
+FINISHED_PLAN_STATUSES = ("pushed", "discarded")
+
 
 def local_name(url: str) -> str:
     """
@@ -182,21 +194,42 @@ def main(argv=None):
                 lambda new, p=parent: db.set_listing_cover_image(p, new),
             ))
 
-    for plan in db.get_plans(user_id=owner):
-        if plan["status"] not in ("draft", "approved"):
-            continue
+    plans = [
+        p for p in db.get_plans(user_id=owner)
+        if p["status"] not in FINISHED_PLAN_STATUSES
+    ]
+    plan_covers = 0
+    for plan in plans:
         for group_key, url in db.get_plan_group_covers(plan["id"]).items():
-            if url and is_ebay_hosted(url):
+            if not url:
+                continue
+            plan_covers += 1
+            if is_ebay_hosted(url):
                 found.append((
-                    f"plan {plan['id']}, listing {group_key}", url,
+                    f"plan {plan['id']} ({plan['status']}), listing {group_key}",
+                    url,
                     lambda new, pid=plan["id"], g=group_key:
                         db.set_plan_group_cover(pid, g, new),
                 ))
 
     if not found:
+        # Says what was examined, not merely that nothing turned up. A
+        # bare "nothing needs re-hosting" is indistinguishable from
+        # having looked in the wrong place -- which is exactly what
+        # happened when this skipped every plan that was not a draft.
+        listing_covers = len(db.get_listing_cover_images())
         print(
-            "No cover photo is hosted by eBay. Nothing here needs "
-            "re-hosting."
+            "No eBay-hosted cover photo found. What was examined:\n"
+            f"  the account-wide default : "
+            + (f"set ({account})" if account else "not set") + "\n"
+            f"  live listings with a cover: {listing_covers}\n"
+            f"  unfinished plans          : {len(plans)}"
+            + (f" ({', '.join(str(p['id']) + ' ' + p['status'] for p in plans)})"
+               if plans else "")
+            + f"\n  covers staged on them     : {plan_covers}\n"
+            "\nA plan that is already pushed or discarded is deliberately "
+            "not examined.\nIf a cover you can see is missing from those "
+            "counts, say so rather than\nassuming it is fine."
         )
         return 0
 
