@@ -214,6 +214,59 @@ def update_plan_item_endpoint(
         "blockers": plan_blockers(inv, item["plan_id"]),
     }
 
+class PlanGroupStatusRequest(BaseModel):
+    group_key: str
+    # The same closed set a single row may be set to, for the same reason:
+    # it is stored verbatim, compared on later requests and rendered back.
+    status: Literal["pending", "excluded"]
+
+@router.post("/api/plans/{plan_id}/group-status")
+def set_plan_group_status_endpoint(
+    plan_id: int,
+    req: PlanGroupStatusRequest,
+    user: Dict[str, Any] = Depends(require_active_user),
+):
+    """
+    Leave a whole listing out of the push, or put it back.
+
+    Approval is all-or-nothing across a plan and refuses while any included
+    card has a blocker, so one bad listing holds up every other. Excluding
+    it is the documented way through that -- eBay's own advice for a group
+    whose other offers are fine -- and this makes it one action rather than
+    one per card.
+
+    It does not approve or push anything. What it changes is which cards the
+    approval will cover, so the gate itself is untouched: a plan still has
+    to be approved as a whole, and a push still acts on a stored approval.
+    """
+    inv = inventory_for(user)
+    plan = inv.get_plan(plan_id)
+    if plan is None or plan["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan["status"] != "draft":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This plan is {plan['status']} and can no longer be edited.",
+        )
+
+    changed = inv.set_plan_group_status(plan_id, req.group_key, req.status)
+    if not changed:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No cards in that listing could be changed. A card already "
+                "pushed or failed keeps its status, because it is the record "
+                "of what eBay did."
+            ),
+        )
+    return {
+        "success": True,
+        "changed": changed,
+        "groups": inv.get_plan_groups(plan_id),
+        "items": inv.get_plan_items(plan_id),
+        "blockers": plan_blockers(inv, plan_id),
+    }
+
 class PlanCoverRequest(BaseModel):
     group_key: str
     cover_image_url: str = ""

@@ -1619,6 +1619,20 @@
                     </label>
                 </div>
 
+                <label class="block mt-3">
+                    <span class="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Never reprice these languages</span>
+                    <input type="text" id="repriceExcludeLanguages" placeholder="CS,ZH"
+                        class="mt-1 w-full px-2 py-1 text-xs rounded-lg bg-dark-800 border border-slate-600 text-white font-mono focus:outline-none focus:border-brand-500">
+                    <span class="block text-[10px] text-slate-500 mt-1">
+                        Language codes as your export spells them, comma-separated. Cards in these
+                        languages are left out of automatic repricing entirely. This is for cards whose
+                        market price can never refresh &mdash; TCGCSV has no Chinese catalogue, so a Chinese
+                        card&rsquo;s market price is frozen at whatever the export said, and repricing would
+                        re-assert that stale figure nightly and overwrite any price you corrected by hand.
+                        Leave empty to reprice everything.
+                    </span>
+                </label>
+
                 <div class="flex items-center gap-2 mt-3 flex-wrap">
                     <button type="button" onclick="saveRepriceSettings()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold transition-all">Save repricing settings</button>
                     <button type="button" id="btnRepriceNow" onclick="runAutoReprice()" class="px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-md shadow-brand-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed">

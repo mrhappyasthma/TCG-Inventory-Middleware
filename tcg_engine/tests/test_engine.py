@@ -2872,6 +2872,105 @@ class StockTargetTests(unittest.TestCase):
         )
 
 
+class PlanGroupStatusTests(unittest.TestCase):
+    """
+    Leaving a whole listing out of a push in one action.
+
+    Approval is all-or-nothing and refuses while any included card has a
+    blocker, so one bad listing holds up every other -- and excluding it is
+    eBay's own documented way through that. Card by card, a seventeen-card
+    listing was seventeen requests.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = Database(db_path=os.path.join(self.tmp, "t.db"))
+        for name, set_name in [
+            ("Alpha", "Set A"), ("Beta", "Set A"), ("Gamma", "Set B"),
+        ]:
+            self.db.get_or_create_manifest(
+                name, set_name, "NM", "Normal", card_number="1", price=1.99
+            )
+            found = self.db.find_manifest(name, set_name, "NM", "Normal")
+            self.db.increment_manifest_quantity(found["manifest_id"], 1)
+            # Otherwise every card is blocked for want of item specifics,
+            # and the test below could not tell an unblocked listing from a
+            # differently-blocked one.
+            self.db.set_manifest_ebay_fields(found["manifest_id"], {
+                "item_specifics": {"C:Game": "Pokémon TCG", "C:Set": set_name},
+                "condition_id": "4000",
+            })
+        from tcg_engine.plans import build_plan
+        self.plan_id = build_plan(
+            self.db, user_id=SHARED_SCOPE, source="manual"
+        )["plan_id"]
+
+    def statuses(self, group_key):
+        return [
+            i["status"] for i in self.db.get_plan_items(self.plan_id)
+            if (i.get("group_key") or "") == group_key
+        ]
+
+    def test_every_card_on_the_listing_is_excluded_at_once(self):
+        changed = self.db.set_plan_group_status(
+            self.plan_id, "Set A|NM", "excluded"
+        )
+        self.assertEqual(changed, 2)
+        self.assertEqual(self.statuses("Set A|NM"), ["excluded"] * 2)
+
+    def test_the_other_listings_are_untouched(self):
+        self.db.set_plan_group_status(self.plan_id, "Set A|NM", "excluded")
+        self.assertEqual(self.statuses("Set B|NM"), ["pending"])
+
+    def test_it_is_reversible(self):
+        self.db.set_plan_group_status(self.plan_id, "Set A|NM", "excluded")
+        self.db.set_plan_group_status(self.plan_id, "Set A|NM", "pending")
+        self.assertEqual(self.statuses("Set A|NM"), ["pending"] * 2)
+
+    def test_a_pushed_card_keeps_its_status(self):
+        """
+        It is the record of something that already reached eBay, so a bulk
+        toggle must not rewrite it.
+        """
+        item = [
+            i for i in self.db.get_plan_items(self.plan_id)
+            if (i.get("group_key") or "") == "Set A|NM"
+        ][0]
+        self.db.update_plan_item(item["id"], status="pushed")
+        changed = self.db.set_plan_group_status(
+            self.plan_id, "Set A|NM", "excluded"
+        )
+        self.assertEqual(changed, 1)
+        self.assertIn("pushed", self.statuses("Set A|NM"))
+
+    def test_an_unknown_listing_changes_nothing(self):
+        self.assertEqual(
+            self.db.set_plan_group_status(self.plan_id, "No Such|NM", "excluded"),
+            0,
+        )
+
+    def test_excluding_the_broken_listing_unblocks_approval(self):
+        """
+        The whole point: a card with no price blocks the plan, and leaving
+        its listing out lets the rest be approved.
+        """
+        from tcg_engine.plans import approve_plan, plan_blockers, PlanError
+        gamma = self.db.find_manifest("Gamma", "Set B", "NM", "Normal")
+        self.db.set_manifest_price(gamma["manifest_id"], 0)
+        from tcg_engine.plans import build_plan
+        self.plan_id = build_plan(
+            self.db, user_id=SHARED_SCOPE, source="manual"
+        )["plan_id"]
+        self.assertTrue(plan_blockers(self.db, self.plan_id))
+        with self.assertRaises(PlanError):
+            approve_plan(self.db, self.plan_id, approved_by=1)
+
+        self.db.set_plan_group_status(self.plan_id, "Set B|NM", "excluded")
+        self.assertEqual(plan_blockers(self.db, self.plan_id), [])
+        result = approve_plan(self.db, self.plan_id, approved_by=1)
+        self.assertEqual(result["approved_items"], 2)
+
+
 class PlanItemOrderTests(unittest.TestCase):
     """
     A draft lists a listing's cards in the order eBay will show them.

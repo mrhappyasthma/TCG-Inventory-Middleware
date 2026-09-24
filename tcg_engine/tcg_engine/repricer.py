@@ -49,6 +49,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from .db import (
     DEFAULT_PRICE_BOUNDARY_MARGIN_PERCENT,
     DEFAULT_PRICE_HOLD_DAYS,
+    DEFAULT_REPRICE_EXCLUDE_LANGUAGES,
     DEFAULT_REPRICE_MAX_CHANGE_PERCENT,
     Database,
     SHARED_SCOPE,
@@ -287,7 +288,26 @@ def reprice_settings(
         "margin_fraction": max(0.0, margin) / 100.0,
         "hold_days": max(0.0, hold_days),
         "cap_fraction": max(0.0, cap) / 100.0,
+        "exclude_languages": parse_excluded_languages(
+            settings.get("auto_reprice_exclude_languages",
+                         DEFAULT_REPRICE_EXCLUDE_LANGUAGES)
+        ),
     }
+
+
+def parse_excluded_languages(value) -> frozenset:
+    """
+    The language codes automatic repricing leaves alone, uppercased.
+
+    A comma-separated setting rather than a flag per card, because the
+    reason is a property of the language and not of any one card: see
+    DEFAULT_REPRICE_EXCLUDE_LANGUAGES.
+    """
+    return frozenset(
+        part.strip().upper()
+        for part in str(value or "").split(",")
+        if part.strip()
+    )
 
 
 def auto_reprice_enabled(db: Database, user_id: int = SHARED_SCOPE) -> bool:
@@ -451,7 +471,24 @@ def plan_reprice(
     }
     config = reprice_settings(db, user_id=user_id)
 
-    cards = db.get_managed_cards_for_repricing()
+    every_card = db.get_managed_cards_for_repricing()
+    # Cards in an exempted language never reach decide_card at all.
+    #
+    # Filtered here rather than given a SKIPPED verdict because run_reprice
+    # logs a line per skip, and 214 identical lines every night is the noise
+    # the batch importer already had to learn to sample. One summary line
+    # says the same thing, and the count is surfaced so that an exemption
+    # silently ceasing to match -- if the export starts spelling the
+    # language differently -- shows up as the number dropping rather than as
+    # prices quietly starting to move.
+    excluded = config["exclude_languages"]
+    exempt = [
+        card for card in every_card
+        if str(card.get("language") or "").strip().upper() in excluded
+    ] if excluded else []
+    exempt_ids = {card["manifest_id"] for card in exempt}
+    cards = [c for c in every_card if c["manifest_id"] not in exempt_ids]
+
     decisions = [
         decide_card(
             card,
@@ -481,6 +518,11 @@ def plan_reprice(
         "changes": changes,
         "holds": holds,
         "considered": len(cards),
+        # Reported separately from `considered`, which is what was actually
+        # judged. Folding the two together would make an exemption that
+        # stopped matching invisible.
+        "exempt": len(exempt),
+        "exempt_languages": sorted(excluded),
         "eligible": len(eligible),
         "change_share": round(share, 4),
         "over_cap": over_cap,
@@ -544,6 +586,18 @@ def run_reprice(
     changes = planned["changes"]
     holds = planned["holds"]
     config = planned["config"]
+
+    # Said once, before anything else, so a run that reviewed far fewer
+    # cards than expected explains itself on its own first line.
+    if planned["exempt"]:
+        record("INFO", (
+            f"{planned['exempt']} card(s) are exempt from automatic "
+            f"repricing because their language is "
+            f"{', '.join(planned['exempt_languages'])}. Their market price "
+            f"cannot be refreshed -- TCGCSV has no catalogue for them -- so "
+            f"repricing would re-assert a frozen figure and overwrite any "
+            f"price corrected by hand."
+        ))
 
     if not decisions:
         record("INFO", (

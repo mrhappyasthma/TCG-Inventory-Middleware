@@ -558,6 +558,97 @@ class RepriceLeavesNoDraftBehindTests(unittest.TestCase):
         )
 
 
+class LanguageExemptionTests(unittest.TestCase):
+    """
+    Automatic repricing skips languages whose market price cannot move.
+
+    Not a preference. The repricer prices from `manifest.market_price`,
+    which is refreshed from TCGCSV -- and TCGCSV has no Chinese catalogue
+    at all, so a Chinese card's market price is frozen at whatever the
+    export said. Repricing against it would re-assert a stale figure every
+    night and overwrite any price corrected by hand.
+    """
+
+    TIERS = [
+        {"min_price": 0.0, "max_price": None,
+         "rule_type": "markup_fixed", "rule_value": 3.00},
+    ]
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.temp_dir.name, "r.db"))
+        self.db.set_pricing_rules(
+            [dict(t, sort_order=0) for t in self.TIERS], user_id=SHARED_SCOPE
+        )
+        self.db.upsert_managed_listing("g", ebay_parent_id="PARENT1")
+        # Two cards wanting the same change; only the language differs.
+        for manifest_id, language in (("ID1001", "EN"), ("ID1002", "CS")):
+            self.db.insert_manifest(
+                manifest_id, f"Card {manifest_id}", "A Set", "Near Mint",
+                "Normal", card_number="1/10", language=language,
+            )
+            self.db.record_market_prices([(manifest_id, 10.00)])
+            self.db.upsert_variation(
+                manifest_id, "PARENT1", 2,
+                custom_label=manifest_id, last_known_price=5.00,
+            )
+            self.db.set_variation_offer(manifest_id, "9001")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_an_exempt_language_is_never_judged(self):
+        planned = plan_reprice(self.db, user_id=SHARED_SCOPE)
+        judged = {d["manifest_id"] for d in planned["decisions"]}
+        self.assertEqual(judged, {"ID1001"})
+        self.assertEqual(planned["exempt"], 1)
+
+    def test_the_other_language_is_still_repriced(self):
+        planned = plan_reprice(self.db, user_id=SHARED_SCOPE)
+        self.assertEqual(
+            [d["manifest_id"] for d in planned["changes"]], ["ID1001"]
+        )
+
+    def test_an_exempt_card_is_not_counted_against_the_cap(self):
+        """
+        It never reached a verdict, so including it in the denominator
+        would make the proportional cap read a store that is quieter than
+        it is.
+        """
+        planned = plan_reprice(self.db, user_id=SHARED_SCOPE)
+        self.assertEqual(planned["considered"], 1)
+        self.assertEqual(planned["eligible"], 1)
+
+    def test_clearing_the_setting_exempts_nothing(self):
+        self.db.set_listing_settings(
+            {"auto_reprice_exclude_languages": ""}, user_id=SHARED_SCOPE
+        )
+        planned = plan_reprice(self.db, user_id=SHARED_SCOPE)
+        self.assertEqual(planned["exempt"], 0)
+        self.assertEqual(
+            {d["manifest_id"] for d in planned["decisions"]},
+            {"ID1001", "ID1002"},
+        )
+
+    def test_the_code_is_matched_case_insensitively(self):
+        self.db.set_listing_settings(
+            {"auto_reprice_exclude_languages": " cs , zh "},
+            user_id=SHARED_SCOPE,
+        )
+        self.assertEqual(plan_reprice(self.db, user_id=SHARED_SCOPE)["exempt"], 1)
+
+    def test_the_run_says_how_many_it_left_alone(self):
+        """
+        One summary line rather than one per card -- and a number that
+        would visibly drop to zero if the exemption stopped matching.
+        """
+        result = run_reprice(self.db, FakeEbay(), dry_run=True)
+        self.assertTrue(
+            any("exempt from automatic repricing" in entry["message"]
+                for entry in result["logs"]),
+            result["logs"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

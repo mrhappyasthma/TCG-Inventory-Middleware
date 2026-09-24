@@ -83,6 +83,24 @@ DEFAULT_PRICE_HOLD_DAYS = "14"
 # The question it exists to answer is "what do I still have to buy".
 DEFAULT_TARGET_QUANTITY = "4"
 
+# Languages the automatic repricer leaves alone, comma-separated.
+#
+# Not a preference: for these cards the price feed cannot ever work. The
+# repricer prices from `manifest.market_price`, which is refreshed from
+# TCGCSV by joining on (tcgplayer_id, printing) -- and TCGCSV has no Chinese
+# Pokemon catalogue at all. Its 94 categories cover "Pokemon" and "Pokemon
+# Japan" and nothing else, and the ids a Chinese SortSwift export carries
+# (9.5-11 billion) are nowhere near TCGplayer's real product ids, which top
+# out around 712,000. So a Chinese card's market price is frozen at whatever
+# the export said the day it was catalogued, for ever.
+#
+# Repricing against a number that can never update is not repricing, it is
+# re-asserting a stale figure nightly -- and it would overwrite by hand any
+# price the seller corrected, which is the actual harm. CS and ZH are both
+# listed for the same reason the title templates cover both: SortSwift
+# currently exports Chinese Simplified as CS.
+DEFAULT_REPRICE_EXCLUDE_LANGUAGES = "CS,ZH"
+
 # The share of live cards that may change price in one run before the run is
 # refused outright. A repricer is downstream of a third-party price feed, and
 # the signature of bad feed data is that it moves everything at once. Same
@@ -1114,6 +1132,8 @@ class Database:
                     ("reprice_max_change_percent",
                      DEFAULT_REPRICE_MAX_CHANGE_PERCENT),
                     ("target_quantity_default", DEFAULT_TARGET_QUANTITY),
+                    ("auto_reprice_exclude_languages",
+                     DEFAULT_REPRICE_EXCLUDE_LANGUAGES),
                 ]
                 cursor.executemany(
                     """
@@ -1150,6 +1170,8 @@ class Database:
                 ("variation_title_template_CS", DEFAULT_CHINESE_TITLE_TEMPLATE),
                 ("variation_title_template_ZH", DEFAULT_CHINESE_TITLE_TEMPLATE),
                 ("variation_title_template_JA", DEFAULT_JAPANESE_TITLE_TEMPLATE),
+                ("auto_reprice_exclude_languages",
+                 DEFAULT_REPRICE_EXCLUDE_LANGUAGES),
             ):
                 cursor.execute(
                     """
@@ -2515,6 +2537,7 @@ class Database:
                 """
                 SELECT m.manifest_id, m.product_name, m.set_name, m.condition,
                        m.printing, m.card_number, m.market_price, m.price,
+                       m.language,
                        COALESCE(m.quantity, 0) AS quantity,
                        v.ebay_parent_id, v.custom_label, v.offer_id,
                        v.last_known_price, v.last_known_qty, v.hold_since,
@@ -4176,6 +4199,37 @@ class Database:
             "status": "ok", "previous": previous, "current": wanted,
             "changed": True, "was_live": was_live,
         }
+
+    def set_plan_group_status(
+        self, plan_id: int, group_key: str, status: str
+    ) -> int:
+        """
+        Include or exclude every card in one of a plan's listings.
+
+        The same per-item ``status`` the row buttons write, applied in one
+        statement. Excluding a listing card by card is how it was done
+        before, and a seventeen-card listing meant seventeen requests and
+        seventeen re-renders.
+
+        Deliberately leaves ``pushed`` and ``failed`` items alone. A pushed
+        card is a record of something that already reached eBay and
+        excluding it would rewrite history; a failed one carries eBay's own
+        reason, which a bulk toggle should not silently discard.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE listing_plan_item
+                   SET status = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE plan_id = ?
+                   AND COALESCE(group_key, '') = ?
+                   AND status IN ('pending', 'excluded')
+                """,
+                (str(status), int(plan_id), str(group_key or "")),
+            )
+            conn.commit()
+            return cursor.rowcount
 
     def set_manifest_image_override(
         self, manifest_id: str, image_url: str

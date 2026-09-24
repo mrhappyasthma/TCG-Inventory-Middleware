@@ -843,6 +843,11 @@ async function loadAutoReprice() {
             s.price_boundary_margin_percent || "10";
         document.getElementById("repriceMaxChange").value =
             s.reprice_max_change_percent || "25";
+        // Not defaulted with `||`: an empty exemption list is a real,
+        // deliberate state ("reprice everything"), and falling back to the
+        // shipped value would show an exemption the user has just removed.
+        document.getElementById("repriceExcludeLanguages").value =
+            s.auto_reprice_exclude_languages ?? "";
         const depth = document.getElementById("targetQuantityDefault");
         if (depth) depth.value = s.target_quantity_default || "4";
 
@@ -910,6 +915,11 @@ async function saveRepriceSettings() {
             document.getElementById("priceBoundaryMargin").value || "10",
         reprice_max_change_percent:
             document.getElementById("repriceMaxChange").value || "25",
+        // Sent even when empty: clearing the box is a real instruction --
+        // "reprice everything" -- and dropping the key would leave the
+        // previous exemption silently in force.
+        auto_reprice_exclude_languages:
+            document.getElementById("repriceExcludeLanguages").value.trim(),
     };
     try {
         const res = await fetch("/api/listing-settings", {
@@ -3972,6 +3982,7 @@ function renderDraftPlan(detail) {
                         </p>
                     </div>
                     ${draftCoverControl(group)}
+                    ${draftGroupIncludeControl(group)}
                     ${invalid ? `<span class="shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-950/80 text-amber-300 border border-amber-800">Needs attention</span>` : ""}
                 </summary>
                 <div class="overflow-x-auto">
@@ -4054,6 +4065,59 @@ function draftCoverControl(group) {
 // quotes JSON.stringify emits closed the onclick attribute early, so the
 // button silently did nothing. Reading it from a data attribute is the same
 // rule the move-target selects already follow.
+function draftGroupIncludeControl(group) {
+    // Whether the whole listing is currently out. A listing with some cards
+    // in and some out counts as in, so the button offers the action that
+    // makes the block uniform rather than toggling half of it.
+    const allOut = group.excluded_count >= group.item_count;
+    const label = allOut ? "Put listing back" : "Leave listing out";
+    // The group key goes in a data- attribute rather than into the inline
+    // handler: it is built from a set name that came out of an uploaded CSV,
+    // and interpolating one through JSON.stringify closed the onclick
+    // attribute early once already.
+    return `<button type="button"
+        onclick="event.preventDefault(); event.stopPropagation(); setDraftGroupIncluded(this, ${allOut ? "true" : "false"})"
+        data-group-key="${escapeHtml(group.group_key)}"
+        class="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-lg border transition-all ${allOut
+            ? "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
+            : "bg-dark-900 border-slate-700 text-slate-400 hover:text-rose-300"}"
+        title="${allOut
+            ? "Include every card on this listing in the push again"
+            : "Leave every card on this listing out of the push. Approval refuses while any included card has a problem, so this is how one bad listing stops holding up the rest."}">
+        ${label}
+    </button>`;
+}
+
+async function setDraftGroupIncluded(button, include) {
+    // Read off the element, never interpolated into the handler above.
+    const groupKey = button.dataset.groupKey;
+    if (!currentDraftPlan || !currentDraftPlan.plan) return;
+    const planId = currentDraftPlan.plan.id;
+    button.disabled = true;
+    try {
+        const res = await fetch(`/api/plans/${planId}/group-status`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                group_key: groupKey,
+                status: include ? "pending" : "excluded",
+            }),
+        });
+        const data = await readJsonResponse(res);
+        if (!res.ok) throw new Error(data.detail || "Could not change the listing");
+        logToTerminal(
+            "INFO",
+            `[DRAFTS] ${data.changed} card(s) in ${groupKey} ` +
+            `${include ? "put back into" : "left out of"} the push`
+        );
+        await fetchDraftPlan();
+    } catch (err) {
+        button.disabled = false;
+        alert(err.message);
+        logToTerminal("ERROR", `[DRAFTS] ${err.message}`);
+    }
+}
+
 async function openDraftCoverPrompt(button) {
     const groupKey = typeof button === "string"
         ? button

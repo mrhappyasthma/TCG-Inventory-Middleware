@@ -551,9 +551,32 @@ amber flag in **Pricing Rules -> Automatic Repricing**: a card priced above
 what the market now supports is the one thing here worth a human glance.
 **Run now** applies a round immediately, after showing what it will change.
 
-All four settings live under **Pricing Rules -> Automatic Repricing**:
-`auto_reprice_enabled`, `price_hold_days`, `price_boundary_margin_percent`
-and `reprice_max_change_percent`.
+All five settings live under **Pricing Rules -> Automatic Repricing**:
+`auto_reprice_enabled`, `price_hold_days`, `price_boundary_margin_percent`,
+`reprice_max_change_percent` and `auto_reprice_exclude_languages`.
+
+#### Languages it never touches
+
+`auto_reprice_exclude_languages` (default `CS,ZH`) leaves those cards out of
+automatic repricing entirely. This is not a preference — for those cards the
+price feed cannot work at all:
+
+* the repricer prices from the **market price**, which is refreshed from
+  TCGCSV by joining on `(tcgplayer_id, printing)`;
+* **TCGCSV has no Chinese catalogue.** Its 94 categories cover `Pokemon` and
+  `Pokemon Japan` and nothing else;
+* and a Chinese SortSwift export's TCGplayer IDs run into the billions, where
+  real TCGplayer product IDs top out around 712,000.
+
+So a Chinese card's market price is frozen at whatever the export said the
+day it was catalogued. Repricing against it would re-assert that stale figure
+every night — and, worse, overwrite any price you had corrected by hand.
+
+The count of exempt cards is reported separately from the count considered,
+and the run says so on its own line, so an exemption that stops matching
+(because the export starts spelling the language differently) shows up as a
+number dropping rather than as prices quietly beginning to move. Clear the
+box to reprice everything.
 
 ### Condition multipliers
 
@@ -893,6 +916,25 @@ so pressing Push again cannot duplicate anything or re-list what worked.
 
 A card that keeps failing can be left out of the draft; excluding a broken
 card is eBay's own documented way to unblock the rest of a group.
+
+### Leaving a whole listing out
+
+Approval is all-or-nothing across a draft and refuses while **any** included
+card has a problem — so one bad listing holds up every other. **Leave listing
+out**, on a listing's header, excludes all of its cards in one action; the
+button becomes **Put listing back**. Approve, and that listing simply is not
+in the push.
+
+Two things it does not do. It does not touch a card already **pushed** or
+**failed** — the first is the record of something that reached eBay, the
+second carries eBay's own reason, and neither should be silently rewritten.
+And it does not approve or push anything: a plan is still approved as a
+whole, and a push still acts on a stored approval.
+
+Once a plan *is* approved you can already push **one listing at a time** —
+press **Listings** on the plan and each has its own Push button. That is the
+sane way to start, since a create cannot be undone by pressing the button
+again: put one small listing up, check it in Seller Hub, then do the rest.
 
 ### What stops a bad batch becoming a short listing
 
